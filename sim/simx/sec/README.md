@@ -41,8 +41,31 @@ VX_CHECKER=1 VX_CHECKER_STATS=1 \
   ./ci/blackbox.sh --driver=simx --app=vecadd_claimed --perf=1
 ```
 
-**The claim:** identical cycle counts, and `deny=0` in the checker line. Compare
-the `cycles=` field between the two runs — that equality *is* the result.
+**Measured** (default config, `-n64`):
+
+| Run | cycles | vs baseline | `added_cycles` |
+|---|---:|---:|---:|
+| `vecadd` baseline | 1240 | — | — |
+| `vecadd_claimed`, defaults | 1244 | **+4** | 8 |
+| `vecadd_claimed`, `VX_CHECKER_MISS_LAT=0` | **1240** | **0** | 0 |
+
+Both runs report `deny=0` and `PASSED!`, and both execute 400 instructions.
+
+The honest version of the zero-overhead claim is therefore *not* "the cycle
+counts are identical at defaults" — they are not. It is this:
+
+> **Every cycle of overhead is attributable to a header-cache miss.** The splice
+> itself is free. Set the miss penalty to zero and the count returns to exactly
+> the baseline 1240.
+
+That is the stronger claim anyway, because the 2 misses here are **compulsory**
+(cold) — the first touch of each claimed buffer. They do not scale with the
+workload, so the overhead is a fixed startup cost, not a per-access tax.
+
+Note the checker sees traffic even though this config has `VX_CFG_L2_ENABLED=0`
+and `VX_CFG_L3_ENABLED=0`: the L3 SimObject is still constructed as a transparent
+arbiter, so the splice point is the off-chip boundary in *every* cache
+configuration. 19 requests crossed it.
 
 ### 2. Cross-tenant isolation
 
@@ -63,6 +86,22 @@ VX_CHECKER=1 VX_CHECKER_ENFORCE=1 VX_CHECKER_STATS=1 \
 
 A checker that simply blocked everything would fail the positive half.
 
+**Measured** (`--cores=2`):
+
+```
+tasks: core0=512 core1=512
+CHECKER: reqs=1864, checked=1864, bypassed=0, allow=1576, deny=288
+CHECKER: enforce: faulted_reads=32, dropped_writes=256
+CHECKER: hcache: hits=1860, misses=4, hit_rate=99.7854%
+CHECKER: added_cycles=16, per_req=0.00858369 cyc
+CHECKER: first_fault: addr=0x100040, hart_id=16, op=read, total=288
+PASSED!
+```
+
+The 288 denies split into 32 faulted reads and 256 dropped writes — reads get a
+poison response, writes are simply dropped, since writes are posted and have no
+response to fault.
+
 ### 3. Epoch revocation
 
 Tenant 0 grants tenant 1 read access for epoch 0. The host revokes with **one
@@ -79,6 +118,20 @@ revocation. Launch 2: core 0 is unaffected, core 1 reads poison.
 
 SimX resets caches at each launch, which models the cache shootdown a real
 revocation would require; the grant state itself lives only in the checker.
+
+**Measured** (`--cores=2`):
+
+```
+tasks: phase1 core0=512 core1=512 | phase2 core0=480 core1=544
+CHECKER: reqs=2432, checked=2432, bypassed=0, allow=2398, deny=34
+CHECKER: enforce: faulted_reads=34, dropped_writes=0
+CHECKER: setup: dcr_claims=1, headers_written=1, current_epoch=1
+PASSED!
+```
+
+`dcr_claims=1` with `current_epoch=1` is the headline: **one** claim was ever
+installed, and revocation moved the epoch rather than rewriting it. All 34 denies
+are faulted reads — tenant 1 losing its grant.
 
 ## Environment variables
 
@@ -125,10 +178,26 @@ for e in 0 4 16 64; do
   echo "== hcache_entries=$e =="
   VX_CHECKER=1 VX_CHECKER_STATS=1 VX_CHECKER_HCACHE_ENTRIES=$e \
     ./ci/blackbox.sh --driver=simx --app=vecadd_claimed --perf=1 2>&1 \
-    | grep -E "CHECKER:|cycles="
+    | grep -E "CHECKER:|^PERF: instrs"
 done
 ```
 
-`entries=0` forces every check to miss and gives the worst case; the point of the
-1 MB header granule is that the working set stays small enough for even a few
-entries to hold it.
+**Measured** (baseline `vecadd` = 1240 cycles):
+
+| `hcache_entries` | cycles | vs baseline | `added_cycles` | hit rate |
+|---:|---:|---:|---:|---:|
+| 0 (disabled) | 1268 | +28 | 76 | 0% |
+| 4 | 1244 | +4 | 8 | 89.5% |
+| 16 (default) | 1244 | +4 | 8 | 89.5% |
+| 64 | 1244 | +4 | 8 | 89.5% |
+
+All four `PASSED!`. Two things to point at during a demo:
+
+- **4 entries already saturate.** Going to 16 or 64 changes nothing, because the
+  1 MB header granule keeps the working set to a handful of headers. That is the
+  granule size doing its job.
+- **`entries=0` is the worst case** — every one of the 19 checks misses and pays
+  the full 4-cycle penalty. Even then it is +28 cycles on 1240, about 2.3%.
+
+The residual 89.5% (not 100%) is the compulsory miss floor: 2 cold misses out of
+19 checks.
