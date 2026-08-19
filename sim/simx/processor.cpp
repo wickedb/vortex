@@ -134,11 +134,49 @@ ProcessorImpl::ProcessorImpl()
     }
   }
 
+  // create the inline access checker (data-plane TEE prototype, sec/).
+  //
+  // Only constructed when VX_CHECKER is set; otherwise the l3→dram binding
+  // below is bit-for-bit what upstream does, so a baseline run is unaffected
+  // by the checker's presence in the tree.
+  MemChecker::Config checker_config;
+  if (MemChecker::env_config(&checker_config)) {
+    checker_config.num_ports = VX_CFG_L3_MEM_PORTS;
+    mem_checker_ = MemChecker::Create("checker", checker_config);
+    // Boot default: all memory is system/shared (OWNER_ANY). DCR claims over
+    // the attested channel (range 0x300+, Phase 3 step 4) then narrow specific
+    // buffer ranges to specific owners; unclaimed regions — kernel code,
+    // stacks, args — stay accessible to every tenant. Allow-all, so Phase 2's
+    // single-owner rows reproduce unchanged.
+    mem_checker_->install_single_owner(OWNER_ANY, PERM_R | PERM_W);
+  }
+
   // connect L3 memory interfaces
   for (uint32_t i = 0; i < VX_CFG_L3_MEM_PORTS; ++i) {
-    l3cache_->mem_req_out.at(i).bind(&memsim_->mem_req_in.at(i));
+    if (mem_checker_) {
+      // Requests are gated. Responses keep the direct DRAM→LLC binding —
+      // splicing a buffered stage there measurably perturbs baseline timing —
+      // and the checker instead taps the response channel to inject fault
+      // responses for enforced denies (Phase 3) into free bus slots.
+      l3cache_->mem_req_out.at(i).bind(&mem_checker_->req_in.at(i));
+      mem_checker_->req_out.at(i).bind(&memsim_->mem_req_in.at(i));
+      mem_checker_->attach_rsp_port(i, &l3cache_->mem_rsp_in.at(i));
+    } else {
+      l3cache_->mem_req_out.at(i).bind(&memsim_->mem_req_in.at(i));
+    }
     memsim_->mem_rsp_out.at(i).bind(&l3cache_->mem_rsp_in.at(i));
   }
+
+  // install the pass-through checker (Phase 1) on the DRAM model's pre-send
+  // hook. It counts and classifies every accepted request and forwards to any
+  // external telemetry consumer; the const-ref signature means it cannot
+  // stall, delay, or mutate a request, so results stay identical to baseline.
+  memsim_->set_pre_send_hook([this](const MemReq& req) {
+    checker_.observe(req);
+    if (mem_telemetry_hook_) {
+      mem_telemetry_hook_(req);
+    }
+  });
 
   // set up memory profiling
   for (uint32_t i = 0; i < VX_CFG_L3_MEM_PORTS; ++i) {
@@ -171,6 +209,15 @@ ProcessorImpl::ProcessorImpl()
 }
 
 ProcessorImpl::~ProcessorImpl() {
+  // Opt-in (VX_CHECKER_STATS=1) so a default run's output stays byte-identical
+  // to baseline and can be diffed directly. Written to stderr to keep it out of
+  // the PERF stream the test harness parses.
+  if (Checker::stats_enabled()) {
+    checker_.dump(std::cerr);
+    if (mem_checker_) {
+      mem_checker_->dump(std::cerr);
+    }
+  }
   SimPlatform::instance().finalize();
 }
 
@@ -355,6 +402,13 @@ int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
     return 0;
   }
 #endif
+  // Checker setup path (Phase 3 step 4). With the checker unarmed these are
+  // inert, so an app that programs its policy runs unchanged on a baseline.
+  if (addr >= DCR_CHECKER_BASE && addr < DCR_CHECKER_END) {
+    if (mem_checker_)
+      return mem_checker_->dcr_write(addr, value);
+    return 0;
+  }
   for (auto& cluster : clusters_) {
     int ret = cluster->dcr_write(addr, value);
     if (ret != 0)
