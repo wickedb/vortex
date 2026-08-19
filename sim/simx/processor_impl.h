@@ -18,6 +18,8 @@
 #include "constants.h"
 #include "cluster.h"
 #include "kmu.h"
+#include "sec/checker.h"
+#include "sec/mem_checker.h"
 
 namespace vortex {
 
@@ -53,9 +55,22 @@ public:
 
   Kmu& kmu()       { return *kmu_; }
 
+  // The pre-send hook slot on Memory is owned by the pass-through checker, so
+  // an external telemetry consumer (the SST backend) is chained behind it
+  // rather than replacing it. Both observers see every request; neither can
+  // perturb one, since the hook signature is const-ref by design.
   void set_mem_telemetry_hook(Memory::PreSendHook hook) {
-    memsim_->set_pre_send_hook(std::move(hook));
+    mem_telemetry_hook_ = std::move(hook);
   }
+
+  // Pass-through checker (Phase 1): observes every request crossing the
+  // LLC→DRAM boundary. Zero functional effect.
+  const Checker& checker() const { return checker_; }
+
+  // Inline checker (Phase 2+): only constructed when VX_CHECKER is set in the
+  // environment. Null otherwise, in which case l3cache_ binds straight to
+  // memsim_ exactly as upstream.
+  const MemChecker* mem_checker() const { return mem_checker_.get(); }
 
   // Functional backing store (device physical memory). Exposed so the raster
   // early-Z stage can read the committed depth buffer synchronously during its
@@ -88,6 +103,9 @@ private:
 #endif
   RAM*        ram_ = nullptr;   // functional backing store (set by attach_ram)
   Cache::Ptr l3cache_;
+  Checker     checker_;
+  MemChecker::Ptr mem_checker_;
+  Memory::PreSendHook mem_telemetry_hook_;
   uint64_t perf_mem_reads_;
   uint64_t perf_mem_writes_;
   uint64_t perf_mem_latency_;
