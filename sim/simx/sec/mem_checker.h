@@ -50,8 +50,18 @@ constexpr uint32_t DCR_CHECKER_BUF_OWNER  = 0x302;  // owner eid (OWNER_ANY = sh
 constexpr uint32_t DCR_CHECKER_BUF_PERMS  = 0x303;  // PERM_R | PERM_W
 constexpr uint32_t DCR_CHECKER_BUF_EPOCH  = 0x304;  // grant epoch (0xFFFFFFFF = no expiry)
 constexpr uint32_t DCR_CHECKER_BUF_COMMIT = 0x305;  // write installs the staged claim
-constexpr uint32_t DCR_CHECKER_EPOCH      = 0x306;  // sets current_epoch (Phase 4 revocation)
+// Sets owner_eid's entry in the per-owner epoch table (Phase 4 revocation).
+// Scoped by DCR_CHECKER_REVOKE_OWNER, which must be written first — mirrors
+// the staged-claim pattern above (stage the target, then commit). A write
+// with no owner staged (still OWNER_ANY) is a no-op: the checker fails closed
+// rather than falling back to a device-wide revocation.
+constexpr uint32_t DCR_CHECKER_EPOCH      = 0x306;
 constexpr uint32_t DCR_CHECKER_BUF_SHARED = 0x307;  // staged non-owner perms (grant to others)
+// Stages which owner's epoch-table entry the next DCR_CHECKER_EPOCH write
+// updates. Persists across writes like `claim_`, so re-revoking the same
+// owner needs no re-stage. Only owner_eid's *own* grants are affected —
+// revoking owner A never touches owner C's unrelated grant to D.
+constexpr uint32_t DCR_CHECKER_REVOKE_OWNER = 0x308;
 constexpr uint32_t DCR_CHECKER_END        = 0x340;
 
 // Spliced into the l3cache_→memsim_ binding, which is the off-chip boundary in
@@ -123,6 +133,7 @@ public:
     uint64_t dropped_writes = 0;  // enforced denies dropped (writes are posted)
     uint64_t dcr_claims = 0;      // buffer claims committed over the DCR path
     uint64_t headers_written = 0; // header-store entries those claims installed
+    uint64_t epoch_bumps = 0;     // per-owner epoch-table writes (scoped revocations)
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
@@ -159,9 +170,12 @@ public:
   // is pre-launch setup, not on the measured path).
   int dcr_write(uint32_t addr, uint32_t value);
 
-  // Phase 4 revocation: bumping this invalidates every grant whose
-  // grant_epoch has fallen behind. No per-access write to any header.
-  void set_epoch(uint64_t epoch);
+  // Phase 4 revocation, scoped to one owner: bumping owner_eid's epoch-table
+  // entry invalidates only *that owner's* grants whose grant_epoch has
+  // fallen behind. No per-access write to any header, and no effect on any
+  // other owner's grants. owner_eid == OWNER_ANY is a no-op (OWNER_ANY
+  // headers are never epoch-gated in the first place — see check()).
+  void set_epoch(uint32_t owner_eid, uint64_t epoch);
 
   const PerfStats& perf_stats() const;
   const FaultStatus& fault_status() const;
