@@ -1,13 +1,15 @@
 // revoke — Phase 4 epoch revocation demo (vortex2.h-native).
 //
 // The thesis sentence this demonstrates: tenant 0 grants tenant 1 read access
-// for epoch 0, the host revokes at epoch 1 with ONE register write (no header
-// is touched — on the setup path or any access path), tenant 1 is denied,
-// and tenant 0's own access is unaffected.
+// for epoch 0, the host revokes at epoch 1 with two register writes — stage
+// the owner being revoked, then commit the epoch (no header is touched — on
+// the setup path or any access path) — tenant 1 is denied, and tenant 0's
+// own access is unaffected.
 //
 //   claim:    shared buffer → owner eid 0 (R|W), shared_perms R, grant_epoch 0
 //   launch 1: both cores read real data (grant active)
-//   revoke:   vx_enqueue_dcr_write(CURRENT_EPOCH, 1)   ← the entire revocation
+//   revoke:   vx_enqueue_dcr_write(REVOKE_OWNER, 0);
+//             vx_enqueue_dcr_write(EPOCH, 1)          ← the entire revocation
 //   launch 2: core 0 reads real data and writes; core 1 reads poison
 //
 // SimX resets caches at each launch, which models the cache shootdown a real
@@ -143,6 +145,10 @@ int main(int argc, char** argv) {
     vx_launch_info_t li1 = make_li(&arg1), li2 = make_li(&arg2);
     vx_event_h ev2=nullptr, read_ev=nullptr;
     CHECK(vx_enqueue_launch(q, &li1, 0, nullptr, nullptr));
+    // Revocation, scoped to owner 0 (the buffer's owner): stage the target
+    // owner, then commit the new epoch. Two register writes, still no header
+    // touched — see common.h.
+    CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_REVOKE_OWNER, 0, 0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_EPOCH, 1, 0, nullptr, nullptr));
     CHECK(vx_enqueue_launch(q, &li2, 0, nullptr, &ev2));
 
