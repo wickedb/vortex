@@ -104,8 +104,9 @@ response to fault.
 
 ### 3. Epoch revocation
 
-Tenant 0 grants tenant 1 read access for epoch 0. The host revokes with **one
-register write** — no header is touched, on the setup path or any access path.
+Tenant 0 grants tenant 1 read access for epoch 0. The host revokes with **two
+register writes** — stage which owner is being revoked, then commit the new
+epoch — no header is touched, on the setup path or any access path.
 
 ```sh
 VX_CHECKER=1 VX_CHECKER_ENFORCE=1 VX_CHECKER_STATS=1 \
@@ -113,8 +114,14 @@ VX_CHECKER=1 VX_CHECKER_ENFORCE=1 VX_CHECKER_STATS=1 \
 ```
 
 **The claim:** launch 1, both cores read real data. Then
-`vx_enqueue_dcr_write(DCR_CHECKER_EPOCH, 1)` — that single write is the entire
+`vx_enqueue_dcr_write(DCR_CHECKER_REVOKE_OWNER, 0)` followed by
+`vx_enqueue_dcr_write(DCR_CHECKER_EPOCH, 1)` — those two writes are the entire
 revocation. Launch 2: core 0 is unaffected, core 1 reads poison.
+
+The epoch is tracked **per owner**, indexed by the granting owner's eid, so
+revoking owner 0's grants can never advance a different owner's epoch entry
+and expire *their* grants too — see `revoke_scope` below for a demo that
+exercises exactly that property.
 
 SimX resets caches at each launch, which models the cache shootdown a real
 revocation would require; the grant state itself lives only in the checker.
@@ -125,13 +132,33 @@ revocation would require; the grant state itself lives only in the checker.
 tasks: phase1 core0=512 core1=512 | phase2 core0=480 core1=544
 CHECKER: reqs=2432, checked=2432, bypassed=0, allow=2398, deny=34
 CHECKER: enforce: faulted_reads=34, dropped_writes=0
-CHECKER: setup: dcr_claims=1, headers_written=1, current_epoch=1
+CHECKER: setup: dcr_claims=1, headers_written=1, epoch_bumps=1, last_revoked_owner=0, epoch=1
 PASSED!
 ```
 
-`dcr_claims=1` with `current_epoch=1` is the headline: **one** claim was ever
-installed, and revocation moved the epoch rather than rewriting it. All 34 denies
-are faulted reads — tenant 1 losing its grant.
+`dcr_claims=1` with `epoch_bumps=1` is the headline: **one** claim was ever
+installed, and revocation moved owner 0's epoch-table entry rather than
+rewriting a header or a device-wide counter. All 34 denies are faulted reads —
+tenant 1 losing its grant.
+
+### 4. Scoped revocation — owner A's revoke doesn't touch owner C's grant
+
+Two independently owned buffers, each granting READ to the other tenant.
+Revoking **only** owner 0's grant must leave owner 1's grant untouched.
+
+```sh
+VX_CHECKER=1 VX_CHECKER_ENFORCE=1 VX_CHECKER_STATS=1 \
+  ./ci/blackbox.sh --driver=simx --app=revoke_scope --cores=2
+```
+
+**The claim:** launch 1, core 1 reads owner 0's buffer (real data, via the
+grant) and core 0 reads owner 1's buffer (real data, via the grant). The host
+then revokes owner 0 only: `vx_enqueue_dcr_write(DCR_CHECKER_REVOKE_OWNER, 0)`
++ `vx_enqueue_dcr_write(DCR_CHECKER_EPOCH, 1)`. Launch 2: core 1's read of
+owner 0's buffer comes back poison (revoked), but core 0's read of owner 1's
+buffer is still real data — owner 1's grant was never touched. Before the
+per-owner epoch table, this same test failed: bumping the single global epoch
+revoked both grants at once.
 
 ## Environment variables
 
