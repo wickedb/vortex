@@ -33,6 +33,12 @@ bool env_flag(const char* name, bool fallback) {
 // the cap is never reached.
 constexpr uint32_t MAX_HEADER_ENTRIES = 1u << 20;
 
+// Bound growth of the per-owner epoch table the same way — owner ids are
+// core ids in this design (a handful at most), so this cap is never reached
+// in practice; it just stops a bogus REVOKE_OWNER value from resizing the
+// table unboundedly.
+constexpr uint32_t MAX_OWNERS = 1u << 12;
+
 }
 
 class MemChecker::Impl {
@@ -71,7 +77,19 @@ private:
   uint32_t hc_sets_;
   uint64_t hc_clock_;
 
-  uint64_t current_epoch_;
+  // Per-owner epoch table (fix for the global-revocation bug: owner A
+  // revoking its grant to B must not also expire owner C's unrelated grant
+  // to D). Indexed by BufferHeader::owner_eid — the *granting* owner, not
+  // the grantee — since that is what the check in check() compares against.
+  // Sized on demand; an owner with no entry yet reads as epoch 0, matching
+  // the pre-revocation default every owner started at.
+  std::vector<uint64_t> epoch_table_;
+
+  // Staged target for the next DCR_CHECKER_EPOCH write (see
+  // DCR_CHECKER_REVOKE_OWNER in mem_checker.h). OWNER_ANY means "nothing
+  // staged" — a bare EPOCH write with no owner staged is a no-op.
+  uint32_t revoke_owner_ = OWNER_ANY;
+  uint32_t last_revoked_owner_ = OWNER_ANY;
 
   // Staged DCR claim (Phase 3 step 4). Persists across commits so a re-grant
   // can rewrite one register and commit again.
@@ -88,8 +106,7 @@ public:
   Impl(MemChecker* simobject, const Config& config)
     : simobject_(simobject)
     , config_(config)
-    , hc_clock_(0)
-    , current_epoch_(0) {
+    , hc_clock_(0) {
     // Size the store to cover the device address space at this granularity.
     uint64_t entries = 1ull << (VX_CFG_MEM_ADDR_WIDTH - std::min<uint32_t>(config_.buffer_log2, VX_CFG_MEM_ADDR_WIDTH));
     entries = std::min<uint64_t>(entries, MAX_HEADER_ENTRIES);
@@ -128,8 +145,22 @@ public:
     }
   }
 
-  void set_epoch(uint64_t epoch) {
-    current_epoch_ = epoch;
+  uint64_t epoch_for(uint32_t owner) const {
+    return (owner < epoch_table_.size()) ? epoch_table_[owner] : 0;
+  }
+
+  void set_epoch(uint32_t owner, uint64_t epoch) {
+    // OWNER_ANY headers are never epoch-gated (see check()), so scoping a
+    // revocation to OWNER_ANY — staged or explicit — would be a no-op host
+    // mistake, not a real grant to expire. Also covers the "nothing staged"
+    // sentinel from a bare DCR_CHECKER_EPOCH write.
+    if (owner == OWNER_ANY || owner >= MAX_OWNERS)
+      return;
+    if (owner >= epoch_table_.size())
+      epoch_table_.resize(owner + 1, 0);
+    epoch_table_[owner] = epoch;
+    ++perf_stats_.epoch_bumps;
+    last_revoked_owner_ = owner;
   }
 
   // The who's-who setup path. Configuration writes take effect immediately:
@@ -147,8 +178,11 @@ public:
     case DCR_CHECKER_BUF_COMMIT:
       this->install_claim();
       break;
+    case DCR_CHECKER_REVOKE_OWNER:
+      revoke_owner_ = value;
+      break;
     case DCR_CHECKER_EPOCH:
-      current_epoch_ = value;
+      this->set_epoch(revoke_owner_, value);
       break;
     default:
       break;  // reserved registers in the checker range: ignore
@@ -234,11 +268,15 @@ public:
          << ", dropped_writes=" << perf_stats_.dropped_writes
          << std::endl;
     }
-    if (perf_stats_.dcr_claims != 0) {
+    if (perf_stats_.dcr_claims != 0 || perf_stats_.epoch_bumps != 0) {
       os << "CHECKER: setup: dcr_claims=" << perf_stats_.dcr_claims
          << ", headers_written=" << perf_stats_.headers_written
-         << ", current_epoch=" << current_epoch_
-         << std::endl;
+         << ", epoch_bumps=" << perf_stats_.epoch_bumps;
+      if (perf_stats_.epoch_bumps != 0) {
+        os << ", last_revoked_owner=" << last_revoked_owner_
+           << ", epoch=" << this->epoch_for(last_revoked_owner_);
+      }
+      os << std::endl;
     }
     if (fault_.valid) {
       os << "CHECKER: first_fault: addr=0x" << std::hex << fault_.addr << std::dec
@@ -368,14 +406,17 @@ private:
 
     // Owner (and system/shared OWNER_ANY) access is not epoch-gated:
     // revocation expires grants to *others*, it does not evict the owner.
-    // Non-owner access rides the shared grant, which an epoch bump on the
-    // checker invalidates without writing any header (thesis §6).
+    // Non-owner access rides the shared grant, which the *granting* owner's
+    // epoch-table entry gates — bumped via DCR_CHECKER_REVOKE_OWNER +
+    // DCR_CHECKER_EPOCH, without writing any header (thesis §6). Scoped per
+    // owner: revoking owner A's grants never advances owner C's entry, so
+    // C's unrelated grant to D is untouched.
     bool ok;
     if (header.owner_eid == OWNER_ANY || header.owner_eid == owner) {
       ok = (header.perms & need) != 0;
     } else {
       ok = ((header.shared_perms & need) != 0)
-        && (current_epoch_ <= header.grant_epoch);
+        && (this->epoch_for(header.owner_eid) <= header.grant_epoch);
     }
     if (config_.test_deny == 1 || (config_.test_deny == 2 && req.is_write()))
       ok = false;
@@ -421,8 +462,8 @@ void MemChecker::install_single_owner(uint32_t owner_eid, uint32_t perms) {
   impl_->install_single_owner(owner_eid, perms);
 }
 
-void MemChecker::set_epoch(uint64_t epoch) {
-  impl_->set_epoch(epoch);
+void MemChecker::set_epoch(uint32_t owner_eid, uint64_t epoch) {
+  impl_->set_epoch(owner_eid, epoch);
 }
 
 int MemChecker::dcr_write(uint32_t addr, uint32_t value) {
