@@ -158,6 +158,11 @@ public:
       return;
     if (owner >= epoch_table_.size())
       epoch_table_.resize(owner + 1, 0);
+    // Monotonicity guard: revocation must not be reversible. A write that
+    // would move the owner's epoch backward (or hold it steady) is silently
+    // ignored rather than un-revoking already-expired grants.
+    if (epoch <= epoch_table_[owner])
+      return;
     epoch_table_[owner] = epoch;
     ++perf_stats_.epoch_bumps;
     last_revoked_owner_ = owner;
