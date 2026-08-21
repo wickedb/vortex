@@ -54,7 +54,9 @@ constexpr uint32_t DCR_CHECKER_BUF_COMMIT = 0x305;  // write installs the staged
 // Scoped by DCR_CHECKER_REVOKE_OWNER, which must be written first — mirrors
 // the staged-claim pattern above (stage the target, then commit). A write
 // with no owner staged (still OWNER_ANY) is a no-op: the checker fails closed
-// rather than falling back to a device-wide revocation.
+// rather than falling back to a device-wide revocation. Monotonic: a value
+// that does not strictly increase the owner's current epoch is ignored, so
+// revocation cannot be reversed by writing an earlier value back.
 constexpr uint32_t DCR_CHECKER_EPOCH      = 0x306;
 constexpr uint32_t DCR_CHECKER_BUF_SHARED = 0x307;  // staged non-owner perms (grant to others)
 // Stages which owner's epoch-table entry the next DCR_CHECKER_EPOCH write
@@ -174,7 +176,9 @@ public:
   // entry invalidates only *that owner's* grants whose grant_epoch has
   // fallen behind. No per-access write to any header, and no effect on any
   // other owner's grants. owner_eid == OWNER_ANY is a no-op (OWNER_ANY
-  // headers are never epoch-gated in the first place — see check()).
+  // headers are never epoch-gated in the first place — see check()). Writes
+  // that would not strictly increase the owner's epoch are ignored, so
+  // revocation cannot be undone by replaying an earlier (or equal) value.
   void set_epoch(uint32_t owner_eid, uint64_t epoch);
 
   const PerfStats& perf_stats() const;
