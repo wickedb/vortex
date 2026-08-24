@@ -142,11 +142,20 @@ struct sector_t {
   bool dirty;
   uint64_t dirty_mask;                 // per-byte dirty bits; the writeback byte-enable
   std::shared_ptr<mem_block_t> data;  // sector bytes (= one mem_block)
+  // hart that last dirtied this sector. A writeback is initiated by whichever
+  // request triggers the eviction, so the evictor's hart_id (bank_req.hart_id)
+  // does NOT identify who wrote the data. The data-plane checker at LLC→DRAM
+  // authorizes writebacks via owner_of(hart_id); carrying the evictor there
+  // misattributes cross-tenant writebacks (sec/mem_checker.cpp, caches.md #8).
+  // Stamp the writer here on every dirtying store and replay it into the
+  // writeback so requester identity survives the write-back cache.
+  uint32_t writer_hart_id;
 
   void reset() {
     valid = false;
     dirty = false;
     dirty_mask = 0;
+    writer_hart_id = 0;
     data.reset();
   }
 };
@@ -1056,7 +1065,7 @@ private:
         MemReq wb;
         wb.addr   = params_.mem_addr_sector(bank_id_, set_id, victim_line.tag, s);
         wb.op     = MemOp::ST;
-        wb.hart_id = bank_req.hart_id;
+        wb.hart_id = sec.writer_hart_id;  // writer, not evictor (caches.md #8)
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
@@ -1201,6 +1210,7 @@ private:
       if (config_.write_back) {
         hit_sec.dirty = true;
         hit_sec.dirty_mask |= byteen;
+        hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (caches.md #8)
       } else {
         // Write-through: emit a write of the merged word downstream.
         MemReq w;
@@ -1325,7 +1335,7 @@ private:
         MemReq wb;
         wb.addr   = params_.mem_addr_sector(bank_id_, set_id, set.lines.at(hit_id).tag, sector_id);
         wb.op = MemOp::ST;
-        wb.hart_id    = bank_req.hart_id;
+        wb.hart_id    = sec.writer_hart_id;  // writer, not evictor (caches.md #8)
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
@@ -1450,6 +1460,7 @@ private:
         if (config_.write_back) {
           hit_sec.dirty = true;
           hit_sec.dirty_mask |= bank_req.byteen;
+          hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (caches.md #8)
         }
 #if VX_CFG_EXT_A_ENABLED
         // Write-back write-miss replay reaching the LLC tag array:
@@ -1552,6 +1563,7 @@ private:
           if (config_.write_back) {
             hit_sec.dirty = true;
             hit_sec.dirty_mask |= bank_req.byteen;
+            hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (caches.md #8)
           } else {
             MemReq w;
             w.addr   = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
@@ -1679,6 +1691,7 @@ private:
             MemReq mem_req;
             mem_req.addr = params_.mem_addr_sector(bank_id_, flush_set_idx_, line.tag, flush_sector_idx_);
             mem_req.op   = MemOp::ST;
+            mem_req.hart_id = sec.writer_hart_id;  // writer, not evictor (caches.md #8)
             mem_req.data = sec.data;
             mem_req.byteen = sec.dirty_mask;
             this->mem_req_out.send(mem_req, MEM_REQ_DELAY);
