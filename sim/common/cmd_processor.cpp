@@ -146,6 +146,7 @@ uint32_t CommandProcessor::mmio_read(uint32_t off) const {
             case 0x28: return uint32_t(q0_.seqnum & 0xFFFFFFFF);
             case 0x2C: return q0_.error;
             case 0x30: return last_dcr_rsp_;  // last CMD_DCR_READ response
+            case 0x34: return dcr_blocked_;   // privileged-window refusals
         }
     }
     return 0xDEADBEEF;
@@ -301,6 +302,27 @@ bool CommandProcessor::event_wait_satisfied_() {
     }
 }
 
+// Apply one {dcr_addr, value} pair that was read out of device memory.
+//
+// Device-resident command bundles are tenant-rewritable (see DCR_PRIV_BEGIN in
+// cmd_processor.h), so the checker's configuration window is unreachable from
+// them: a forged {BUF_OWNER, self} / {BUF_COMMIT, 1} pair must not become a
+// privileged claim on a victim's buffer. Dropped silently and counted rather
+// than raising Q_ERROR — a refused write is a policy decision on a per-pair
+// basis, not a malformed command, and stalling the queue would turn the
+// attempt into a denial of service against the legitimate launch that carries
+// the rest of the bundle. Q_DCR_BLOCKED (0x134) makes the attempt observable.
+bool CommandProcessor::dcr_write_indirect_(uint32_t addr, uint32_t value) {
+    if (addr >= DCR_PRIV_BEGIN && addr < DCR_PRIV_END) {
+        if (dcr_blocked_ != 0xFFFFFFFFu)   // saturate rather than wrap
+            ++dcr_blocked_;
+        return false;
+    }
+    if (hooks_.vortex_dcr_write)
+        hooks_.vortex_dcr_write(addr, value);
+    return true;
+}
+
 // CMD_LAUNCH_QMD: read the KMU descriptor from device memory and replay it
 // through the DCR-write hook. The descriptor is a {uint32 count, then count ×
 // (uint32 dcr_addr, uint32 value)} list the host staged before submit (like a
@@ -318,7 +340,8 @@ void CommandProcessor::apply_qmd_(uint64_t qmd_addr) {
         uint32_t pair[2] = {0, 0};          // {dcr_addr, value}
         hooks_.dram_read(addr, pair, sizeof(pair));
         addr += sizeof(pair);
-        hooks_.vortex_dcr_write(pair[0] & 0xFFF, pair[1]);  // VX_DCR_ADDR_BITS=12
+        // VX_DCR_ADDR_BITS=12. Filtered: the blob is in tenant-writable memory.
+        dcr_write_indirect_(pair[0] & 0xFFF, pair[1]);
     }
 }
 
@@ -326,7 +349,7 @@ void CommandProcessor::apply_qmd_(uint64_t qmd_addr) {
 // complete immediately and return false; a launch step (LAUNCH/LAUNCH_QMD)
 // kicks the launch sub-FSM and returns true so the caller waits for the drain
 // (the inter-stage barrier). Mirrors the per-opcode logic of the ring Bid path.
-bool CommandProcessor::exec_inline_cmd_(const Cmd& c) {
+bool CommandProcessor::exec_inline_cmd_(const Cmd& c, bool indirect) {
     switch (c.opcode) {
         case OP_LAUNCH:
         case OP_LAUNCH_QMD:
@@ -334,11 +357,18 @@ bool CommandProcessor::exec_inline_cmd_(const Cmd& c) {
                 apply_qmd_(c.arg0);
             launch_state_ = LaunchState::PulseStart;
             return true;
-        case OP_DCR_WRITE:
-            if (hooks_.vortex_dcr_write)
-                hooks_.vortex_dcr_write(uint32_t(c.arg0 & 0xFFF),
-                                        uint32_t(c.arg1 & 0xFFFFFFFF));
+        case OP_DCR_WRITE: {
+            const uint32_t addr = uint32_t(c.arg0 & 0xFFF);
+            const uint32_t val  = uint32_t(c.arg1 & 0xFFFFFFFF);
+            // A step decoded out of a device-resident descriptor is subject to
+            // the privileged-window filter; a ring command is not.
+            if (indirect) {
+                dcr_write_indirect_(addr, val);
+            } else if (hooks_.vortex_dcr_write) {
+                hooks_.vortex_dcr_write(addr, val);
+            }
             return false;
+        }
         case OP_DCR_READ:
             if (hooks_.vortex_dcr_read)
                 last_dcr_rsp_ = hooks_.vortex_dcr_read(
@@ -564,7 +594,7 @@ void CommandProcessor::tick_engine() {
                 return;
             }
             draw_load_step_();
-            if (exec_inline_cmd_(draw_cmd_)) {
+            if (exec_inline_cmd_(draw_cmd_, /*indirect=*/true)) {
                 eng_state_ = EngState::DrawLaunchWait;
             } else {
                 ++draw_step_;

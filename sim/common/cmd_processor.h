@@ -43,6 +43,9 @@
 //     0x128    Q_SEQNUM           (RO mirror)
 //     0x12C    Q_ERROR
 //     0x130    Q_LAST_DCR_RSP     (RO — latest CMD_DCR_READ response)
+//     0x134    Q_DCR_BLOCKED      (RO — DCR writes refused by the
+//                                 privileged-window filter; see
+//                                 DCR_PRIV_BEGIN below)
 //
 // CMD_DRAW (OP_DRAW, opcode 0x0C) — device-orchestrated draw.
 //   A single ring command whose arg0 points at a resident *draw descriptor*:
@@ -103,6 +106,39 @@ public:
         // the DCR bus waiting for a response.
         bool mmu_fault_report = false;
     };
+
+    // ----- Privileged DCR window (control/data separation) -----
+    //
+    // DCR addresses in [DCR_PRIV_BEGIN, DCR_PRIV_END) are the memory
+    // checker's configuration interface — buffer ownership, permissions and
+    // the per-owner revocation epoch (sim/simx/sec/mem_checker.h holds the
+    // authoritative per-register names, DCR_CHECKER_BASE..DCR_CHECKER_END).
+    // They are the mechanism's *control plane*, and the threat model treats
+    // the host ring as the attested channel that owns it.
+    //
+    // Indirect command bundles do not qualify. A QMD descriptor
+    // (CMD_LAUNCH_QMD) and an OP_DRAW step list are read out of device
+    // memory at execution time, and the checker's boot policy leaves
+    // unclaimed memory OWNER_ANY | R|W — world-writable. A tenant kernel can
+    // therefore rewrite a bundle after the host staged it and before the CP
+    // reads it (TOCTOU) and have its own {addr,value} pairs replayed with
+    // full privilege: {BUF_OWNER, self} + {BUF_COMMIT, 1} claims a victim's
+    // buffer, {EPOCH, 0} attempts to undo a revocation. Because the CP reads
+    // the bundle functionally, no such write ever crosses the LLC→DRAM
+    // enforcement point, so the checker cannot see the attack itself.
+    //
+    // Real hardware puts the privileged register window out of reach of an
+    // unprivileged command buffer; this range is that rule. Writes to it from
+    // an indirect bundle are dropped and counted in Q_DCR_BLOCKED (0x134).
+    // Nothing legitimate is lost: the runtime only ever packs KMU registers
+    // (VX_DCR_KMU_*, 0x010..0x023) into a QMD — see cmd_stage_qmds() in
+    // sw/runtime/common/queue.cpp.
+    //
+    // Duplicated as literals rather than included, because sim/common must
+    // not depend on the simx-only checker. mem_checker.cpp static_asserts
+    // that the two definitions agree.
+    static constexpr uint32_t DCR_PRIV_BEGIN = 0x300;
+    static constexpr uint32_t DCR_PRIV_END   = 0x340;
 
     explicit CommandProcessor(const Hooks& hooks);
 
@@ -196,6 +232,8 @@ private:
     Queue    q0_;                    // single-queue model
     Hooks    hooks_;
     uint32_t last_dcr_rsp_ = 0;     // Q_LAST_DCR_RSP slot (0x130)
+    uint32_t dcr_blocked_ = 0;      // Q_DCR_BLOCKED slot (0x134): DCR writes
+                                    // refused by the privileged-window filter
 
     // ----- Engine/launch state machines -----
     EngState    eng_state_ = EngState::Idle;
@@ -229,9 +267,15 @@ private:
     // unpacker and the OP_DRAW step walk).
     static int decode_cmd_bytes(const uint8_t* buf, int len, int off, Cmd& out);
     // Execute one DCR_WRITE / DCR_READ / CACHE_FLUSH / EVENT_SIG / MEM_* /
-    // LAUNCH_QMD step against `c` (shared by the ring Bid path and OP_DRAW).
+    // LAUNCH_QMD step against `c`. `indirect` is true when `c` was decoded
+    // out of a device-memory command bundle (an OP_DRAW step list) rather
+    // than fetched from the host ring; it gates the privileged DCR window.
     // Returns true if a kernel launch was kicked (caller must wait for drain).
-    bool exec_inline_cmd_(const Cmd& c);
+    bool exec_inline_cmd_(const Cmd& c, bool indirect);
+    // Apply one {dcr_addr, value} pair that came from device memory. Drops
+    // and counts it if it targets [DCR_PRIV_BEGIN, DCR_PRIV_END); otherwise
+    // forwards to hooks_.vortex_dcr_write. Returns true if it was applied.
+    bool dcr_write_indirect_(uint32_t addr, uint32_t value);
     // Read the next OP_DRAW step from the descriptor into draw_cmd_.
     void draw_load_step_();
     // Inverse of decoded helpers: write seqnum to cmpl_addr.

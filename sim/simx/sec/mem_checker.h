@@ -43,6 +43,14 @@ constexpr uint32_t OWNER_ANY = 0xFFFFFFFFu;
 // (Phase 4) can rewrite just BUF_EPOCH and commit again. These model the
 // attested channel as trusted configuration, per the threat model.
 // Mirrored in tests/regression/twotenant/common.h for the host side.
+//
+// "Attested channel" means the host command ring, and only that. The whole
+// range is refused when it is reached from a device-resident command bundle
+// (a CMD_LAUNCH_QMD descriptor or an OP_DRAW step list), which lives in
+// tenant-writable memory and would otherwise let a tenant forge
+// {BUF_OWNER, self} + {BUF_COMMIT, 1} and claim a victim's buffer — see
+// CommandProcessor::DCR_PRIV_BEGIN in sim/common/cmd_processor.h, which
+// mem_checker.cpp static_asserts against BASE/END below.
 constexpr uint32_t DCR_CHECKER_BASE       = 0x300;
 constexpr uint32_t DCR_CHECKER_BUF_BASE   = 0x300;  // buffer base address
 constexpr uint32_t DCR_CHECKER_BUF_SIZE   = 0x301;  // buffer size in bytes
