@@ -3,6 +3,8 @@
 #include "mem_checker.h"
 #include "mem/mem_block_pool.h"
 
+#include <cmd_processor.h>   // CommandProcessor::DCR_PRIV_* (see static_assert below)
+
 #include <cstdlib>
 #include <cstring>
 #include <ostream>
@@ -10,6 +12,18 @@
 #include <deque>
 
 using namespace vortex;
+
+// The Command Processor refuses DCR writes into the checker's configuration
+// window when they arrive from a device-resident (tenant-writable) command
+// bundle — see DCR_PRIV_BEGIN in sim/common/cmd_processor.h. That filter has
+// to duplicate the range as literals, because sim/common must not depend on
+// the simx-only checker. These are the compile-time link between the two: if
+// the checker's register window ever moves, the CP's filter moves with it or
+// the build stops, rather than silently reopening the control-plane bypass.
+static_assert(CommandProcessor::DCR_PRIV_BEGIN == DCR_CHECKER_BASE,
+              "CP privileged-DCR window must start at DCR_CHECKER_BASE");
+static_assert(CommandProcessor::DCR_PRIV_END == DCR_CHECKER_END,
+              "CP privileged-DCR window must end at DCR_CHECKER_END");
 
 namespace {
 

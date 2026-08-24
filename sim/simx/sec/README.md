@@ -202,6 +202,61 @@ buffer is still real data — owner 1's grant was never touched. Before the
 per-owner epoch table, this same test failed: bumping the single global epoch
 revoked both grants at once.
 
+## The setup channel, and what is *not* part of it
+
+The checker's policy registers (`0x300`–`0x340`) are configuration, not data.
+The threat model treats the **host command ring** as the attested channel that
+owns them: every demo above programs its policy with `vx_enqueue_dcr_write`,
+which the runtime turns into a `CMD_DCR_WRITE` ring command.
+
+Device-resident command bundles are deliberately *not* part of that channel.
+Two of them exist — a `CMD_LAUNCH_QMD` descriptor and an `OP_DRAW` step list —
+and both are read out of device memory by the Command Processor at execution
+time. That memory is unclaimed, and the boot policy leaves unclaimed memory
+`OWNER_ANY | R|W`, so a tenant kernel can rewrite a bundle after the host
+staged it and before the CP reads it. Replaying its pairs unfiltered would let
+a tenant forge
+
+```
+{DCR_CHECKER_BUF_OWNER (0x302), self}   {DCR_CHECKER_BUF_COMMIT (0x305), 1}
+```
+
+and claim a victim's buffer, or `{DCR_CHECKER_EPOCH (0x306), 0}` to attempt to
+walk a revocation back. The CP reads the bundle *functionally* — a `memcpy` out
+of RAM, never a `MemReq` — so nothing about this attack crosses the LLC→DRAM
+enforcement point and the checker cannot see it at all: the data plane is
+simply told to hand the buffer over.
+
+`CommandProcessor::DCR_PRIV_BEGIN`/`END` (`sim/common/cmd_processor.h`) close
+it: DCR writes into the checker's window are dropped when they arrive from a
+bundle, and counted in the CP's read-only `Q_DCR_BLOCKED` register (MMIO
+`0x134`) so the attempt is observable rather than silent. The window is
+duplicated as literals there because `sim/common` must not depend on the
+simx-only checker; `mem_checker.cpp` carries `static_assert`s tying the two
+definitions together, so the window cannot move on one side only.
+
+Nothing legitimate is filtered — the runtime only ever packs KMU registers
+(`VX_DCR_KMU_*`, `0x010`–`0x023`) into a QMD (`cmd_stage_qmds()` in
+`sw/runtime/common/queue.cpp`), and the ring path is untouched. The regression
+is `tests/unittest/cp_dcr_filter`, which drives the real CP model through its
+MMIO surface with a forged bundle:
+
+```sh
+make -C tests/unittest/cp_dcr_filter run   # from the build directory
+```
+
+It asserts that the legitimate KMU pairs in the same bundle still apply in
+order, that nothing in `[0x300, 0x340)` reaches the DCR bus, that
+`Q_DCR_BLOCKED` counts exactly the attempts, and that a ring `CMD_DCR_WRITE`
+still programs the checker. Neutering the filter makes it fail.
+
+Note the scope: this closes the *reachability* of the control plane from a
+tenant. It does not authenticate the policy's author on the channel that
+remains — a DCR write is still `{addr, value}` on a broadcast bus with no
+requester identity, so the checker still cannot distinguish an owner
+re-claiming its own buffer from a second tenant claiming it over the ring. See
+`todo.md` §4.
+
 ## Environment variables
 
 `VX_CHECKER` gates everything else — with it unset, the rest are ignored and the
