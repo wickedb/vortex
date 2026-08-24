@@ -136,6 +136,19 @@ public:
     uint64_t dcr_claims = 0;      // buffer claims committed over the DCR path
     uint64_t headers_written = 0; // header-store entries those claims installed
     uint64_t epoch_bumps = 0;     // per-owner epoch-table writes (scoped revocations)
+    // Claims refused because a granule they cover already belongs to another
+    // owner. Granule exclusivity is what lets one writer id per cache sector
+    // be sufficient (install_claim(), todo.md #8); a non-zero count here means
+    // a setup would have put two owners in one granule and was fail-closed.
+    uint64_t claims_rejected = 0;
+    // Granules overwritten by their *existing* owner (re-grant). Distinguishes
+    // a clean setup from a clobbered one: cross-owner overwrite is impossible
+    // by construction now, so this counts only legitimate re-claims.
+    uint64_t headers_reclaimed = 0;
+    // Committed claims whose base or size was not granule-aligned. Diagnostic
+    // only — legal and harmless under a single owner, but it is the condition
+    // that makes outward rounding able to reach a neighbour's granule.
+    uint64_t claims_unaligned = 0;
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
