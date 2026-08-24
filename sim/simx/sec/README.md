@@ -17,13 +17,32 @@ binding is byte-for-byte what upstream does.
 
 ## Build
 
+Vortex builds **out of tree**: all commands below run from a configured build
+directory, not the source root (`make -C sim/simx` from the source root fails —
+it has no `config.mk`). If you do not already have one, configure it once (see
+the top-level `README.md` for toolchain setup):
+
 ```sh
-make -C sim/simx
+mkdir build && cd build
+../configure --xlen=32 --tooldir=$HOME/tools
+make -s            # full build (first time)
+```
+
+To rebuild only the SimX simulator after editing `sec/` or `mem/` sources:
+
+```sh
+make -C sim/simx   # run from inside the build directory
 ```
 
 ## The three demos
 
-Run from the repo root. Each ends in `PASSED!` or `FAILED!`.
+Run **from the build directory** (`blackbox.sh` resolves apps against the build
+tree). Each ends in `PASSED!` or `FAILED!`.
+
+> **New regression tests.** When a test directory is added under
+> `tests/regression/` in the source tree (e.g. `revoke_scope`), copy it into the
+> build tree before running it — the build tree is populated at configure time:
+> `cp -r ../tests/regression/revoke_scope tests/regression/`.
 
 ### 1. I didn't break the baseline
 
