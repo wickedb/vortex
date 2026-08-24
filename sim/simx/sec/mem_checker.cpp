@@ -282,6 +282,10 @@ public:
            << ", epoch=" << this->epoch_for(last_revoked_owner_);
       }
       os << std::endl;
+      os << "CHECKER: claims: rejected=" << perf_stats_.claims_rejected
+         << ", reclaimed=" << perf_stats_.headers_reclaimed
+         << ", unaligned=" << perf_stats_.claims_unaligned
+         << std::endl;
     }
     if (fault_.valid) {
       os << "CHECKER: first_fault: addr=0x" << std::hex << fault_.addr << std::dec
@@ -312,13 +316,55 @@ private:
   // gets the staged owner/perms/epoch. Indexing matches check()'s
   // (id & header_mask_), so the claim lands on exactly the entries the
   // data path will consult.
+  //
+  // Granule exclusivity (fail-closed). A claim is rejected outright if any
+  // granule it would cover already belongs to a *different* non-OWNER_ANY
+  // owner. This is the invariant the write-back-cache identity fix depends
+  // on: one writer id is stamped per cache sector, but the sector's dirty
+  // mask accumulates bytes from every writer, so if two owners could share a
+  // granule they could share a sector, and the last writer's identity would
+  // authorize the other owner's bytes on the merged writeback (todo.md #8).
+  // Enforcing exclusivity here means two owners can never reach the same
+  // sector, which is what makes one writer id per sector sufficient.
+  //
+  // Note this is deliberately *not* a blanket "base must be granule-aligned"
+  // rule. Alignment is neither necessary nor sufficient: a single-owner claim
+  // may sit unaligned and overlap code/stack granules harmlessly (all traffic
+  // is one eid — tests/regression/vecadd_claimed relies on this to stay
+  // cycle-identical to vecadd), while two *aligned* claims can still collide
+  // through outward rounding when a size spills past a granule boundary.
+  // Cross-owner conflict is the condition that actually matters, so that is
+  // the one enforced; misalignment is counted for diagnostics instead.
   void install_claim() {
     if (claim_.size == 0)
       return;
     uint64_t first = uint64_t(claim_.base) >> config_.buffer_log2;
     uint64_t last  = (uint64_t(claim_.base) + claim_.size - 1) >> config_.buffer_log2;
+
+    // Diagnostic: does this claim rely on the padding convention the
+    // multi-tenant tests follow? Counted, never rejected.
+    uint64_t granule_mask = (1ull << config_.buffer_log2) - 1;
+    if ((uint64_t(claim_.base) & granule_mask) != 0
+     || (uint64_t(claim_.size) & granule_mask) != 0)
+      ++perf_stats_.claims_unaligned;
+
+    // Pre-pass: reject before mutating anything, so a rejected claim leaves
+    // the header store exactly as it was.
+    for (uint64_t id = first; id <= last; ++id) {
+      const auto& header = header_store_[id & header_mask_];
+      if (header.owner_eid != OWNER_ANY && header.owner_eid != claim_.owner) {
+        ++perf_stats_.claims_rejected;
+        return;
+      }
+    }
+
     for (uint64_t id = first; id <= last; ++id) {
       auto& header = header_store_[id & header_mask_];
+      // Re-claim by the same owner (e.g. a Phase 4 re-grant) is allowed and
+      // counted, so "no owner ever silently replaced another" is a measured
+      // zero rather than an assumption.
+      if (header.owner_eid == claim_.owner)
+        ++perf_stats_.headers_reclaimed;
       header.owner_eid = claim_.owner;
       header.perms = claim_.perms;
       header.shared_perms = claim_.shared;
