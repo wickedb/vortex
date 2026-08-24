@@ -102,6 +102,29 @@ The 288 denies split into 32 faulted reads and 256 dropped writes — reads get 
 poison response, writes are simply dropped, since writes are posted and have no
 response to fault.
 
+**Under the full cache hierarchy** (`--l2cache --l3cache`), the same demo also
+passes:
+
+```sh
+VX_CHECKER=1 VX_CHECKER_ENFORCE=1 VX_CHECKER_STATS=1 \
+  ./ci/blackbox.sh --driver=simx --app=twotenant --cores=2 --l2cache --l3cache
+```
+
+```
+CHECKER: reqs=450, checked=450, allow=388, deny=62
+CHECKER: enforce: faulted_reads=31, dropped_writes=31
+PASSED!
+```
+
+This configuration previously **failed** with 992 errors — tenant 1's writes
+landed in tenant 0's buffer — because a dirty-line writeback from a shared
+write-back LLC carried the *evictor's* identity, not the writer's, so the
+memory-side checker misattributed it (`caches.md` #8, adapting CHERIoT's
+identity-carrying metadata). The fix stamps the writing hart into each dirtied
+sector (`mem/cache.cpp`) and replays it into every writeback, so requester
+identity survives the write-back cache. Single-tenant runs are byte-identical to
+before (the tag is inert when there is one owner).
+
 ### 3. Epoch revocation
 
 Tenant 0 grants tenant 1 read access for epoch 0. The host revokes with **two
