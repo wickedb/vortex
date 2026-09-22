@@ -42,9 +42,12 @@ bool env_flag(const char* name, bool fallback) {
 }
 
 // Bound the modelled isolated store so a fine-granularity sweep can't try to
-// allocate a header per cache line across the whole 32-bit space. Buffers
-// beyond the cap wrap; at the granularities this study cares about (>=64 KB)
-// the cap is never reached.
+// allocate a header per cache line across the whole 32-bit space. At the
+// granularities this study cares about (>=4 KB on a 32-bit space) the cap is
+// never reached and every buffer gets its own entry. Below that the store can
+// no longer cover the address space, and buffers whose ids collide in it
+// contend for one entry — which the tag turns into a refused claim
+// (claims_aliased) rather than into two buffers sharing one policy.
 constexpr uint32_t MAX_HEADER_ENTRIES = 1u << 20;
 
 // Bound growth of the per-owner epoch table the same way — owner ids are
@@ -84,8 +87,34 @@ private:
   // The isolated metadata region. Writable only through this object — no
   // MemReq path reaches it, which is the simulator's stand-in for "checker-
   // writable only" (thesis §6: integrity by construction, no crypto).
-  std::vector<BufferHeader> header_store_;
+  //
+  // Direct-mapped and tagged: entry (id & header_mask_) holds the header for
+  // buffer `tag`, and only for that buffer. An entry whose tag does not match
+  // the buffer being looked up is not a header for it — the buffer is
+  // unclaimed and falls to default_header_. Without the tag, two buffer ids
+  // colliding modulo the store size would silently share one header, so a
+  // claim on one would rewrite the other's policy and a check on one would be
+  // answered from the other's owner (todo.md #5).
+  //
+  // The tag is what makes the fail-closed rule in install_claim() expressible,
+  // and the fail-closed rule is in turn what makes the permissive default on a
+  // tag miss sound: an installed header is never displaced — a colliding claim
+  // is refused instead — so "tag does not match" always means "never claimed",
+  // never "claimed and evicted".
+  struct StoreEntry {
+    BufferHeader header;
+    uint64_t     tag = 0;
+    bool         valid = false;
+  };
+  std::vector<StoreEntry> header_store_;
   uint32_t header_mask_;
+
+  // Policy for granules with no installed header. install_single_owner() sets
+  // it; the boot default is OWNER_ANY + R|W, i.e. unclaimed memory (kernel
+  // code, stacks, launch args) is system/shared. Holding it in one place
+  // rather than pre-filling every entry is what lets an entry's valid bit mean
+  // "claimed" — the property the tag check depends on.
+  BufferHeader default_header_;
 
   std::vector<HCacheEntry> hcache_;
   uint32_t hc_sets_;
@@ -121,13 +150,27 @@ public:
     : simobject_(simobject)
     , config_(config)
     , hc_clock_(0) {
-    // Size the store to cover the device address space at this granularity.
-    uint64_t entries = 1ull << (VX_CFG_MEM_ADDR_WIDTH - std::min<uint32_t>(config_.buffer_log2, VX_CFG_MEM_ADDR_WIDTH));
+    // Size the store to cover the device address space at this granularity,
+    // unless the harness pins a capacity to model a store that cannot.
+    uint64_t entries;
+    if (config_.header_entries != 0) {
+      entries = 1ull << log2ceil(config_.header_entries);
+    } else {
+      entries = 1ull << (VX_CFG_MEM_ADDR_WIDTH - std::min<uint32_t>(config_.buffer_log2, VX_CFG_MEM_ADDR_WIDTH));
+    }
     entries = std::min<uint64_t>(entries, MAX_HEADER_ENTRIES);
     if (entries == 0)
       entries = 1;
     header_store_.resize(entries);
     header_mask_ = uint32_t(entries - 1);
+    config_.header_entries = uint32_t(entries);
+
+    // Boot default: unclaimed memory is system/shared. Overwritten by
+    // install_single_owner() at construction (see processor.cpp).
+    default_header_.owner_eid = OWNER_ANY;
+    default_header_.perms = PERM_R | PERM_W;
+    default_header_.shared_perms = 0;
+    default_header_.grant_epoch = UINT64_MAX;
 
     if (config_.hcache_entries != 0) {
       uint32_t assoc = std::max<uint32_t>(1, std::min(config_.hcache_assoc, config_.hcache_entries));
@@ -150,13 +193,23 @@ public:
 
   ~Impl() {}
 
+  // Installs one owner over all of global memory by moving the *default* —
+  // the policy every granule with no claim of its own falls to. Equivalent to
+  // the old blanket pre-fill of every entry, minus the part that made every
+  // entry look claimed, which is what the tag check needs to distinguish.
   void install_single_owner(uint32_t owner_eid, uint32_t perms) {
-    for (auto& header : header_store_) {
-      header.owner_eid = owner_eid;
-      header.perms = perms;
-      header.shared_perms = 0;
-      header.grant_epoch = UINT64_MAX;
-    }
+    default_header_.owner_eid = owner_eid;
+    default_header_.perms = perms;
+    default_header_.shared_perms = 0;
+    default_header_.grant_epoch = UINT64_MAX;
+  }
+
+  // The policy governing `buffer_id`: its own header if it has one installed,
+  // otherwise the default. The tag comparison is the whole aliasing fix.
+  const BufferHeader& header_for(uint64_t buffer_id) const {
+    const StoreEntry& entry = header_store_[buffer_id & header_mask_];
+    return (entry.valid && entry.tag == buffer_id) ? entry.header
+                                                   : default_header_;
   }
 
   uint64_t epoch_for(uint32_t owner) const {
@@ -276,6 +329,7 @@ public:
        << " cyc"
        << std::endl;
     os << "CHECKER: config: buffer=" << (1ull << config_.buffer_log2) << "B"
+       << ", header_entries=" << config_.header_entries
        << ", hcache_entries=" << config_.hcache_entries
        << ", assoc=" << config_.hcache_assoc
        << ", hit_lat=" << config_.hit_latency
@@ -297,6 +351,7 @@ public:
       }
       os << std::endl;
       os << "CHECKER: claims: rejected=" << perf_stats_.claims_rejected
+         << ", aliased=" << perf_stats_.claims_aliased
          << ", reclaimed=" << perf_stats_.headers_reclaimed
          << ", unaligned=" << perf_stats_.claims_unaligned
          << std::endl;
@@ -319,7 +374,10 @@ private:
   // owner is the core field shifted back out — no new MemReq field. Every
   // single-core configuration resolves to eid 0, so all Phase 2 results stay
   // reproducible by construction. Writeback attribution under this mapping:
-  // phase3/writeback_attribution.md.
+  // sec/README.md §2. (Not phase3/writeback_attribution.md — that records the
+  // earlier decision to exempt writebacks from the owner check, which the
+  // 992-error failure under --cores=2 --l3cache overturned. It predicted that
+  // configuration as post-PoC work; it turned out to be the demo config.)
   uint32_t owner_of(uint32_t hart_id) const {
     constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
     constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
@@ -363,9 +421,25 @@ private:
       ++perf_stats_.claims_unaligned;
 
     // Pre-pass: reject before mutating anything, so a rejected claim leaves
-    // the header store exactly as it was.
+    // the header store exactly as it was. Two independent reasons to refuse,
+    // both fail-closed, counted separately because they say different things
+    // about the setup — one is a policy conflict, the other a capacity limit.
     for (uint64_t id = first; id <= last; ++id) {
-      const auto& header = header_store_[id & header_mask_];
+      const StoreEntry& entry = header_store_[id & header_mask_];
+      if (entry.valid && entry.tag != id) {
+        // The entry this granule indexes belongs to a different buffer.
+        // Installing here would hand that buffer this claim's policy while
+        // leaving it addressable under its own id — silent cross-buffer
+        // corruption, and the reason the store needs a tag at all (todo.md
+        // #5). Refuse whole, whoever owns the occupant: two buffers is the
+        // problem, not two owners.
+        ++perf_stats_.claims_aliased;
+        return;
+      }
+      // Granule exclusivity, as before. An unclaimed granule is governed by
+      // the default, so that is what a cross-owner conflict is measured
+      // against when no header is installed yet.
+      const BufferHeader& header = entry.valid ? entry.header : default_header_;
       if (header.owner_eid != OWNER_ANY && header.owner_eid != claim_.owner) {
         ++perf_stats_.claims_rejected;
         return;
@@ -373,17 +447,21 @@ private:
     }
 
     for (uint64_t id = first; id <= last; ++id) {
-      auto& header = header_store_[id & header_mask_];
+      StoreEntry& entry = header_store_[id & header_mask_];
       // Re-claim by the same owner (e.g. a Phase 4 re-grant) is allowed and
       // counted, so "no owner ever silently replaced another" is a measured
-      // zero rather than an assumption.
-      if (header.owner_eid == claim_.owner)
+      // zero rather than an assumption. Only an installed header can be
+      // re-claimed; first claim over an unclaimed granule is not a re-claim,
+      // which is why the valid bit is part of the test.
+      if (entry.valid && entry.header.owner_eid == claim_.owner)
         ++perf_stats_.headers_reclaimed;
-      header.owner_eid = claim_.owner;
-      header.perms = claim_.perms;
-      header.shared_perms = claim_.shared;
-      header.grant_epoch = (claim_.epoch == 0xFFFFFFFFu) ? UINT64_MAX
-                                                         : uint64_t(claim_.epoch);
+      entry.valid = true;
+      entry.tag = id;
+      entry.header.owner_eid = claim_.owner;
+      entry.header.perms = claim_.perms;
+      entry.header.shared_perms = claim_.shared;
+      entry.header.grant_epoch = (claim_.epoch == 0xFFFFFFFFu) ? UINT64_MAX
+                                                               : uint64_t(claim_.epoch);
       ++perf_stats_.headers_written;
     }
     ++perf_stats_.dcr_claims;
@@ -465,7 +543,7 @@ private:
     }
     uint64_t added = hit ? config_.hit_latency : config_.miss_latency;
 
-    const BufferHeader& header = header_store_[buffer_id & header_mask_];
+    const BufferHeader& header = this->header_for(buffer_id);
     uint32_t owner = this->owner_of(req.hart_id);
     uint32_t need = req.is_write() ? PERM_W : PERM_R;
 
@@ -551,6 +629,7 @@ bool MemChecker::env_config(Config* out) {
   if (!env_flag("VX_CHECKER", false))
     return false;
   out->buffer_log2    = env_u32("VX_CHECKER_BUF_LOG2", 20);
+  out->header_entries = env_u32("VX_CHECKER_HEADER_ENTRIES", 0);
   out->hcache_entries = env_u32("VX_CHECKER_HCACHE_ENTRIES", 16);
   out->hcache_assoc   = env_u32("VX_CHECKER_HCACHE_ASSOC", 4);
   out->hit_latency    = env_u32("VX_CHECKER_HIT_LAT", 0);

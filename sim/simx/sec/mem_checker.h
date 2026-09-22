@@ -21,6 +21,11 @@ namespace vortex {
 // Read-only in steady state: revocation advances `current_epoch` on the
 // checker rather than writing headers, so the check stays a pure cacheable
 // read that can overlap the DRAM access it gates (thesis §6).
+//
+// Headers live in a direct-mapped, *tagged* store (see MemChecker::Config
+// ::header_entries). A granule with no installed header is unclaimed and is
+// governed by the boot default rather than by whatever entry it indexes —
+// which is what makes an untagged store's silent aliasing impossible here.
 struct BufferHeader {
   uint32_t owner_eid = 0;
   uint32_t perms = 0;         // owner access — not epoch-gated
@@ -111,6 +116,14 @@ public:
   struct Config {
     uint32_t num_ports = 1;
     uint32_t buffer_log2 = 20;      // log2 bytes covered by one header (1 MB)
+    // Entries in the isolated header store. 0 = size it to cover the whole
+    // device address space at this granularity, which is the design point (no
+    // buffer can then fail to get an entry). A non-zero value models a store
+    // too small for the address space, which is what a fine-granularity sweep
+    // forces; claims that would collide in it are refused rather than aliased,
+    // so the capacity limit shows up as claims_aliased instead of as silent
+    // policy corruption. Rounded up to a power of two.
+    uint32_t header_entries = 0;
     uint32_t hcache_entries = 16;   // 0 disables the cache: every check is a miss
     uint32_t hcache_assoc = 4;
     uint32_t hit_latency = 0;       // cycles added on a header-cache hit
@@ -157,6 +170,15 @@ public:
     // only — legal and harmless under a single owner, but it is the condition
     // that makes outward rounding able to reach a neighbour's granule.
     uint64_t claims_unaligned = 0;
+    // Claims refused because a granule they cover maps onto a header-store
+    // entry already held by a *different* buffer. The store is direct-mapped
+    // and tagged: entry index is (buffer_id mod entries) and the tag is the
+    // buffer_id, so two buffers whose ids collide modulo the store size want
+    // the same entry. Installing both would silently give one buffer the
+    // other's policy, so the second claim is refused whole (fail closed) and
+    // counted here. Non-zero means the store is too small for the granularity
+    // in use — a capacity result worth reporting, not a bug to route around.
+    uint64_t claims_aliased = 0;
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
