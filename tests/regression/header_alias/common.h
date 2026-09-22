@@ -2,7 +2,7 @@
 #define _COMMON_H_
 
 // header_alias — regression for the direct-mapped header-store aliasing hole
-// (todo.md #5).
+// (PROJECT.md §10, item #5).
 //
 // The header store is indexed (buffer_id & mask). Two buffers whose granule
 // ids collide modulo the store size therefore want the same entry. Before the

@@ -1,7 +1,7 @@
 // Data-plane access checker — LLC→DRAM boundary.
 //
-// Part of the data-centric TEE prototype; see files/thesis.md and
-// files/vortex_simx.md. Kept under sec/ so the thesis work stays separable
+// Part of the data-centric TEE prototype; the argument and the measured
+// results are in playground_2626/PROJECT.md. Kept under sec/ so the thesis work stays separable
 // from upstream Vortex in a diff.
 
 #pragma once
@@ -22,7 +22,7 @@ struct MemReq;
 // made and no latency is injected, so a run with the checker installed is
 // bit-identical to the unprotected baseline *by construction*: it is attached
 // via Memory::PreSendHook, which receives `const MemReq&` and has no way to
-// stall, delay, or mutate the request (phase0/checker_hook_map.md §2.4,
+// stall, delay, or mutate the request (playground_2626/PROJECT.md §8.1,
 // mechanism A).
 //
 // Later phases swap this for a real gate against a header store + header

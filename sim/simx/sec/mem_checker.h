@@ -1,7 +1,7 @@
 // Data-plane access checker — inline module on the LLC→DRAM wire.
 //
-// Part of the data-centric TEE prototype; see files/thesis.md and
-// files/vortex_simx.md. Kept under sec/ so the thesis work stays separable
+// Part of the data-centric TEE prototype; the argument and the measured
+// results are in playground_2626/PROJECT.md. Kept under sec/ so the thesis work stays separable
 // from upstream Vortex in a diff.
 
 #pragma once
@@ -42,7 +42,7 @@ constexpr uint32_t PERM_W = 0x2;
 constexpr uint32_t OWNER_ANY = 0xFFFFFFFFu;
 
 // DCR setup path (Phase 3 step 4). Range 0x300+ reserved for the checker
-// (phase0/checker_hook_map.md §2.5: 0x280–0xFFF free, DXA ends at 0x280).
+// (0x280–0xFFF is free; DXA ends at 0x280. See playground_2626/PROJECT.md §2.4.)
 // A buffer claim is staged across BUF_* registers and installed by a write to
 // BUF_COMMIT; the staged values persist across commits so a later re-grant
 // (Phase 4) can rewrite just BUF_EPOCH and commit again. These model the
@@ -132,7 +132,7 @@ public:
     // implies (a 64 KB header store); both VX_CFG_DCACHE_LATENCY's and
     // VX_CFG_L2_LATENCY's scaling rules give 4 there. Fine granularities push
     // the store off chip and cost a real memory access instead — the harness
-    // sets those explicitly. See phase2/latency_model.md.
+    // sets those explicitly. Derivation: playground_2626/PROJECT.md §8.3.
     uint32_t miss_latency = 4;
     bool     enforce = false;       // Phase 3: a deny actually blocks the request
     // Mechanism self-test. 0 = off; 1 = deny every check (with enforce this
@@ -159,7 +159,7 @@ public:
     uint64_t epoch_bumps = 0;     // per-owner epoch-table writes (scoped revocations)
     // Claims refused because a granule they cover already belongs to another
     // owner. Granule exclusivity is what lets one writer id per cache sector
-    // be sufficient (install_claim(), todo.md #8); a non-zero count here means
+    // be sufficient (install_claim(), playground_2626/PROJECT.md §2.3); a non-zero count here means
     // a setup would have put two owners in one granule and was fail-closed.
     uint64_t claims_rejected = 0;
     // Granules overwritten by their *existing* owner (re-grant). Distinguishes

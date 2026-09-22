@@ -12,7 +12,7 @@
 // produces the isolation.
 
 // Checker DCR registers — mirror of sim/simx/sec/mem_checker.h (range 0x300+,
-// reserved per phase0/checker_hook_map.md §2.5).
+// reserved; see PROJECT.md §2.4).
 #define DCR_CHECKER_BUF_BASE   0x300
 #define DCR_CHECKER_BUF_SIZE   0x301
 #define DCR_CHECKER_BUF_OWNER  0x302

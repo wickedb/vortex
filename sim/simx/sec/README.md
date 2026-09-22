@@ -1,5 +1,9 @@
 # Data-plane access checker — demo guide
 
+> `PROJECT.md` referenced below is `playground_2626/PROJECT.md` in the sibling
+> workspace: the project's single record — the argument, the open items, and the
+> measured results. This file is the run guide and stays with the code.
+
 A prototype data-centric TEE for Vortex, built entirely in the SimX cycle model
 (`sim/simx/`). No RTL is involved: `MemChecker` is a `SimObject` spliced into the
 `l3cache_ → memsim_` request path, which is the off-chip boundary in every cache
@@ -162,7 +166,8 @@ PASSED!
 This configuration previously **failed** with 992 errors — tenant 1's writes
 landed in tenant 0's buffer — because a dirty-line writeback from a shared
 write-back LLC carried the *evictor's* identity, not the writer's, so the
-memory-side checker misattributed it (`todo.md` #8, adapting CHERIoT's
+memory-side checker misattributed it (`PROJECT.md` §2.3,
+adapting CHERIoT's
 identity-carrying metadata). The fix stamps the writing hart into each dirtied
 sector (`mem/cache.cpp`) and replays it into every writeback, so requester
 identity survives the write-back cache. Single-tenant runs are byte-identical to
@@ -193,8 +198,8 @@ The grant state lives only in the checker, so revocation writes no header.
 The cache shootdown a real revocation would need is **not** demonstrated:
 SimX resets every cache sector between launches, which is *stronger* than
 anything this design can issue — `flush_caches()` drains dirty sectors without
-clearing `sec.valid`, so there is no invalidate primitive to cost (`todo.md`
-#9). Revocation's real cost is two register writes plus that missing
+clearing `sec.valid`, so there is no invalidate primitive to cost
+(`PROJECT.md` §10, item #9). Revocation's real cost is two register writes plus that missing
 invalidate; costing it is RTL work.
 
 **Measured** (`--cores=2`):
@@ -277,7 +282,7 @@ buffer — it means no policy was installed, so `bufB` falls to the boot default
 is not. The counter is the only signal, which is why it is in the dump and why
 the regression asserts the unprotected read rather than pretending it denies.
 Making the refusal itself unforgeable to the tenant is the authorship problem
-(`todo.md` #4), not this one.
+(`PROJECT.md` §10, item #4b), not this one.
 
 ## The setup channel, and what is *not* part of it
 
@@ -332,7 +337,7 @@ tenant. It does not authenticate the policy's author on the channel that
 remains — a DCR write is still `{addr, value}` on a broadcast bus with no
 requester identity, so the checker still cannot distinguish an owner
 re-claiming its own buffer from a second tenant claiming it over the ring. See
-`todo.md` §4.
+`PROJECT.md` §10.
 
 ## Environment variables
 

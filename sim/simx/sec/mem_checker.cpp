@@ -94,7 +94,7 @@ private:
   // unclaimed and falls to default_header_. Without the tag, two buffer ids
   // colliding modulo the store size would silently share one header, so a
   // claim on one would rewrite the other's policy and a check on one would be
-  // answered from the other's owner (todo.md #5).
+  // answered from the other's owner (playground_2626/PROJECT.md §10, item #5).
   //
   // The tag is what makes the fail-closed rule in install_claim() expressible,
   // and the fail-closed rule is in turn what makes the permissive default on a
@@ -374,10 +374,10 @@ private:
   // owner is the core field shifted back out — no new MemReq field. Every
   // single-core configuration resolves to eid 0, so all Phase 2 results stay
   // reproducible by construction. Writeback attribution under this mapping:
-  // sec/README.md §2. (Not phase3/writeback_attribution.md — that records the
-  // earlier decision to exempt writebacks from the owner check, which the
-  // 992-error failure under --cores=2 --l3cache overturned. It predicted that
-  // configuration as post-PoC work; it turned out to be the demo config.)
+  // sec/README.md §2. (An earlier note argued writebacks should be *exempt*
+  // from the owner check and filed --cores=2 --l3cache as post-PoC work; that
+  // is the configuration which then failed with 992 errors and forced the
+  // opposite design. It is archived, not live — see playground_2626/PROJECT.md §17.)
   uint32_t owner_of(uint32_t hart_id) const {
     constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
     constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
@@ -395,7 +395,7 @@ private:
   // on: one writer id is stamped per cache sector, but the sector's dirty
   // mask accumulates bytes from every writer, so if two owners could share a
   // granule they could share a sector, and the last writer's identity would
-  // authorize the other owner's bytes on the merged writeback (todo.md #8).
+  // authorize the other owner's bytes on the merged writeback (playground_2626/PROJECT.md §2.3).
   // Enforcing exclusivity here means two owners can never reach the same
   // sector, which is what makes one writer id per sector sufficient.
   //
@@ -430,8 +430,9 @@ private:
         // The entry this granule indexes belongs to a different buffer.
         // Installing here would hand that buffer this claim's policy while
         // leaving it addressable under its own id — silent cross-buffer
-        // corruption, and the reason the store needs a tag at all (todo.md
-        // #5). Refuse whole, whoever owns the occupant: two buffers is the
+        // corruption, and the reason the store needs a tag at all
+        // (playground_2626/PROJECT.md §10, item #5). Refuse whole, whoever owns the occupant:
+        // two buffers is the
         // problem, not two owners.
         ++perf_stats_.claims_aliased;
         return;

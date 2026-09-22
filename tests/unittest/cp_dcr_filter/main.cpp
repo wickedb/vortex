@@ -1,5 +1,5 @@
 // ============================================================================
-// cp_dcr_filter — regression for the control-plane bypass (todo.md §3 / M1).
+// cp_dcr_filter — regression for the control-plane bypass (PROJECT.md §2.4).
 //
 // CommandProcessor::apply_qmd_ replays {dcr_addr, value} pairs read out of
 // device memory. The QMD blob is staged in unclaimed memory, which the memory
