@@ -19,7 +19,7 @@
 // flush_caches() is a writeback drain that never clears sec.valid, so there
 // is no invalidate primitive to cost. This test therefore passes partly on a
 // simulator artifact. Revocation's real cost is two register writes plus an
-// invalidate that does not yet exist (todo.md #9); costing it is RTL work.
+// invalidate that does not yet exist (PROJECT.md §10 #9); costing it is RTL work.
 // Stated so the demo is not read as evidence for the part it assumes.
 
 #include <vortex2.h>

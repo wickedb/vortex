@@ -17,7 +17,7 @@
 //
 // Same caveat as revoke: the cache shootdown a real revocation needs is not
 // demonstrated here. SimX's per-launch cache reset is stronger than anything
-// the design can issue — there is no invalidate primitive (todo.md #9) — so
+// the design can issue — no invalidate primitive exists (PROJECT.md #9) — so
 // this test shows the scoping property, not revocation's true cost.
 
 #include <vortex2.h>
