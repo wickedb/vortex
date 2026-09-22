@@ -12,8 +12,15 @@
 //             vx_enqueue_dcr_write(EPOCH, 1)          ← the entire revocation
 //   launch 2: core 0 reads real data and writes; core 1 reads poison
 //
-// SimX resets caches at each launch, which models the cache shootdown a real
-// revocation requires; the grant state itself lives only in the checker.
+// The grant state itself lives only in the checker, so revocation writes no
+// header. What this test does NOT demonstrate is the cache shootdown a real
+// revocation would need: SimX resets every cache sector between launches, and
+// that reset is *stronger* than anything this design can currently issue —
+// flush_caches() is a writeback drain that never clears sec.valid, so there
+// is no invalidate primitive to cost. This test therefore passes partly on a
+// simulator artifact. Revocation's real cost is two register writes plus an
+// invalidate that does not yet exist (todo.md #9); costing it is RTL work.
+// Stated so the demo is not read as evidence for the part it assumes.
 
 #include <vortex2.h>
 #include "common.h"
