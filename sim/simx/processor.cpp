@@ -35,11 +35,35 @@ static void simx_print_backtrace() {
   std::free(symbols);
 }
 
+namespace {
+// The live instance, for the atexit hook. SimX constructs one ProcessorImpl
+// per process in every lane that matters here.
+ProcessorImpl* g_stats_dump_target = nullptr;
+
+void dump_checker_stats_atexit() {
+  if (g_stats_dump_target != nullptr) {
+    g_stats_dump_target->dump_checker_stats();
+  }
+}
+} // namespace
+
 ProcessorImpl::ProcessorImpl()
   : clusters_(VX_CFG_NUM_CLUSTERS)
 {
   SimPlatform::instance().initialize();
   SimPlatform::instance().set_num_workers(SIMX_NUM_WORKERS);
+
+  // Register the stats dump for process exit as well as destruction, so a host
+  // that leaks the device still reports counters (see dump_checker_stats()).
+  // Registered once; the hook is a no-op when no instance is live.
+  if (Checker::stats_enabled()) {
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+      atexit_registered = true;
+      std::atexit(dump_checker_stats_atexit);
+    }
+    g_stats_dump_target = this;
+  }
 
 	assert(VX_CFG_PLATFORM_MEMORY_DATA_SIZE == VX_CFG_MEM_BLOCK_SIZE);
 
@@ -208,15 +232,23 @@ ProcessorImpl::ProcessorImpl()
   this->reset();
 }
 
+// Opt-in (VX_CHECKER_STATS=1) so a default run's output stays byte-identical
+// to baseline and can be diffed directly. Written to stderr to keep it out of
+// the PERF stream the test harness parses.
+void ProcessorImpl::dump_checker_stats() {
+  if (checker_stats_dumped_ || !Checker::stats_enabled())
+    return;
+  checker_stats_dumped_ = true;
+  checker_.dump(std::cerr);
+  if (mem_checker_) {
+    mem_checker_->dump(std::cerr);
+  }
+}
+
 ProcessorImpl::~ProcessorImpl() {
-  // Opt-in (VX_CHECKER_STATS=1) so a default run's output stays byte-identical
-  // to baseline and can be diffed directly. Written to stderr to keep it out of
-  // the PERF stream the test harness parses.
-  if (Checker::stats_enabled()) {
-    checker_.dump(std::cerr);
-    if (mem_checker_) {
-      mem_checker_->dump(std::cerr);
-    }
+  this->dump_checker_stats();
+  if (g_stats_dump_target == this) {
+    g_stats_dump_target = nullptr;
   }
   SimPlatform::instance().finalize();
 }

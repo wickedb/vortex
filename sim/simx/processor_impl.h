@@ -36,6 +36,14 @@ public:
   ProcessorImpl();
   ~ProcessorImpl();
 
+  // Emits the checker counters (VX_CHECKER_STATS=1) at most once per object.
+  // Normally called from ~ProcessorImpl, but also registered with atexit():
+  // a host that never releases the device — PoCL does not, so every OpenCL
+  // workload under tests/opencl exits with the Processor still alive — would
+  // otherwise produce no counters at all, and §8.4 requires reading
+  // claims_rejected / claims_aliased before a run's protection can be trusted.
+  void dump_checker_stats();
+
   void attach_ram(RAM* mem);
 
   void reset();
@@ -94,6 +102,10 @@ private:
 
   // True once any cluster's walker complex has latched a page fault.
   bool mmu_fault_pending() const;
+
+  // Guards dump_checker_stats() against emitting twice when both the
+  // destructor and the atexit hook fire.
+  bool        checker_stats_dumped_ = false;
 
   Kmu::Ptr    kmu_;
   std::vector<Cluster::Ptr> clusters_;
