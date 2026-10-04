@@ -135,6 +135,11 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         logic                          is_hit, is_dirty, mshr_pending;
         logic                          is_refill; // fill into an already-resident line (sector refill)
         logic [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask; // per-sector dirty of the evict way
+        // Per-sector writer id of the evict way, read at S0 with the dirty mask
+        // and carried to the writeback beat at stC. Must travel with the mask:
+        // the beat that writes sector k back needs the id recorded for sector k
+        // (PROJECT.md §2.3).
+        logic [`CS_SECTORS_PER_LINE-1:0][MEM_OWNER_WIDTH-1:0] evict_writer_ids;
         logic [`CS_TAG_SEL_BITS-1:0]   evict_tag;
         logic [MSHR_ADDR_WIDTH-1:0]    mshr_previd;
     } lookup_t;
@@ -516,6 +521,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire [`CS_WAY_SEL_WIDTH-1:0] hit_idx_st0;
     wire evict_dirty_st0;
     wire [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask_st0;
+    wire [`CS_SECTORS_PER_LINE-1:0][MEM_OWNER_WIDTH-1:0] evict_writer_ids_st0;
     wire [`CS_TAG_SEL_BITS-1:0] evict_tag_st0;
 
     // A fill into a line that is already resident (a sector refill) must target
@@ -589,12 +595,17 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .line_idx_n  (sel_req.req.addr[`CS_LINE_SEL_BITS-1:0]),
         .line_tag    (line_tag_st0),
         .sector_idx  (sector_idx_st0),
+        // st0's own owner: the tags module operates entirely on st0, so this
+        // must be the request being committed there (see VX_cache_tags).
+        // Cast by offset, the same idiom core_req_amo uses for the AMO sideband.
+        .req_owner   (st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
         .evict_way   (evict_way_st0),
         .fill_way_oh (fill_way_oh_st0),
         .tag_matches (tag_matches_st0),
         .line_present (line_present_st0),
         .evict_dirty (evict_dirty_st0),
         .evict_dirty_mask (evict_dirty_mask_st0),
+        .evict_writer_ids (evict_writer_ids_st0),
         .evict_tag   (evict_tag_st0)
     );
 
@@ -632,6 +643,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         lk_st0.is_dirty     = evict_dirty_st0;
         lk_st0.is_refill    = st0.req.is_fill && line_present_any_st0;
         lk_st0.evict_dirty_mask = evict_dirty_mask_st0;
+        lk_st0.evict_writer_ids = evict_writer_ids_st0;
         lk_st0.evict_tag    = evict_tag_st0;
         lk_st0.mshr_previd  = mshr_previd;
         lk_st0.mshr_pending = mshr_pending_raw && ~is_amo_fwd_st0;
@@ -1258,6 +1270,33 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         assign mreq_queue_tag = stC.req.mshr_id;
     end
 
+    // ---- REPLAY the writer id into the writeback (PROJECT.md §2.3) ----
+    // A writeback is issued by whichever request triggered the eviction, so
+    // stC.req.attr names the EVICTOR, not whoever dirtied the line. Authorizing
+    // a dirty eviction under the evictor is unsound in exactly the case the
+    // threat model cares about -- it produced 992/1024 errors in SimX, with
+    // counters identical to a correct run. On a writeback beat, substitute the
+    // owner recorded for that sector when it was dirtied; every other request
+    // (fill, write-through store, AMO forward) is issued by its own requester
+    // and keeps its attr untouched.
+    wire [`UP(MEM_ATTR_WIDTH)-1:0] mreq_queue_attr;
+    if (WRITEBACK) begin : g_mreq_attr_wb
+        wire [MEM_OWNER_WIDTH-1:0] wb_writer = stC.lk.evict_writer_ids[wb_sector];
+        // Overwrite just the owner field and leave every other attr bit alone.
+        // A field assignment rather than a concatenation, so this stays correct
+        // if another field is ever appended above owner.
+        reg [`UP(MEM_ATTR_WIDTH)-1:0] wb_attr;
+        always @(*) begin
+            wb_attr = stC.req.attr;
+            wb_attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH] = wb_writer;
+        end
+        assign mreq_queue_attr = is_wb_beat ? wb_attr : stC.req.attr;
+    end else begin : g_mreq_attr_wt
+        // Write-through: the store itself pushes the request, so its attr is
+        // already the requester's. Nothing to substitute.
+        assign mreq_queue_attr = stC.req.attr;
+    end
+
     assign mreq_queue_pop = mem_req_valid && mem_req_ready;
 
     VX_fifo_queue #(
@@ -1270,7 +1309,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .reset    (reset),
         .push     (mreq_queue_push),
         .pop      (mreq_queue_pop),
-        .data_in  ({mreq_queue_rw, mreq_queue_addr, mreq_queue_byteen, mreq_queue_data, mreq_queue_tag, stC.req.attr}),
+        .data_in  ({mreq_queue_rw, mreq_queue_addr, mreq_queue_byteen, mreq_queue_data, mreq_queue_tag, mreq_queue_attr}),
         .data_out ({mem_req_rw, mem_req_addr, mem_req_byteen, mem_req_data, mem_req_tag, mem_req_attr}),
         .empty    (mreq_queue_empty),
         .alm_full (mreq_queue_alm_full),
