@@ -34,7 +34,13 @@ override CONFIGS += -DSIMULATION -DSV_DPI
 XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
 
 DBG_FLAGS += -DVX_DBG_DEBUG_LEVEL=$(DEBUG) $(DBG_TRACE_FLAGS)
-RTL_PKGS = $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/fpu/VX_fpu_pkg.sv
+# VX_tlb_pkg is imported unconditionally by Vortex.sv's module header, so it has
+# to be parsed before Vortex regardless of whether VM is enabled: a package named
+# in an import list must already be declared at that point (IEEE 1800 26.3), and
+# the -I/-y directory search that finds modules by filename does not apply.
+# hw/syn/firesim/Makefile and hw/syn/xilinx/dut/catalog.mk already list it; the
+# rtlsim lane did not, so a VM-disabled build failed with PKGNODECL.
+RTL_PKGS = $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/fpu/VX_fpu_pkg.sv $(RTL_DIR)/vm/VX_tlb_pkg.sv
 
 FPU_INCLUDE = -I$(RTL_DIR)/fpu
 ifneq (,$(filter -DVX_CFG_FPU_TYPE_FPNEW -DVX_CFG_TCU_TYPE_FPNEW, $(XCONFIGS)))
