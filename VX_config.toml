@@ -248,6 +248,59 @@ VX_CFG_L3_CRSQ_SIZE = 0
 VX_CFG_L3_NUM_BANKS = "expr: pow(2, clog2(min($VX_CFG_L3_NUM_REQS, 16)))"
 VX_CFG_L3_MEM_PORTS = "expr: min($VX_CFG_L3_NUM_BANKS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS) if $VX_CFG_L3_ENABLE else min($VX_CFG_L3_NUM_REQS, $VX_CFG_PLATFORM_MEMORY_NUM_BANKS)"
 
+# Data-plane access checker (data-centric TEE prototype — RTL_PLAN.md §4).
+#
+# Mirrors MemChecker::Config field for field so the RTL and SimX design points
+# cannot silently diverge; the DCR register numbers themselves live in
+# VX_types.toml [dcr_checker], which the host runtime also reads.
+#
+# Disabled by default: with VX_CFG_CHECKER_ENABLE=false the checker is not
+# instantiated at all and the L3->DRAM path must be byte-for-byte upstream —
+# not "a passthrough", absent. That is what makes the baseline comparison in
+# PROJECT.md §7 honest, and R5 measures its deltas against it.
+[checker]
+VX_CFG_CHECKER_ENABLE = false
+
+# log2 bytes covered by one header. 20 = 1 MB, the design point: coarse enough
+# that the metadata working set is a handful of entries (PROJECT.md §2.1).
+VX_CFG_CHECKER_BUF_LOG2 = 20
+
+# Entries in the isolated header store. 0 sizes it to cover the device address
+# space at this granularity, so every granule gets its own entry and no two
+# buffers can contend. A non-zero value models a store that cannot cover the
+# space — what the granularity sweep forces — and colliding claims are then
+# refused rather than aliased.
+VX_CFG_CHECKER_HEADER_ENTRIES = 0
+
+# Header cache: presence tags only, no policy data, so it cannot go stale —
+# which is why revocation needs no header-cache invalidation (ledger #7).
+VX_CFG_CHECKER_HCACHE_ENTRIES = 16
+VX_CFG_CHECKER_HCACHE_ASSOC = 4
+
+# Cycles added on a header-cache hit. 0 is the design point and it is
+# LOAD-BEARING: at a ~99.99% hit rate, zero-versus-one cycle is +0.000% against
+# +0.339% (PROJECT.md §7.3) — 340x the entire miss path. Whether 0 survives
+# synthesis is the question the RTL track exists to answer (R5).
+VX_CFG_CHECKER_HIT_LATENCY = 0
+
+# Cycles added on a miss (isolated-store fetch). 4 is Vortex's own array
+# latency for an on-chip SRAM of the size the 1 MB design point implies; both
+# DCACHE_LATENCY's and L2_LATENCY's scaling rules give 4 there. Nothing is
+# imported from a paper, so nothing needs defending from one (§8.3).
+VX_CFG_CHECKER_MISS_LATENCY = 4
+
+# Per-owner epoch counter width. SimX uses 64 bits, which is meaningless in
+# hardware: the monotonicity guard means the width only bounds how many scoped
+# revocations a session can express. 16 bits = 65k per owner. An R5 area input.
+VX_CFG_CHECKER_EPOCH_WIDTH = 16
+
+# A deny actually blocks: reads answered with poison, writes dropped. Off by
+# default so a run's deny counts are observable without perturbing the data the
+# kernel sees -- the same split VX_CHECKER_ENFORCE makes in SimX (§8.3).
+# Integer rather than a boolean: the TOML auto-mirrors only `*_ENABLE`
+# booleans into `*_ENABLED`, so an int keeps one macro that is always defined.
+VX_CFG_CHECKER_ENFORCE = 0
+
 [lmem]
 VX_CFG_LMEM_LOG_SIZE = 14
 VX_CFG_LMEM_NUM_BANKS = "expr: $VX_CFG_NUM_LSU_LANES"
