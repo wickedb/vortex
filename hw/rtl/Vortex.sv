@@ -298,9 +298,14 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         assign mem_req_tag[i]    = chk_out_tag;
     end
 
-    // Tail of the DCR chain continues to the clusters.
-    assign dcr_bus_if.rsp_valid = chk_dcr_if[L3_MEM_PORTS].rsp_valid;
-    assign dcr_bus_if.rsp_data  = chk_dcr_if[L3_MEM_PORTS].rsp_data;
+    // The checkers only observe DCR writes; the clusters' path (below) is the
+    // sole driver of dcr_bus_if.rsp_*, so the chain's tail answers nothing.
+    assign chk_dcr_if[L3_MEM_PORTS].rsp_valid = 1'b0;
+    assign chk_dcr_if[L3_MEM_PORTS].rsp_data  = '0;
+    `UNUSED_VAR (chk_dcr_if[L3_MEM_PORTS].req_valid)
+    `UNUSED_VAR (chk_dcr_if[L3_MEM_PORTS].req_data)
+    `UNUSED_VAR (chk_dcr_if[0].rsp_valid)
+    `UNUSED_VAR (chk_dcr_if[0].rsp_data)
 `else
     for (genvar i = 0; i < L3_MEM_PORTS; ++i) begin : g_mem_bus_if
         assign mem_req_valid[i]  = mem_bus_if[i].req_valid;
