@@ -373,6 +373,8 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     end else begin : g_no_dirty_store
         assign dirty_rdata = '0;
         `UNUSED_VAR ({dirty_wren, dirty_wdata, dirty_rdata})
+        assign wtag_rdata = '0;
+        `UNUSED_VAR ({wtag_wren, wtag_wdata, wtag_rdata})
     end
 
 endmodule
