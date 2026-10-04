@@ -26,6 +26,7 @@ show_help()
 {
     show_usage
     echo "  where"
+    echo "--checker / --checker-enforce: build the data-plane access checker in (RTL lanes; compile-time)"
     echo "--driver: gpu, simx, rtlsim, opae, xrt, aved"
     echo "--target: aved driver only -- avedsim (default), sim, hw"
     echo "--app: any subfolder test under regression, graphics, mpi, opencl, or hip"
@@ -72,6 +73,13 @@ parse_args() {
             --cores=*)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_NUM_CORES=${i#*=}") ;;
             --warps=*)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_NUM_WARPS=${i#*=}") ;;
             --threads=*) CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_NUM_THREADS=${i#*=}") ;;
+            # The data-plane checker is a COMPILE-TIME config in RTL, unlike
+            # SimX where VX_CHECKER=1 is an environment variable. Without these
+            # flags an rtlsim run silently builds a GPU with no checker at all,
+            # and a cross-tenant test then "fails" for the right reason in the
+            # wrong way. See RTL_PLAN.md R4.
+            --checker)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_ENABLE") ;;
+            --checker-enforce) CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_ENABLE -DVX_CFG_CHECKER_ENFORCE=1") ;;
             --l2cache)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_L2_ENABLE") ;;
             --l3cache)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_L3_ENABLE") ;;
             --perf=*)   CONFIGS=$(add_option "$CONFIGS" "-DPERF_ENABLE"); PERF_CLASS=${i#*=} ;;
