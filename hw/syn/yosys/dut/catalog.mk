@@ -9,7 +9,7 @@
 # synthesizes, so both gates measure the same modules and a divergence between
 # them is meaningful rather than an artefact of two DUT lists.
 
-DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor vortex
+DUTS := cache core tcu gfx tex raster om rtu dxa vm tensor mem_checker vortex
 
 UNITTEST_DIR ?= $(VORTEX_HOME)/hw/unittest
 
@@ -66,6 +66,18 @@ tensor_CFG := -DVX_CFG_NUM_THREADS=16 -DVX_CFG_NUM_WARPS=16 -DVX_CFG_EXT_TCU_ENA
               -DVX_CFG_EXT_DXA_ENABLE -DVX_CFG_TCU_WGMMA_ENABLE -DVX_CFG_TCU_MX_ENABLE \
               -DVX_CFG_EXT_A_ENABLE -DVX_CFG_NUM_CORES=2 -DVX_CFG_SOCKET_SIZE=2 \
               -DVX_CFG_PLATFORM_MEMORY_NUM_BANKS=1 -DVX_CFG_L2_ENABLE -DVX_CFG_L2_SIZE=262144
+
+# Data-plane access checker (data-centric TEE). The same hw/unittest top the R1
+# testbench verifies, so the module measured here is the module that was tested.
+# NUM_CORES=2 to match the TB: a single-core build has only one principal, so the
+# owner field degenerates and the area number would understate the comparison
+# logic. Report the header store separately from the checker logic -- and note
+# the writer-id metadata (R2) is NOT in this DUT; it lives in the cache, and
+# PROJECT.md is explicit that it must be reported apart or a reviewer will
+# assume it was hidden.
+mem_checker_TOP := VX_mem_checker_top
+mem_checker_INC := -I$(UNITTEST_DIR)/mem_checker
+mem_checker_CFG := -DVX_CFG_NUM_CORES=2 -DVX_CFG_CHECKER_ENABLE
 
 # The whole GPU. Hours-long; nightly only, never a PR gate.
 vortex_TOP := Vortex
