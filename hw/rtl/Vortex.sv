@@ -162,6 +162,105 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .mem_bus_if     (mem_bus_if)
     );
 
+`ifdef VX_CFG_CHECKER_ENABLE
+    // ====================================================================
+    // Data-plane access checker, spliced on the LLC->DRAM wire.
+    //
+    // This is the off-chip boundary in EVERY cache configuration: the L3 is
+    // instantiated with PASSTHRU when disabled and acts as a transparent
+    // arbiter, so the splice point does not move when a sweep changes cache
+    // config. Placing it here also means every lane inherits it from one
+    // instantiation -- rtlsim, OPAE and the Alveo path all instantiate Vortex.
+    //
+    // Note the checker sits UPSTREAM of the port assignment below, where attr
+    // is discarded. Owner identity therefore never crosses the top-level port,
+    // so the AXI shell does not inherit the width (RTL_PLAN.md §2).
+    //
+    // One instance per port, each with its own policy state, with the DCR
+    // stream chained through them so every instance observes every claim and
+    // revocation. That duplicates the header store per port (2x 12 KB at the
+    // default config) -- correct and simple, but an R5 area item: a shared
+    // store with per-port header caches would halve it.
+    // ====================================================================
+    localparam CHK_ASHIFT = `CLOG2(L3_SECTOR_SIZE);
+
+    VX_dcr_bus_if chk_dcr_if[L3_MEM_PORTS+1]();
+    assign chk_dcr_if[0].req_valid = dcr_bus_if.req_valid;
+    assign chk_dcr_if[0].req_data  = dcr_bus_if.req_data;
+
+    for (genvar i = 0; i < L3_MEM_PORTS; ++i) begin : g_checker
+        wire chk_out_valid, chk_out_rw, chk_out_deny, chk_out_fault;
+        wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] chk_out_addr;
+        wire [L3_SECTOR_SIZE*8-1:0] chk_out_data;
+        wire [L3_SECTOR_SIZE-1:0]   chk_out_byteen;
+        wire [L3_MEM_TAG_WIDTH-1:0] chk_out_tag;
+        `UNUSED_VAR ({chk_out_deny, chk_out_fault})
+
+        VX_mem_checker #(
+            .INSTANCE_ID ($sformatf("checker%0d", i)),
+            .DATA_SIZE   (L3_SECTOR_SIZE),
+            .TAG_WIDTH   (L3_MEM_TAG_WIDTH),
+            .FAULT_DEPTH (`VX_CFG_L3_MSHR_SIZE)
+        ) chk_inst (
+            .clk            (clk),
+            .reset          (reset),
+            .dcr_bus_if     (chk_dcr_if[i]),
+            .dcr_bus_out_if (chk_dcr_if[i+1]),
+            // The bus carries a BLOCK address; the checker resolves granules
+            // from a byte address, as SimX does.
+            .req_valid      (mem_bus_if[i].req_valid),
+            .req_rw         (mem_bus_if[i].req_data.rw),
+            .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(mem_bus_if[i].req_data.addr) << CHK_ASHIFT),
+            .req_owner      (mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
+            .req_tag        (mem_bus_if[i].req_data.tag),
+            .req_data       (mem_bus_if[i].req_data.data),
+            .req_byteen     (mem_bus_if[i].req_data.byteen),
+            .req_ready      (mem_bus_if[i].req_ready),
+            .out_valid      (chk_out_valid),
+            .out_rw         (chk_out_rw),
+            .out_addr       (chk_out_addr),
+            .out_data       (chk_out_data),
+            .out_byteen     (chk_out_byteen),
+            .out_tag        (chk_out_tag),
+            .out_deny       (chk_out_deny),
+            .out_fault      (chk_out_fault),
+            .out_ready      (mem_req_ready[i]),
+            .dram_rsp_valid (mem_rsp_valid[i]),
+            .dram_rsp_data  (mem_rsp_data[i]),
+            .dram_rsp_tag   (mem_rsp_tag[i]),
+            .dram_rsp_ready (mem_rsp_ready[i]),
+            .rsp_valid      (mem_bus_if[i].rsp_valid),
+            .rsp_data       (mem_bus_if[i].rsp_data.data),
+            .rsp_tag        (mem_bus_if[i].rsp_data.tag),
+            .rsp_ready      (mem_bus_if[i].rsp_ready),
+            `UNUSED_PIN (fault_overflow),
+            `UNUSED_PIN (cnt_reqs),    `UNUSED_PIN (cnt_checked),
+            `UNUSED_PIN (cnt_bypassed),`UNUSED_PIN (cnt_allows),
+            `UNUSED_PIN (cnt_denies),  `UNUSED_PIN (cnt_hc_hits),
+            `UNUSED_PIN (cnt_faulted_reads), `UNUSED_PIN (cnt_dropped_writes),
+            `UNUSED_PIN (cnt_hc_misses),`UNUSED_PIN (cnt_claims),
+            `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
+            `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
+            `UNUSED_PIN (cnt_reclaimed)
+        );
+
+        // Request side: the checker gates what reaches DRAM. Payload fields it
+        // does not inspect (data, byteen) pass through unchanged.
+        assign mem_req_valid[i]  = chk_out_valid;
+        assign mem_req_rw[i]     = chk_out_rw;
+        assign mem_req_addr[i]   = chk_out_addr[`VX_CFG_MEM_ADDR_WIDTH-1 -: VX_MEM_ADDR_WIDTH];
+        // ALL of these must come from the checker's output stage, not the bus
+        // input: the checker pipelines the request, so mixing the two pairs one
+        // request's address with the next one's payload.
+        assign mem_req_byteen[i] = chk_out_byteen;
+        assign mem_req_data[i]   = chk_out_data;
+        assign mem_req_tag[i]    = chk_out_tag;
+    end
+
+    // Tail of the DCR chain continues to the clusters.
+    assign dcr_bus_if.rsp_valid = chk_dcr_if[L3_MEM_PORTS].rsp_valid;
+    assign dcr_bus_if.rsp_data  = chk_dcr_if[L3_MEM_PORTS].rsp_data;
+`else
     for (genvar i = 0; i < L3_MEM_PORTS; ++i) begin : g_mem_bus_if
         assign mem_req_valid[i]  = mem_bus_if[i].req_valid;
         assign mem_req_rw[i]     = mem_bus_if[i].req_data.rw;
@@ -177,6 +276,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         assign mem_bus_if[i].rsp_data.tag  = mem_rsp_tag[i];
         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
     end
+`endif
 
     wire [`VX_CFG_NUM_CLUSTERS-1:0] per_cluster_busy;
 
