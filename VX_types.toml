@@ -154,6 +154,46 @@ VX_DCR_DXA_DESC_SMEM_STRIDE_OFF = 21
 VX_DCR_DXA_DESC_COUNT = 16
 VX_DCR_DXA_STATE_END = 0x280
 
+# Data-plane access checker DCR window (data-centric TEE prototype).
+#
+# One definition shared by all three consumers: the SimX checker
+# (sim/simx/sec/mem_checker.h static_asserts against these), the host runtime's
+# auto-claim path (sw/runtime/common/buffer.cpp), and the RTL checker's DCR
+# decoder. Previously mirrored by hand in each regression's common.h, which is
+# how a window can drift from its enforcement.
+#
+# A claim is STAGED across BUF_* and installed by a write to BUF_COMMIT; staged
+# values persist across commits so a re-grant rewrites one register and commits
+# again. Revocation stages REVOKE_OWNER then writes EPOCH; no header is touched.
+#
+# The whole window is refused when reached from a device-resident,
+# tenant-writable command bundle (CommandProcessor::DCR_PRIV_BEGIN) — a
+# memory-side checker cannot police its own configuration traffic, so the
+# boundary is drawn at the command processor instead.
+[dcr_checker]
+VX_DCR_CHECKER_STATE_BEGIN  = 0x300
+VX_DCR_CHECKER_BUF_BASE     = 0x300  # staged: buffer base address
+VX_DCR_CHECKER_BUF_SIZE     = 0x301  # staged: buffer size in bytes
+VX_DCR_CHECKER_BUF_OWNER    = 0x302  # staged: owner eid (OWNER_ANY = shared)
+VX_DCR_CHECKER_BUF_PERMS    = 0x303  # staged: owner perms, never epoch-gated
+VX_DCR_CHECKER_BUF_EPOCH    = 0x304  # staged: grant epoch (NO_EXPIRY = never)
+VX_DCR_CHECKER_BUF_COMMIT   = 0x305  # write installs the staged claim
+VX_DCR_CHECKER_EPOCH        = 0x306  # set staged owner's epoch (the revoke)
+VX_DCR_CHECKER_BUF_SHARED   = 0x307  # staged: non-owner perms (grant to others)
+VX_DCR_CHECKER_REVOKE_OWNER = 0x308  # stage whose epoch the next EPOCH write bumps
+VX_DCR_CHECKER_STATE_END    = 0x340
+
+# Checker policy constants.
+[checker_const]
+VX_CHECKER_PERM_R         = 0x1
+VX_CHECKER_PERM_W         = 0x2
+# Wildcard owner: any tenant may access, subject to perms. The boot default for
+# every granule, so unclaimed memory (kernel code, stacks, launch args) is
+# system/shared. OWNER_ANY headers are never epoch-gated.
+VX_CHECKER_OWNER_ANY      = 0xFFFFFFFF
+# A grant with no expiry. Distinct from epoch 0, which a single revocation ends.
+VX_CHECKER_GRANT_NO_EXPIRY = 0xFFFFFFFF
+
 # Texture unit DCR (32-entry block: 6 base + up to VX_TEX_LOD_MAX mip offsets)
 [dcr_tex]
 VX_DCR_TEX_STATE_BEGIN = 0x040
