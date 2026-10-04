@@ -14,7 +14,8 @@
 `include "VX_define.vh"
 
 module VX_fetch import VX_gpu_pkg::*; #(
-    parameter `STRING INSTANCE_ID = ""
+    parameter `STRING INSTANCE_ID = "",
+    parameter CORE_ID = 0
 ) (
     `SCOPE_IO_DECL
 
@@ -226,7 +227,14 @@ module VX_fetch import VX_gpu_pkg::*; #(
         .ready_out (icache_bus_if.req_ready)
     );
 
-    assign icache_bus_if.req_data.attr   = '0;
+    // Fetches carry the requester's owner like data accesses do (VX_lsu_slice);
+    // with attr '0 every fetch would be authorized as owner 0.
+    mem_bus_attr_t icache_req_attr;
+    always @(*) begin
+        icache_req_attr       = '0;
+        icache_req_attr.owner = MEM_OWNER_WIDTH'(CORE_ID);
+    end
+    assign icache_bus_if.req_data.attr   = icache_req_attr;
     assign icache_bus_if.req_data.rw     = 1'b0;
     assign icache_bus_if.req_data.byteen = '1;
     assign icache_bus_if.req_data.data   = '0;
