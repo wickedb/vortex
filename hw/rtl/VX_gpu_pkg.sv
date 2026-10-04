@@ -209,7 +209,16 @@ package VX_gpu_pkg;
     // is_addr_om is appended ABOVE amo, deliberately: the amo field is cast by
     // offset (VX_cache_bank), so inserting a bit below it would silently shift
     // MEM_ATTR_AMO_OFFS and reinterpret the AMO sideband.
+    // Principal identity for the data-plane access checker (RTL_PLAN.md R2).
+    // One tenant per core, so only the core field of a hart id is load-bearing
+    // and the bus carries owner id rather than a full hart id — 1 bit at
+    // --cores=2 against HART_ID_WIDTH. That narrowing is what keeps the
+    // metadata cost honest; see MEM_ATTR_OWNER_OFFS below for why it sits
+    // above amo.
+    localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS));
+
     typedef struct packed {
+        logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS = 4 + AMO_REQ_BITS
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4
         logic                        is_addr_om;    // MEM_ATTR_OM_OFFS    = 3
         logic                        is_addr_local; // MEM_ATTR_LOCAL_OFFS = 2
@@ -222,6 +231,11 @@ package VX_gpu_pkg;
     localparam MEM_ATTR_LOCAL_OFFS  = 2;
     localparam MEM_ATTR_OM_OFFS     = 3;
     localparam MEM_ATTR_AMO_OFFS    = 4;
+    // Appended ABOVE amo for the same reason is_addr_om was: the amo field is
+    // cast by offset in VX_cache_bank, so a field inserted below
+    // MEM_ATTR_AMO_OFFS would silently shift it and reinterpret the AMO
+    // sideband. Everything at or below offset 4 keeps its position.
+    localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
 
     // Total width of the mem-bus attr field. Use this as the parameter
     // default for VX_mem_bus_if's ATTR_WIDTH parameter and as the

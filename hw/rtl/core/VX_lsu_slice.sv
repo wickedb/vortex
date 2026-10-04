@@ -111,6 +111,13 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
     `endif
         assign mem_req_attr_struct[i].is_addr_io = ((block_addr >= io_addr_start) && (block_addr < io_addr_end))
                                                  || lane_is_om;
+        // Principal identity for the data-plane access checker (RTL_PLAN.md R2).
+        // One tenant per core, so the owner IS the core id — the same value the
+        // AMO sideband below folds into make_hart_id's high bits, and exactly
+        // what SimX's owner_of(hart_id) = hart_id >> (log2 WARPS + log2 THREADS)
+        // extracts. Carrying it narrowed to MEM_OWNER_WIDTH rather than as a
+        // full hart id is what keeps the metadata cost at 1 bit for --cores=2.
+        assign mem_req_attr_struct[i].owner = MEM_OWNER_WIDTH'(CORE_ID);
     `ifdef VX_CFG_LMEM_ENABLE
         // is local memory address
         wire [MEM_ADDRW-1:0] lmem_addr_start = MEM_ADDRW'(`VX_CFG_XLEN'(`VX_MEM_LMEM_BASE_ADDR) >> MEM_ASHIFT);
