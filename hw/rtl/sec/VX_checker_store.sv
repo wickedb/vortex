@@ -41,8 +41,9 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // check depends on.
     input  chk_header_t             default_header,
 
-    // Lookup port (the check path). Combinational tag resolve off a registered
-    // RAM read, so the policy answer lands the cycle after the index.
+    // Lookup port (the check path). The id is registered on rd_en and the RAM
+    // is read at the REGISTERED id, so the policy answer lands the cycle after
+    // the index and HOLDS for as long as the request sits in S1.
     input  wire                     rd_en,
     input  wire [CHK_BUF_ID_W-1:0]  rd_buf_id,
     output chk_header_t             rd_header,
@@ -129,12 +130,12 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     ) store_rd (
         .clk   (clk),
         .reset (reset),
-        .read  (rd_en),
+        .read  (1'b1),
         .write (wr_en),
         .wren  (1'b1),
         .waddr (idx_of(wr_buf_id)),
         .wdata (wr_word),
-        .raddr (idx_of(rd_buf_id)),
+        .raddr (idx_of(rd_id_r)),
         .rdata (ram_rdata)
     );
 
@@ -156,16 +157,20 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .rdata (probe_rdata)
     );
 
-    // The tag comparison is the whole aliasing fix. Registered id so the
-    // compare lines up with the RAM's registered read data.
-    reg [CHK_BUF_ID_W-1:0] rd_id_r, probe_id_r;
+    // OUT_REG(0) makes VX_dp_ram an async read (`read` is ignored), so the
+    // check port is addressed with the registered id: the bus moves on to the
+    // next request while S1 is still resolving this one.
+    reg [CHK_BUF_ID_W-1:0] rd_id_r;
     always @(posedge clk) begin
-        if (rd_en)    rd_id_r    <= rd_buf_id;
-        if (probe_en) probe_id_r <= probe_buf_id;
+        if (rd_en) rd_id_r <= rd_buf_id;
     end
 
+    // The tag comparison is the whole aliasing fix. Each port compares against
+    // the id it actually read: the registered id on the check port, the live
+    // probe id on the installer port (whose FSM consumes the probe in the cycle
+    // it drives it).
     wire rd_hit    = ram_rdata.valid   && (ram_rdata.tag   == tag_of(rd_id_r));
-    wire probe_hit = probe_rdata.valid && (probe_rdata.tag == tag_of(probe_id_r));
+    wire probe_hit = probe_rdata.valid && (probe_rdata.tag == tag_of(probe_buf_id));
 
     assign rd_header    = rd_hit ? ram_rdata : default_header;
     assign rd_claimed   = rd_hit;
