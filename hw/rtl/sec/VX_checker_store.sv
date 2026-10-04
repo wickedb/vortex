@@ -76,11 +76,16 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // Index / tag split. With TAG_W == 0 the whole id is the index and the tag
     // comparison degenerates to a constant 1 — which is correct, not a
     // shortcut: at the design point a collision is impossible.
-    function automatic logic [IDX_W-1:0] idx_of(input logic [CHK_BUF_ID_W-1:0] id);
-        return id[IDX_W-1:0];
+    /* verilator lint_off UNUSEDSIGNAL */
+    // A single-entry store has IDX_W == 0: every buffer maps to entry 0, and
+    // the address port is still one bit wide.
+    function automatic logic [`UP(IDX_W)-1:0] idx_of(input logic [CHK_BUF_ID_W-1:0] id);
+        if (IDX_W == 0)
+            return '0;
+        else
+            return id[`UP(IDX_W)-1:0];
     endfunction
 
-    /* verilator lint_off UNUSEDSIGNAL */
     // At the design point TAG_W == 0, so no bits of `id` are read here at all —
     // the index already spans the whole granule id and a collision is
     // impossible. The argument stays for the fine-granularity configurations
