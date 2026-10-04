@@ -79,24 +79,22 @@ static void revoke(uint32_t owner, uint32_t new_epoch) {
   tick(2);
 }
 
-// Drive one request through and return whether it was denied.
-static bool access(uint64_t addr, bool is_write, uint32_t owner) {
+// Present one request and hold it until the checker accepts it.
+static void accept(uint64_t addr, bool is_write, uint32_t owner) {
   sim->req_valid = 1;
   sim->req_rw    = is_write ? 1 : 0;
   sim->req_addr  = (uint32_t)addr;
   sim->req_owner = owner;
-  sim->out_ready = 1;
-
-  // wait for accept
   int guard = 0;
   while (!sim->req_ready && guard++ < 128) tick();
   tick();
-  sim->req_valid = 0;
+}
 
-  // Wait for the verdict to retire. Under enforcement a denied request never
-  // reaches out_valid — it is blocked — so a denial is observable only as the
-  // out_fault pulse. Watch for either.
-  guard = 0;
+// Wait for the accepted request to retire and return whether it was denied.
+// Under enforcement a denied request never reaches out_valid — it is blocked —
+// so a denial is observable only as the out_fault pulse. Watch for either.
+static bool verdict() {
+  int guard = 0;
   bool denied = false;
   while (guard++ < 128) {
     if (sim->out_fault) { denied = true; break; }
@@ -105,6 +103,14 @@ static bool access(uint64_t addr, bool is_write, uint32_t owner) {
   }
   tick();
   return denied;
+}
+
+// Drive one request through and return whether it was denied.
+static bool access(uint64_t addr, bool is_write, uint32_t owner) {
+  sim->out_ready = 1;
+  accept(addr, is_write, owner);
+  sim->req_valid = 0;
+  return verdict();
 }
 
 int main(int argc, char** argv) {
@@ -209,6 +215,43 @@ int main(int argc, char** argv) {
   expect(access(C + 0 * GRANULE, false, 1), "multi-granule claim: granule 0 protected");
   expect(access(C + 1 * GRANULE, false, 1), "multi-granule claim: granule 1 protected");
   expect(access(C + 2 * GRANULE, false, 1), "multi-granule claim: granule 2 protected");
+
+  // ---- 13/14. the verdict belongs to the request in S1, not to the bus.
+  // Every case above holds req_addr steady until retirement, which the LLC
+  // does not: its request queue moves on while S1 is held. These change the
+  // bus address mid-resolution, toward the opposite verdict each time.
+
+  // 13. held by miss latency: a fresh granule forces a header-cache miss, and
+  // meanwhile the bus shows B, where owner 1 IS allowed.
+  const uint64_t D = 24 * GRANULE;
+  claim(D, GRANULE, /*owner*/0, VX_CHECKER_PERM_R | VX_CHECKER_PERM_W, 0,
+        VX_CHECKER_GRANT_NO_EXPIRY);
+  sim->out_ready = 1;
+  uint32_t miss_before = sim->cnt_hc_misses;
+  accept(D, false, 1);
+  sim->req_valid = 0;
+  sim->req_addr  = (uint32_t)B;
+  expect(sim->cnt_hc_misses == miss_before + 1, "case 13 takes the miss-latency path");
+  expect(verdict(), "verdict held across miss latency: D denied while bus shows B");
+
+  // 14. held by back-pressure: an allowed request waits in S1 while the next
+  // request, to a granule owner 1 may NOT read, waits on the bus behind it.
+  sim->out_ready = 0;
+  accept(B, false, 1);
+  sim->req_addr = (uint32_t)C;               // req_valid stays 1: queued behind
+  int guard = 0;
+  while (!sim->out_valid && !sim->out_fault && guard++ < 128) tick();
+  bool held = true;
+  for (int i = 0; i < 8; ++i) {
+    if (sim->out_fault || !sim->out_valid || sim->out_addr != (uint32_t)B) held = false;
+    tick();
+  }
+  expect(held, "held request keeps its verdict and address under back-pressure");
+  expect(sim->out_valid && !sim->out_deny, "held request to B retires ALLOWED");
+  sim->out_ready = 1;
+  tick();                                    // B retires; C is accepted on the same edge
+  sim->req_valid = 0;
+  expect(verdict(), "request queued behind it (C) is DENIED");
 
   // ---- counter sanity: every checked request was either allowed or denied
   expect(sim->cnt_checked == sim->cnt_allows + sim->cnt_denies,
