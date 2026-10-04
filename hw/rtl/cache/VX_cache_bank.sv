@@ -189,6 +189,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire [REQ_SEL_WIDTH-1:0]       replay_idx;
     wire [MSHR_ADDR_WIDTH-1:0]     replay_id;
     amo_req_t                      replay_amo;
+    // A replayed store stamps the writer tag from its own attr, so the MSHR
+    // parks the owner with the request (PROJECT.md §2.3).
+    wire [MEM_OWNER_WIDTH-1:0]     replay_owner;
 
     // AMO engine interconnect (tied to 0 when the bank carries no AMO logic).
     wire                          amo_hit_st1, amo_commit_busy, amo_chain_stall, amo_wb_pending;
@@ -451,6 +454,12 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         `UNUSED_VAR ({core_req_data, replay_data, amo_wb_data})
     end
 
+    reg [`UP(MEM_ATTR_WIDTH)-1:0] replay_attr;
+    always @(*) begin
+        replay_attr = '0;
+        replay_attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH] = replay_owner;
+    end
+
     // Input mux -> arbitrated request (whole-struct populate). AMO priority
     // matches the mux (replay > wb > core_req): a replay can fire during a
     // pending wb (chained AMO replays from MSHR after a fill) and must not be
@@ -466,7 +475,10 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         sel_req.req.is_replay = replay_enable;
         sel_req.req.is_passthru_fill = is_passthru_fill_sel;
         sel_req.req.rw       = replay_mux ? replay_rw : (amo_wb_pending ? 1'b1 : core_req_rw);
-        sel_req.req.attr     = amo_wb_pending ? amo_wb_attr : (core_req_valid ? core_req_attr : '0);
+        // Replay first, as for every other field. Only the owner is parked in
+        // the MSHR; a replay's other attr bits stay '0.
+        sel_req.req.attr     = replay_mux ? replay_attr
+                             : (amo_wb_pending ? amo_wb_attr : (core_req_valid ? core_req_attr : '0));
         sel_req.req.way_idx  = flush_way;
         sel_req.req.addr     = (init_valid | flush_valid) ? `CS_LINE_ADDR_WIDTH'(flush_sel)
                              : (replay_mux ? replay_addr : (fill_mux ? mem_rsp_addr
@@ -846,7 +858,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .AMO_ENABLE  (AMO_ENABLE != 0),
         .AMO_PASSTHRU ((AMO_ENABLE != 0) && (IS_LLC == 0)),
         .WORD_SEL_WIDTH (WORD_SEL_WIDTH),
-        .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS)
+        .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS + MEM_OWNER_WIDTH)
     ) cache_mshr (
         .clk                 (clk),
         .reset               (reset),
@@ -867,7 +879,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .dequeue_valid       (replay_valid),
         .dequeue_addr        (replay_addr),
         .dequeue_rw          (replay_rw),
-        .dequeue_data        ({replay_wsel, replay_byteen, replay_data, replay_tag, replay_idx, replay_amo}),
+        .dequeue_data        ({replay_wsel, replay_byteen, replay_data, replay_tag, replay_idx, replay_amo, replay_owner}),
         .dequeue_id          (replay_id),
         .dequeue_ready       (replay_ready || fwd_fire),
         .allocate_valid      (mshr_allocate_st0 && ~pipe_stall),
@@ -878,7 +890,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         // Only non-LLC AMOs must not coalesce; at the LLC same-line AMOs coalesce
         // and serialize their commits on the single filled line.
         .allocate_is_amo     (AMO_ENABLE ? st0.req.amo.amo_valid : 1'b0),
-        .allocate_data       ({st0.req.word_idx, st0.req.byteen, write_word_st0, st0.req.tag, st0.req.req_idx, st0.req.amo}),
+        .allocate_data       ({st0.req.word_idx, st0.req.byteen, write_word_st0, st0.req.tag, st0.req.req_idx, st0.req.amo,
+                               st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]}),
         .allocate_id         (mshr_alloc_id),
         .allocate_pending    (mshr_pending_raw),
         .allocate_pending_wr (mshr_pending_wr_raw),
