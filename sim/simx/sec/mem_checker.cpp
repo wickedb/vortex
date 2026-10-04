@@ -25,6 +25,29 @@ static_assert(CommandProcessor::DCR_PRIV_BEGIN == DCR_CHECKER_BASE,
 static_assert(CommandProcessor::DCR_PRIV_END == DCR_CHECKER_END,
               "CP privileged-DCR window must end at DCR_CHECKER_END");
 
+// Third consumer of the same window: the host runtime's auto-claim path
+// (sw/runtime/common/buffer.cpp) issues these registers from outside the
+// simulator, so the numbers now also live in VX_types.toml, from which both
+// sw/VX_types.h and hw/VX_types.vh are generated. The RTL checker's decoder
+// will read the same generated header. Bind the simx-private constants to the
+// generated ones here, so a window that moves in one place stops the build
+// instead of leaving the runtime claiming registers the checker does not
+// implement — which would look like a successful setup and protect nothing.
+static_assert(DCR_CHECKER_BUF_BASE     == VX_DCR_CHECKER_BUF_BASE,     "BUF_BASE drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_SIZE     == VX_DCR_CHECKER_BUF_SIZE,     "BUF_SIZE drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_OWNER    == VX_DCR_CHECKER_BUF_OWNER,    "BUF_OWNER drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_PERMS    == VX_DCR_CHECKER_BUF_PERMS,    "BUF_PERMS drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_EPOCH    == VX_DCR_CHECKER_BUF_EPOCH,    "BUF_EPOCH drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_COMMIT   == VX_DCR_CHECKER_BUF_COMMIT,   "BUF_COMMIT drifted from VX_types.toml");
+static_assert(DCR_CHECKER_EPOCH        == VX_DCR_CHECKER_EPOCH,        "EPOCH drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_SHARED   == VX_DCR_CHECKER_BUF_SHARED,   "BUF_SHARED drifted from VX_types.toml");
+static_assert(DCR_CHECKER_REVOKE_OWNER == VX_DCR_CHECKER_REVOKE_OWNER, "REVOKE_OWNER drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BASE         == VX_DCR_CHECKER_STATE_BEGIN,  "window start drifted from VX_types.toml");
+static_assert(DCR_CHECKER_END          == VX_DCR_CHECKER_STATE_END,    "window end drifted from VX_types.toml");
+static_assert(PERM_R    == VX_CHECKER_PERM_R,    "PERM_R drifted from VX_types.toml");
+static_assert(PERM_W    == VX_CHECKER_PERM_W,    "PERM_W drifted from VX_types.toml");
+static_assert(OWNER_ANY == VX_CHECKER_OWNER_ANY, "OWNER_ANY drifted from VX_types.toml");
+
 namespace {
 
 uint32_t env_u32(const char* name, uint32_t fallback) {
