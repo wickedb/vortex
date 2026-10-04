@@ -162,6 +162,18 @@ public:
     delete sfp_;
   #endif
 
+    // Run SystemVerilog `final` blocks before tearing the model down. Verilator
+    // executes them only on an explicit final() call -- destruction alone does
+    // not, and neither does returning from the run loop. Without this, any
+    // end-of-simulation reporting in the RTL is silently dropped: the data-plane
+    // checker's counter dump (hw/rtl/sec/VX_mem_checker.sv), which R4 parity
+    // reads, produced no output at all until this was added.
+    //
+    // Skipped after a $stop/abort, which terminates the process outright -- so
+    // a crashed run still reports nothing, and that is a limitation of the
+    // mechanism rather than a sign the RTL saw no traffic.
+    device_->final();
+
     // Model before context: the model holds a reference to the context it was
     // built with, so releasing the context first would leave that reference
     // dangling through the model's own destruction.
