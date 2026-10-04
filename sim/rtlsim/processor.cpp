@@ -148,6 +148,22 @@ public:
 
     // Turn on assertion after reset
     context_->assertOn(true);
+
+    // Hosts that exit without releasing the device (PoCL does) never reach
+    // ~Impl, so `final` blocks must also run from atexit.
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+      atexit_registered = true;
+      std::atexit([] { if (s_live_ != nullptr) s_live_->run_final(); });
+    }
+    s_live_ = this;
+  }
+
+  // Runs SystemVerilog `final` blocks at most once, from ~Impl or atexit.
+  void run_final() {
+    if (final_done_) return;
+    final_done_ = true;
+    device_->final();
   }
 
   ~Impl() {
@@ -172,7 +188,8 @@ public:
     // Skipped after a $stop/abort, which terminates the process outright -- so
     // a crashed run still reports nothing, and that is a limitation of the
     // mechanism rather than a sign the RTL saw no traffic.
-    device_->final();
+    this->run_final();
+    if (s_live_ == this) s_live_ = nullptr;
 
     // Model before context: the model holds a reference to the context it was
     // built with, so releasing the context first would leave that reference
@@ -474,6 +491,8 @@ private:
 
   VerilatedContext* context_;
   Vrtlsim_shim* device_;
+  bool final_done_ = false;
+  static inline Impl* s_live_ = nullptr;
 
   RAM* ram_;
 
