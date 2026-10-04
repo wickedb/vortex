@@ -29,6 +29,7 @@
 #endif
 
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <fstream>
@@ -271,10 +272,21 @@ public:
     device_->dcr_req_valid = 0;
     this->tick();
     // READ response is returned when dcr_rsp_valid is high
+    uint64_t cycles = 2;
     while (!device_->dcr_rsp_valid) {
       this->tick();
+      ++cycles;
     }
     *value = device_->dcr_rsp_data;
+    // Opt-in (VX_FLUSH_STATS=1): a cache-flush read blocks until the walk
+    // completes, so its cycles are the invalidate's cost. stderr, off the PERF stream.
+    static const bool flush_stats = [] {
+      const char* e = std::getenv("VX_FLUSH_STATS");
+      return e && *e && *e != '0';
+    }();
+    if (flush_stats && addr == VX_DCR_BASE_CACHE_FLUSH) {
+      std::fprintf(stderr, "FLUSH: core=%u cycles=%llu\n", tag, (unsigned long long)cycles);
+    }
     return 0;
   }
 
