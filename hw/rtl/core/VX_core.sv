@@ -246,7 +246,8 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     );
 
     VX_fetch #(
-        .INSTANCE_ID (`SFORMATF(("%s-fetch", INSTANCE_ID)))
+        .INSTANCE_ID (`SFORMATF(("%s-fetch", INSTANCE_ID))),
+        .CORE_ID     (CORE_ID)
     ) fetch (
         `SCOPE_IO_BIND  (0)
         .clk            (clk),
