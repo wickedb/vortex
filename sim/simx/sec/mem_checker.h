@@ -245,6 +245,7 @@ public:
   // LabelAuthority: what a labeled cache consults (sec/label.h).
   MemLabel resolve_label(uint64_t addr) const override;
   bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const override;
+  bool enforcing() const override;
   std::shared_ptr<mem_block_t> poison() const override;
   void count_label_deny(bool is_write) override;
 

@@ -455,6 +455,8 @@ public:
     return ok;
   }
 
+  bool enforcing() const { return config_.enforce; }
+
   std::shared_ptr<mem_block_t> poison() const { return poison_; }
 
   void count_label_deny(bool is_write) {
@@ -717,6 +719,10 @@ MemLabel MemChecker::resolve_label(uint64_t addr) const {
 
 bool MemChecker::authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const {
   return impl_->authorize(label, hart_id, is_write);
+}
+
+bool MemChecker::enforcing() const {
+  return impl_->enforcing();
 }
 
 std::shared_ptr<mem_block_t> MemChecker::poison() const {
