@@ -12,6 +12,7 @@
 // limitations under the License.
 
 #include "cache.h"
+#include "sec/label.h"
 #include "mem_block_pool.h"
 #include "debug.h"
 #include "types.h"
@@ -142,20 +143,18 @@ struct sector_t {
   bool dirty;
   uint64_t dirty_mask;                 // per-byte dirty bits; the writeback byte-enable
   std::shared_ptr<mem_block_t> data;  // sector bytes (= one mem_block)
-  // hart that last dirtied this sector. A writeback is initiated by whichever
-  // request triggers the eviction, so the evictor's hart_id (bank_req.hart_id)
-  // does NOT identify who wrote the data. The data-plane checker at LLC→DRAM
-  // authorizes writebacks via owner_of(hart_id); carrying the evictor there
-  // misattributes cross-tenant writebacks (sec/mem_checker.cpp, sec/README.md §2).
-  // Stamp the writer here on every dirtying store and replay it into the
-  // writeback so requester identity survives the write-back cache.
-  uint32_t writer_hart_id;
+  // Data-plane checker policy label (sec/label.h), stored with the data when
+  // a labeled cache fills the sector and evaluated whenever the sector is
+  // delivered or written. Because every write into a labeled line is judged
+  // against it, a dirty sector holds only authorized bytes, and its
+  // writeback needs no writer identity.
+  MemLabel label;
 
   void reset() {
     valid = false;
     dirty = false;
     dirty_mask = 0;
-    writer_hart_id = 0;
+    label = MemLabel{};
     data.reset();
   }
 };
@@ -380,6 +379,9 @@ struct bank_req_t {
   // Other bits ride along for future use.
   MemFlags flags;
 
+  // For Fill: the policy label that arrived with (or was resolved for) the data.
+  MemLabel label;
+
   // Bank admission order, stamped once in processInputs. MSHR replay drains
   // by this stamp, so chain order is admission order regardless of whether a
   // request joins the chain at admission or later at pipe exit (a request
@@ -409,6 +411,7 @@ struct bank_req_t {
     byteen = 0;
     amo_cmp = 0;
     flags = MemFlags{};
+    label = MemLabel{};
     adm_seq = 0;
   }
 
@@ -695,6 +698,18 @@ public:
     return !flushing_;
   }
 
+  // Labeled lines (sec/label.h). With an authority attached this bank stores
+  // a label with every line it fills, judges every write into a line, and
+  // flags the fills and writebacks it issues so the memory-port checker
+  // passes them. `edge` marks the shared level whose requesters are private
+  // L1s: it also judges every read it delivers, answering a deny with poison.
+  // Interior levels forward data plus label and let the edge decide, so a
+  // shared cache never installs poison.
+  void set_label_authority(LabelAuthority* authority, bool edge) {
+    lab_ = authority;
+    lab_edge_ = (authority != nullptr) && edge;
+  }
+
 protected:
   void on_reset() {
     perf_stats_ = Cache::PerfStats();
@@ -836,6 +851,12 @@ private:
       bank_req.uuid    = root_peek.bank_req.uuid;
       bank_req.mshr_id = mshr_id;
       bank_req.data    = mem_rsp.data;
+      // Label at origin: an interior labeled level forwards it with the data;
+      // from DRAM (or through a bypassed level) it is resolved here, as the
+      // memory-port checker would resolve it for this fill.
+      bank_req.label   = mem_rsp.label;
+      if (lab_ != nullptr && !bank_req.label.valid)
+        bank_req.label = lab_->resolve_label(bank_req.addr);
       pipe_req_->push(bank_req);
       ++pipe_fill_count_;
       DT(3, this->name() << " fill-rsp: " << mem_rsp);
@@ -1065,7 +1086,8 @@ private:
         MemReq wb;
         wb.addr   = params_.mem_addr_sector(bank_id_, set_id, victim_line.tag, s);
         wb.op     = MemOp::ST;
-        wb.hart_id = sec.writer_hart_id;  // writer, not evictor (sec/README.md §2)
+        wb.hart_id = bank_req.hart_id;
+        wb.flags.labeled = (lab_ != nullptr);  // authorized on entry (sec/label.h)
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
@@ -1087,6 +1109,7 @@ private:
     sec.dirty      = false;
     sec.dirty_mask = 0;
     sec.data       = bank_req.data;
+    sec.label      = bank_req.label;
     mshr_.replay(bank_req.mshr_id);
     // arm the fill-forward window for this chain
     fwd_active_ = true;
@@ -1136,7 +1159,7 @@ private:
     bank_req_t req;
     mshr_.dequeue(&req);
     MemRsp rsp{req.req_tag, req.hart_id, req.uuid};
-    rsp.data = set.lines.at(present_id).sectors.at(sector_id).data;
+    this->deliver_read(rsp, set.lines.at(present_id).sectors.at(sector_id), req.addr, req.hart_id);
     this->core_rsp_out.send(rsp);
     DT(3, this->name() << " fwd-rsp: " << rsp);
     return true;
@@ -1174,6 +1197,24 @@ private:
     if (do_store && !config_.write_back && this->mem_req_out.full())
       return false;
 
+    // Labeled lines: an AMO reads and writes the line, so it needs both
+    // permissions. A denied AMO leaves the line and reservations untouched
+    // and answers with poison, like a denied read.
+    if (lab_ != nullptr) {
+      const MemLabel &label = this->label_of(hit_sec, bank_req.addr);
+      const bool rd_ok = lab_->authorize(label, hid, false);
+      const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true);
+      if (!(rd_ok && wr_ok)) {
+        lab_->count_label_deny(rd_ok);
+        MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
+        rsp.data = lab_->poison();
+        this->core_rsp_out.send(rsp);
+        crsp_sent_ = true;
+        DT(3, this->name() << " amo-deny: " << rsp);
+        return true;
+      }
+    }
+
     // Pure compute: read old word, derive new and ret.
     uint64_t old_word = 0;
     if (hit_sec.data) {
@@ -1210,7 +1251,6 @@ private:
       if (config_.write_back) {
         hit_sec.dirty = true;
         hit_sec.dirty_mask |= byteen;
-        hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (sec/README.md §2)
       } else {
         // Write-through: emit a write of the merged word downstream.
         MemReq w;
@@ -1335,7 +1375,8 @@ private:
         MemReq wb;
         wb.addr   = params_.mem_addr_sector(bank_id_, set_id, set.lines.at(hit_id).tag, sector_id);
         wb.op = MemOp::ST;
-        wb.hart_id    = sec.writer_hart_id;  // writer, not evictor (sec/README.md §2)
+        wb.hart_id    = bank_req.hart_id;
+        wb.flags.labeled = (lab_ != nullptr);  // authorized on entry (sec/label.h)
         wb.uuid   = bank_req.uuid;
         wb.data   = sec.data;
         wb.byteen = sec.dirty_mask;
@@ -1426,6 +1467,7 @@ private:
           fill.tag     = mshr_id;
           fill.hart_id = bank_req.hart_id;
           fill.uuid    = bank_req.uuid;
+          fill.flags.labeled = (lab_ != nullptr);  // judged at delivery
           this->mem_req_out.send(fill, MEM_REQ_DELAY);
           ++pending_fill_reqs_;
         }
@@ -1456,11 +1498,14 @@ private:
         if (!config_.write_back) {
           assert(bank_req.skip_core_rsp && "WT replay without pre-sent store");
         }
-        sector_merge(hit_sec, bank_req.data, bank_req.byteen);
-        if (config_.write_back) {
-          hit_sec.dirty = true;
-          hit_sec.dirty_mask |= bank_req.byteen;
-          hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (sec/README.md §2)
+        // A denied write leaves the line untouched; a write-through level
+        // already forwarded it at miss time, and the next level judges it too.
+        if (this->label_allows_write(hit_sec, bank_req.addr, bank_req.hart_id)) {
+          sector_merge(hit_sec, bank_req.data, bank_req.byteen);
+          if (config_.write_back) {
+            hit_sec.dirty = true;
+            hit_sec.dirty_mask |= bank_req.byteen;
+          }
         }
 #if VX_CFG_EXT_A_ENABLED
         // Write-back write-miss replay reaching the LLC tag array:
@@ -1475,7 +1520,7 @@ private:
       if (need_core_rsp(bank_req) && !bank_req.skip_core_rsp) {
         MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
         if (!bank_req.write)
-          rsp.data = hit_sec.data;
+          this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id);
         this->core_rsp_out.send(rsp);
         crsp_sent_ = true;
         DT(3, this->name() << " replay-rsp: " << rsp);
@@ -1559,11 +1604,17 @@ private:
 
         auto &hit_sec = set.lines.at(hit_id).sectors.at(sector_id);
         if (bank_req.write) {
-          sector_merge(hit_sec, bank_req.data, bank_req.byteen);
+          // Write rule: a denied write never merges into the line. Write-
+          // through still forwards it (below), so the next labeled level, or
+          // the memory-port checker if there is none, judges it as well.
+          const bool write_ok = this->label_allows_write(hit_sec, bank_req.addr, bank_req.hart_id);
+          if (write_ok)
+            sector_merge(hit_sec, bank_req.data, bank_req.byteen);
           if (config_.write_back) {
-            hit_sec.dirty = true;
-            hit_sec.dirty_mask |= bank_req.byteen;
-            hit_sec.writer_hart_id = bank_req.hart_id;  // writer, not evictor (sec/README.md §2)
+            if (write_ok) {
+              hit_sec.dirty = true;
+              hit_sec.dirty_mask |= bank_req.byteen;
+            }
           } else {
             MemReq w;
             w.addr   = params_.mem_addr_sector(bank_id_, set_id, addr_tag, sector_id);
@@ -1593,7 +1644,7 @@ private:
         if (need_rsp) {
           MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
           if (!bank_req.write)
-            rsp.data = hit_sec.data;
+            this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id);
           this->core_rsp_out.send(rsp);
           crsp_sent_ = true;
           DT(3, this->name() << " core-rsp: " << rsp);
@@ -1645,6 +1696,7 @@ private:
             fill.tag   = mshr_id; // routes the fill response back here
             fill.hart_id   = bank_req.hart_id;
             fill.uuid  = bank_req.uuid;
+            fill.flags.labeled = (lab_ != nullptr);  // judged at delivery
             this->mem_req_out.send(fill, MEM_REQ_DELAY);
             DT(3, this->name() << " fill-req: " << fill);
             ++pending_fill_reqs_;
@@ -1691,7 +1743,7 @@ private:
             MemReq mem_req;
             mem_req.addr = params_.mem_addr_sector(bank_id_, flush_set_idx_, line.tag, flush_sector_idx_);
             mem_req.op   = MemOp::ST;
-            mem_req.hart_id = sec.writer_hart_id;  // writer, not evictor (sec/README.md §2)
+            mem_req.flags.labeled = (lab_ != nullptr);  // authorized on entry (sec/label.h)
             mem_req.data = sec.data;
             mem_req.byteen = sec.dirty_mask;
             this->mem_req_out.send(mem_req, MEM_REQ_DELAY);
@@ -1715,6 +1767,38 @@ private:
   Cache::Config config_;
   params_t params_;
   uint32_t bank_id_;
+
+  LabelAuthority* lab_ = nullptr;
+  bool lab_edge_ = false;
+
+  // The sector's label, resolved now if the line predates the authority.
+  const MemLabel& label_of(sector_t &sec, uint64_t addr) {
+    if (!sec.label.valid)
+      sec.label = lab_->resolve_label(addr);
+    return sec.label;
+  }
+
+  // Write rule: every labeled level judges a write before it modifies a line.
+  bool label_allows_write(sector_t &sec, uint64_t addr, uint32_t hart_id) {
+    if (lab_ == nullptr)
+      return true;
+    bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true);
+    if (!ok)
+      lab_->count_label_deny(true);
+    return ok;
+  }
+
+  // Read delivery: the line's data and label, or poison at the edge on a deny.
+  void deliver_read(MemRsp &rsp, sector_t &sec, uint64_t addr, uint32_t hart_id) {
+    rsp.data = sec.data;
+    if (lab_ == nullptr)
+      return;
+    rsp.label = this->label_of(sec, addr);
+    if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false)) {
+      lab_->count_label_deny(false);
+      rsp.data = lab_->poison();
+    }
+  }
 
   std::vector<set_t> sets_;
   MSHR mshr_;
@@ -1926,6 +2010,13 @@ public:
     }
   }
 
+  void set_label_authority(LabelAuthority* authority, bool edge) {
+    if (config_.bypass) return;   // a bypassed level stores nothing to label
+    for (auto &bank : banks_) {
+      bank->set_label_authority(authority, edge);
+    }
+  }
+
   bool flush_done() const {
     if (config_.bypass) return true;
     for (const auto &bank : banks_) {
@@ -1944,6 +2035,7 @@ private:
     uint64_t tag = mem_rsp.tag >> params_.log2_num_inputs;
     MemRsp core_rsp{tag, mem_rsp.hart_id, mem_rsp.uuid};
     core_rsp.data = mem_rsp.data;  // forward TLM payload through bypass
+    core_rsp.label = mem_rsp.label;
     simobject_->core_rsp_out.at(req_id).send(core_rsp, 0);
     DT(3, simobject_->name() << " bypass-core-rsp: " << core_rsp);
     return true;
@@ -1994,6 +2086,10 @@ Cache::PerfStats Cache::perf_stats() const {
 
 void Cache::flush_begin() {
   impl_->flush_begin();
+}
+
+void Cache::set_label_authority(LabelAuthority* authority, bool edge) {
+  impl_->set_label_authority(authority, edge);
 }
 
 bool Cache::flush_done() const {
