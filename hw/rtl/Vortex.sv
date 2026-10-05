@@ -238,7 +238,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .FAULT_DEPTH (`VX_CFG_L3_MSHR_SIZE),
             // Any enabled shared level is labeled, and the LLC is then a
             // labeled write-back cache (asserted above).
-            .LABEL_MODE  (`VX_CFG_L2_ENABLED || `VX_CFG_L3_ENABLED)
+            .LABEL_MODE  (`VX_CFG_L2_ENABLED || `VX_CFG_L3_ENABLED),
+            .LABEL_IDX_W (LABEL_FILL_ID_W)
         ) chk_inst (
             .clk            (clk),
             .reset          (reset),

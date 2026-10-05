@@ -55,7 +55,10 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // checker then never denies: it resolves each fill's header -- the lookup
     // it always did, overlapped with DRAM -- and attaches the label to the
     // response (rsp_label). Without it the checker judges every request.
-    parameter LABEL_MODE   = 0
+    parameter LABEL_MODE   = 0,
+    // Low tag bits that name an outstanding labeled fill (VX_gpu_pkg
+    // LABEL_FILL_ID_W): the label table has 2^LABEL_IDX_W entries.
+    parameter LABEL_IDX_W  = TAG_WIDTH - UUID_WIDTH
 ) (
     input  wire clk,
     input  wire reset,
@@ -344,22 +347,46 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // ---------------------------------------------------------------------
     // Labeled lines: the label table. A fill's label is captured when its
     // read is forwarded to DRAM (S1 holds the resolved header) and attached to
-    // its response, found by the tag's value bits: outstanding reads have
-    // unique values (bank + MSHR id), and the response quotes its request's
-    // tag. Capturing at request time means a claim installed while the read is
-    // in flight cannot be raced; claims arrive at launch boundaries anyway.
+    // its response, found by the low tag bits that name an outstanding LLC
+    // fill (LABEL_IDX_W: MSHR id, bank and the selects below them), so the
+    // table holds one entry per fill that can be in flight. The response
+    // quotes its request's tag. Capturing at request time means a claim
+    // installed while the read is in flight cannot be raced; claims arrive at
+    // launch boundaries anyway. IO reads take an NC path no labeled cache
+    // stores, so they neither write the table nor need its answer.
     // ---------------------------------------------------------------------
-    localparam LBL_IDX_W = `UP(TAG_WIDTH - UUID_WIDTH);
+    localparam LBL_IDX_W = `UP(`MIN(LABEL_IDX_W, TAG_WIDTH - UUID_WIDTH));
     if (LABEL_MODE != 0) begin : g_label_tbl
         reg [CHK_LABEL_W-1:0] label_tbl [1 << LBL_IDX_W];
         wire [LBL_IDX_W-1:0] wr_idx = LBL_IDX_W'(s1_tag);
         wire [LBL_IDX_W-1:0] rd_idx = LBL_IDX_W'(rsp_tag);
+        wire lbl_write = out_valid && out_ready && ~s1_rw && ~s1_bypass;
         always @(posedge clk) begin
-            if (out_valid && out_ready && ~s1_rw) begin
+            if (lbl_write) begin
                 label_tbl[wr_idx] <= chk_label_of(rd_header);
             end
         end
         assign rsp_label = `UP(MEM_RSP_ATTR_WIDTH)'(label_tbl[rd_idx]);
+    `ifdef SIMULATION
+        // The index is derived from the tag layout (VX_gpu_pkg), not from the
+        // tag itself, so check it: a slot is never reissued while its fill is
+        // still outstanding. Any response frees its slot, which can only hide
+        // a collision, never invent one.
+        reg [(1 << LBL_IDX_W)-1:0] lbl_busy;
+        always @(posedge clk) begin
+            if (reset) begin
+                lbl_busy <= '0;
+            end else begin
+                if (rsp_valid && rsp_ready) begin
+                    lbl_busy[rd_idx] <= 1'b0;
+                end
+                if (lbl_write) begin
+                    lbl_busy[wr_idx] <= 1'b1;
+                end
+            end
+        end
+        `RUNTIME_ASSERT (~lbl_write || ~lbl_busy[wr_idx], ("%t: %s label table slot %0d reissued while its fill is outstanding (tag=0x%0h): LABEL_FILL_ID_W does not match the tag layout", $time, INSTANCE_ID, wr_idx, s1_tag))
+    `endif
     end else begin : g_no_label_tbl
         assign rsp_label = '0;
     end
