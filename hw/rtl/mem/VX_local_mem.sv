@@ -686,7 +686,8 @@ module VX_local_mem import VX_gpu_pkg::*; #(
 
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_lsu_bus_if
         assign lsu_bus_if[i].rsp_valid = rsp_valid_out[i];
-        assign lsu_bus_if[i].rsp_data  = rsp_data_out[i];
+        // Local memory carries no policy label (it is outside the policy).
+        assign lsu_bus_if[i].rsp_data  = {`UP(MEM_RSP_ATTR_WIDTH)'(0), rsp_data_out[i]};
         assign rsp_ready_out[i] = lsu_bus_if[i].rsp_ready;
     end
 

@@ -640,6 +640,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
             assign cp_vx_mem_arb_out_if[i].req_ready = mem_req_ready[i];
 
             assign cp_vx_mem_arb_out_if[i].rsp_valid     = mem_rsp_valid[i];
+            assign cp_vx_mem_arb_out_if[i].rsp_data.attr = '0;
             assign cp_vx_mem_arb_out_if[i].rsp_data.data = mem_rsp_data[i];
             assign cp_vx_mem_arb_out_if[i].rsp_data.tag  = mem_rsp_tag[i];
             assign mem_rsp_ready[i] = cp_vx_mem_arb_out_if[i].rsp_ready;
@@ -653,6 +654,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
             assign vx_mem_bus_if[i].req_ready = mem_req_ready[i];
 
             assign vx_mem_bus_if[i].rsp_valid     = mem_rsp_valid[i];
+            assign vx_mem_bus_if[i].rsp_data.attr = '0;
             assign vx_mem_bus_if[i].rsp_data.data = mem_rsp_data[i];
             assign vx_mem_bus_if[i].rsp_data.tag  = CCI_VX_TAG_WIDTH'(mem_rsp_tag[i]);
             assign mem_rsp_ready[i] = vx_mem_bus_if[i].rsp_ready;

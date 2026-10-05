@@ -334,6 +334,7 @@ module VX_mmu import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         // zeroed response ahead of the cache reply for its lane.
         assign core_rsp_ready[l] = core_bus_if[l].rsp_ready;
         assign core_bus_if[l].rsp_valid     = kill_to_lane[l] ? 1'b1 : mem_bus_if[l].rsp_valid;
+        assign core_bus_if[l].rsp_data.attr = kill_to_lane[l] ? '0 : mem_bus_if[l].rsp_data.attr;
         assign core_bus_if[l].rsp_data.data = kill_to_lane[l] ? '0 : mem_bus_if[l].rsp_data.data;
         assign core_bus_if[l].rsp_data.tag  = kill_to_lane[l] ? kill_tag : mem_bus_if[l].rsp_data.tag;
         assign mem_bus_if[l].rsp_ready      = core_bus_if[l].rsp_ready && ~kill_to_lane[l];
