@@ -1780,11 +1780,14 @@ private:
   }
 
   // Write rule: every labeled level judges a write before it modifies a line.
+  // The deny counts only where the verdict is final: a write-through level
+  // forwards a denied write and the write-back level below judges it again,
+  // so counting both would report every denied write twice (as RTL does not).
   bool label_allows_write(sector_t &sec, uint64_t addr, uint32_t hart_id) {
     if (lab_ == nullptr)
       return true;
     bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true);
-    if (!ok)
+    if (!ok && config_.write_back)
       lab_->count_label_deny(true);
     return ok || !lab_->enforcing();
   }
