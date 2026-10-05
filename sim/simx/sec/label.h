@@ -39,6 +39,10 @@ public:
   // `hart_id` identifies the requester (owner = core, as at the port).
   virtual bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const = 0;
 
+  // Whether a deny takes effect (the port checker's ENFORCE). Without it a
+  // labeled cache counts its denies but delivers and merges as if allowed.
+  virtual bool enforcing() const = 0;
+
   // The block a denied read is answered with (shared with the port checker).
   virtual std::shared_ptr<mem_block_t> poison() const = 0;
 

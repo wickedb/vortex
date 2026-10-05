@@ -1205,6 +1205,8 @@ private:
       const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true);
       if (!(rd_ok && wr_ok)) {
         lab_->count_label_deny(rd_ok);
+      }
+      if (!(rd_ok && wr_ok) && lab_->enforcing()) {
         MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
         rsp.data = lab_->poison();
         this->core_rsp_out.send(rsp);
@@ -1784,7 +1786,7 @@ private:
     bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true);
     if (!ok)
       lab_->count_label_deny(true);
-    return ok;
+    return ok || !lab_->enforcing();
   }
 
   // Read delivery: the line's data and label, or poison at the edge on a deny.
@@ -1795,7 +1797,8 @@ private:
     rsp.label = this->label_of(sec, addr);
     if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false)) {
       lab_->count_label_deny(false);
-      rsp.data = lab_->poison();
+      if (lab_->enforcing())
+        rsp.data = lab_->poison();
     }
   }
 
