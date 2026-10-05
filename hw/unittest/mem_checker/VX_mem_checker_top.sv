@@ -9,7 +9,13 @@
 
 module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter HIT_LATENCY  = `VX_CFG_CHECKER_HIT_LATENCY,
-    parameter MISS_LATENCY = `VX_CFG_CHECKER_MISS_LATENCY
+    parameter MISS_LATENCY = `VX_CFG_CHECKER_MISS_LATENCY,
+    // Labeled lines. The directed TB runs with 0 (the checker judges every
+    // request); R5 synthesizes with 1 so the label table is in the numbers.
+    // The index width follows the build's cache configuration, as in the GPU,
+    // so build with the evaluation L2/L3 defines to size the table for it.
+    parameter LABEL_MODE   = 0,
+    parameter LABEL_IDX_W  = LABEL_FILL_ID_W
 ) (
     input  wire clk,
     input  wire reset,
@@ -51,6 +57,10 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      rsp_ready,
     output wire                      fault_overflow,
 
+    // labeled lines: the fill's label and the live epoch table
+    output wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] rsp_label,
+    output wire [LABEL_EPOCHS_W-1:0] epochs_out,
+
     // counters
     output wire [31:0] cnt_reqs,
     output wire [31:0] cnt_checked,
@@ -90,7 +100,9 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .ENFORCE      (1),          // the TB exercises enforcement explicitly
         .DATA_SIZE    (64),
         .TAG_WIDTH    (16),
-        .FAULT_DEPTH  (16)
+        .FAULT_DEPTH  (16),
+        .LABEL_MODE   (LABEL_MODE),
+        .LABEL_IDX_W  (LABEL_IDX_W)
     ) chk_inst (
         .clk                 (clk),
         .reset               (reset),
@@ -120,10 +132,8 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .rsp_valid           (rsp_valid),
         .rsp_data            (rsp_data),
         .rsp_tag             (rsp_tag),
-        // Labeled lines are exercised in the GPU, not by this directed TB
-        // (LABEL_MODE = 0 here: the checker judges every request).
-        `UNUSED_PIN (rsp_label),
-        `UNUSED_PIN (epochs_out),
+        .rsp_label           (rsp_label),
+        .epochs_out          (epochs_out),
         .rsp_ready           (rsp_ready),
         .fault_overflow      (fault_overflow),
         .cnt_reqs            (cnt_reqs),
