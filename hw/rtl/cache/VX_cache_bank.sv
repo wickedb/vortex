@@ -43,7 +43,10 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter WORD_SEL_WIDTH    = `UP(`CS_WORD_SEL_BITS),
     // Labeled lines (sec/VX_sec_pkg chk_label_t). See VX_cache.sv.
     parameter LABEL_ENABLE      = 0,
-    parameter LABEL_EDGE        = 0
+    parameter LABEL_EDGE        = 0,
+    // The port checker's ENFORCE switch, applied to the same predicate here: a
+    // deny always counts, but poisons a read or drops a write only when set.
+    parameter LABEL_ENFORCE     = `VX_CFG_CHECKER_ENFORCE
 ) (
     input wire clk,
     input wire reset,
@@ -152,7 +155,8 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         logic [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask; // per-sector dirty of the evict way
         logic [`CS_TAG_SEL_BITS-1:0]   evict_tag;
         // Labeled lines: the hit way's label (what an interior level forwards)
-        // and whether the predicate denied this request against it.
+        // and whether the predicate denied this request against it (the
+        // verdict, counted whether or not it is enforced).
         logic                          label_deny;
         logic [`UP(MEM_RSP_ATTR_WIDTH)-1:0] label;
         logic [MSHR_ADDR_WIDTH-1:0]    mshr_previd;
@@ -160,7 +164,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
     typedef struct packed {            // data-array drive (S0 -> stD)
         req_t                          req;
-        logic                          label_deny;  // a denied write never reaches the array
+        logic                          label_deny;  // an enforced deny: the write never reaches the array
         logic [`CS_WORD_WIDTH-1:0]     wdata;
         logic [NUM_WAYS-1:0]           tag_matches;
     } data_t;
@@ -677,6 +681,12 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         assign label_deny_st0 = 1'b0;
         assign label_hit_st0  = '0;
     end
+    // What a deny does: under enforcement a denied write never reaches the
+    // data array (stD), and a denied read is answered with poison (at the
+    // edge). Without it the verdict is only counted, as at the port. The dirty
+    // bit stays ungated, off the tag-to-LUTRAM write-enable arc, so a denied
+    // write costs one benign writeback of unchanged bytes.
+    wire label_block_st0 = label_deny_st0 && (LABEL_ENFORCE != 0);
 
     VX_onehot_encoder #(
         .N (NUM_WAYS)
@@ -737,7 +747,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         dat_in = st0;
         dat_in.req.way_idx = evict_way_st0;
         dat_in.tag_matches = tag_matches_st0;
-        dat_in.label_deny = label_deny_st0;
+        dat_in.label_deny = label_block_st0;
     end
 
     // commit path: the request (with the resolved hit/victim way and MSHR id)
@@ -1124,7 +1134,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // A read denied at the edge is answered with the checker's poison pattern;
     // it lands only in the requester's private L1, never in a shared level.
     wire [`CS_WORD_WIDTH-1:0] poison_word = {WORD_SIZE{8'hDD}};
-    wire [`CS_WORD_WIDTH-1:0] crsp_queue_data = (LABEL_EDGE != 0 && stC.lk.label_deny) ? poison_word
+    wire [`CS_WORD_WIDTH-1:0] crsp_queue_data = (LABEL_EDGE != 0 && LABEL_ENFORCE != 0 && stC.lk.label_deny) ? poison_word
                                               : (is_amo_replay_st1 ? amo_ptw_word_st1
                                               : (amo_hit_st1 ? amo_rsp_data : read_word_fwd_stc));
 
@@ -1194,7 +1204,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     end else begin : g_no_fwd_label
         assign fwd_label_deny = 1'b0;
     end
-    wire [`CS_WORD_WIDTH-1:0] fwd_word_rsp = fwd_label_deny ? poison_word : fwd_word;
+    wire [`CS_WORD_WIDTH-1:0] fwd_word_rsp = (fwd_label_deny && LABEL_ENFORCE != 0) ? poison_word : fwd_word;
 
     `RUNTIME_ASSERT (~fwd_fire || (replay_addr == fbuf_addr_r), ("%t: %s fill-forward address mismatch: addr=0x%0h, staged=0x%0h", $time, INSTANCE_ID, `CS_BANK_TO_FULL_ADDR(replay_addr, BANK_ID), `CS_BANK_TO_FULL_ADDR(fbuf_addr_r, BANK_ID)))
     `RUNTIME_ASSERT (~(flush_fire && fwd_pending), ("%t: %s flush during fill-forward drain", $time, INSTANCE_ID))
