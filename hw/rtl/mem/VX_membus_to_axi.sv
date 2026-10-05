@@ -55,6 +55,7 @@ module VX_membus_to_axi
         assign mem_req_tag[i]        = bus_in_if[i].req_data.tag;
         assign bus_in_if[i].req_ready = mem_req_ready[i];
         assign bus_in_if[i].rsp_valid = mem_rsp_valid[i];
+        assign bus_in_if[i].rsp_data.attr = '0;  // AXI carries no policy label
         assign bus_in_if[i].rsp_data.data = mem_rsp_data[i];
         assign bus_in_if[i].rsp_data.tag  = mem_rsp_tag[i];
         assign mem_rsp_ready[i]      = bus_in_if[i].rsp_ready;
