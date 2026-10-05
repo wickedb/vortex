@@ -23,6 +23,7 @@ package VX_sec_pkg;
     // expression means the bus field and the header field cannot drift —
     // the same reasoning that put the DCR window in VX_types.toml.
     import VX_gpu_pkg::MEM_OWNER_WIDTH;
+    import VX_gpu_pkg::MEM_RSP_ATTR_WIDTH;
 
     // ---------------------------------------------------------------------
     // Granularity. One header covers 2^BUF_LOG2 bytes (1 MB by default).
@@ -111,6 +112,42 @@ package VX_sec_pkg;
     localparam int CHK_HEADER_W = $bits(chk_header_t);
 
     // ---------------------------------------------------------------------
+    // The policy LABEL: a header minus the store's bookkeeping (valid, tag).
+    //
+    // Labeled lines: the checker resolves a granule's header where the lookup
+    // is overlapped with DRAM and attaches the label to the fill response
+    // (mem_bus rsp_data.attr). Every shared cache stores it with the line and
+    // evaluates the SAME predicate at the point of delivery, so a hit in a
+    // cache shared between tenants is authorized like a miss. A label is exact
+    // per line: a line never straddles a granule (static-asserted where used).
+    // Revocation stays an epoch bump -- the predicate reads the live epoch, so
+    // every cached copy of a grant expires at once without being touched.
+    // ---------------------------------------------------------------------
+    typedef struct packed {
+        logic                      owner_any;
+        logic [CHK_OWNER_W-1:0]    owner;
+        logic [1:0]                perms;
+        logic [1:0]                shared_perms;
+        logic [CHK_EPOCH_W-1:0]    grant_epoch;
+    } chk_label_t;
+
+    localparam int CHK_LABEL_W = $bits(chk_label_t);
+
+    /* verilator lint_off UNUSEDSIGNAL */
+    // A label is the header's POLICY: `valid` and `tag` are store residency,
+    // resolved before a header reaches here, and deliberately dropped.
+    function automatic chk_label_t chk_label_of(input chk_header_t hdr);
+        chk_label_t l;
+        l.owner_any    = hdr.owner_any;
+        l.owner        = hdr.owner;
+        l.perms        = hdr.perms;
+        l.shared_perms = hdr.shared_perms;
+        l.grant_epoch  = hdr.grant_epoch;
+        return l;
+    endfunction
+    /* verilator lint_on UNUSEDSIGNAL */
+
+    // ---------------------------------------------------------------------
     // The authorization predicate, as a function so the TB and the datapath
     // cannot drift. Mirrors MemChecker::check() (sim/simx/sec/mem_checker.cpp).
     //
@@ -123,6 +160,23 @@ package VX_sec_pkg;
     // the owner — and the epoch that gates a grant is the GRANTING owner's,
     // which is what makes revocation scoped per owner.
     // ---------------------------------------------------------------------
+    // THE predicate, on a label: the checker applies it to the header it just
+    // read, a labeled cache to the label it stored with the line.
+    function automatic logic chk_authorize_label(
+        input chk_label_t             lbl,
+        input logic [CHK_OWNER_W-1:0] requester,
+        input logic                   is_write,
+        input logic [CHK_EPOCH_W-1:0] owner_epoch
+    );
+        logic [1:0] need;
+        need = is_write ? CHK_PERM_W : CHK_PERM_R;
+        if (lbl.owner_any || (lbl.owner == requester)) begin
+            return |(lbl.perms & need);
+        end else begin
+            return (|(lbl.shared_perms & need)) && (owner_epoch <= lbl.grant_epoch);
+        end
+    endfunction
+
     /* verilator lint_off UNUSEDSIGNAL */
     // `valid` and `tag` are resolved by the store before it hands a header
     // here — by this point the header is either the installed one or the boot
@@ -133,13 +187,7 @@ package VX_sec_pkg;
         input logic                   is_write,
         input logic [CHK_EPOCH_W-1:0] owner_epoch
     );
-        logic [1:0] need;
-        need = is_write ? CHK_PERM_W : CHK_PERM_R;
-        if (hdr.owner_any || (hdr.owner == requester)) begin
-            return |(hdr.perms & need);
-        end else begin
-            return (|(hdr.shared_perms & need)) && (owner_epoch <= hdr.grant_epoch);
-        end
+        return chk_authorize_label(chk_label_of(hdr), requester, is_write, owner_epoch);
     endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 
