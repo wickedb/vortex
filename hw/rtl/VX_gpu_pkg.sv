@@ -1791,6 +1791,22 @@ package VX_gpu_pkg;
     // L3 is the LLC whenever it is enabled.
     localparam L3_IS_LLC            = `VX_CFG_L3_ENABLED;
 
+    // Labeled lines: the bits of a memory-port tag that name an outstanding
+    // fill of the labeled LLC, which index the checker's label table. Every
+    // arbiter on the way inserts its select bits at the bottom of the tag
+    // (TAG_SEL_IDX = 0), so these are the low bits: the LLC bank's MSHR id and
+    // bank select, its cache/NC select, and, when the L2 is the LLC, the
+    // passthrough L3's request and word selects. The core-side tag an NC path
+    // carries is not part of it, since no labeled cache stores an NC response;
+    // that is what keeps the table at the in-flight fill count instead of
+    // growing with the core count. rtlsim checks the index never collides.
+`ifdef VX_CFG_L3_ENABLE
+    localparam LABEL_FILL_ID_W      = `CLOG2(`VX_CFG_L3_MSHR_SIZE) + `CLOG2(`CDIV(L3_NUM_BANKS, L3_MEM_PORTS)) + 1;
+`else
+    localparam LABEL_FILL_ID_W      = `CLOG2(`VX_CFG_L2_MSHR_SIZE) + `CLOG2(`CDIV(L2_NUM_BANKS, L2_MEM_PORTS)) + 1
+                                    + `CLOG2(`CDIV(L3_NUM_REQS, L3_MEM_PORTS)) + `CLOG2(L3_SECTOR_SIZE / L3_WORD_SIZE);
+`endif
+
     ///////////////////////////////////////////////////////////////////////////
 
     localparam VX_MEM_PORTS =           L3_MEM_PORTS;
