@@ -34,6 +34,9 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // Memory
     VX_mem_bus_if.master        mem_bus_if [L2_MEM_PORTS],
 
+    // Labeled lines: the checker's live per-owner epoch table, for the L2.
+    input  wire [LABEL_EPOCHS_W-1:0] label_epochs,
+
     // KMU bus
     VX_kmu_bus_if.slave         kmu_bus_if[1],
 
@@ -233,10 +236,15 @@ module VX_cluster import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .NC_ENABLE      (1),
         .PASSTHRU       (!`VX_CFG_L2_ENABLED),
         .IS_LLC         (L2_IS_LLC),
-        .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
+        .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED),
+        // Labeled lines: an enabled L2 is shared by this cluster's cores and
+        // serves their private L1s, so it is the edge that judges reads.
+        .LABEL_ENABLE   (`VX_CFG_CHECKER_ENABLED && `VX_CFG_L2_ENABLED),
+        .LABEL_EDGE     (1)
     ) l2cache (
         .clk            (clk),
         .reset          (reset),
+        .label_epochs   (label_epochs),
     `ifdef PERF_ENABLE
         .cache_perf     (l2_perf),
     `endif

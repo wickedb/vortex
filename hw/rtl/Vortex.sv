@@ -124,6 +124,19 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .TAG_WIDTH (L3_MEM_TAG_WIDTH)
     ) mem_bus_if[L3_MEM_PORTS]();
 
+    // Labeled lines: the checker's live per-owner epoch table, fanned out to
+    // every labeled cache so a revocation expires every cached copy at once.
+    wire [LABEL_EPOCHS_W-1:0] label_epochs;
+
+`ifdef VX_CFG_CHECKER_ENABLE
+    // A labeled LLC must be write-back: then everything leaving it is a fill
+    // (judged where its data is delivered) or a writeback of bytes that were
+    // authorized when they entered, and the port checker can pass both. A
+    // write-through LLC would forward unjudged misses to DRAM.
+    `STATIC_ASSERT(!(`VX_CFG_L3_ENABLED) || `VX_CFG_L3_WRITEBACK, ("labeled lines: a labeled L3 LLC must be write-back"))
+    `STATIC_ASSERT((`VX_CFG_L3_ENABLED) || !(`VX_CFG_L2_ENABLED) || `VX_CFG_L2_WRITEBACK, ("labeled lines: a labeled L2 LLC must be write-back"))
+`endif
+
     VX_cache_wrap #(
         .INSTANCE_ID    ("l3cache"),
         .CACHE_SIZE     (`VX_CFG_L3_SIZE),
@@ -149,10 +162,15 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .NC_ENABLE      (1),
         .PASSTHRU       (!`VX_CFG_L3_ENABLED),
         .IS_LLC         (L3_IS_LLC),
-        .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED)
+        .AMO_ENABLE     (`VX_CFG_EXT_A_ENABLED),
+        // Labeled lines: the L3 is shared by every cluster; it is the edge
+        // (judges reads) only when there is no L2 between it and the L1s.
+        .LABEL_ENABLE   (`VX_CFG_CHECKER_ENABLED && `VX_CFG_L3_ENABLED),
+        .LABEL_EDGE     (!`VX_CFG_L2_ENABLED)
     ) l3cache (
         .clk            (clk),
         .reset          (reset),
+        .label_epochs   (label_epochs),
 
     `ifdef PERF_ENABLE
         .cache_perf     (l3_perf),
@@ -194,13 +212,24 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         wire [L3_SECTOR_SIZE*8-1:0] chk_out_data;
         wire [L3_SECTOR_SIZE-1:0]   chk_out_byteen;
         wire [L3_MEM_TAG_WIDTH-1:0] chk_out_tag;
+        wire [LABEL_EPOCHS_W-1:0] chk_epochs;
         `UNUSED_VAR ({chk_out_deny, chk_out_fault})
+        // Every instance sees the same DCR stream, so every epoch table is the
+        // same; the caches take port 0's.
+        if (i == 0) begin : g_epochs
+            assign label_epochs = chk_epochs;
+        end else begin : g_no_epochs
+            `UNUSED_VAR (chk_epochs)
+        end
 
         VX_mem_checker #(
             .INSTANCE_ID ($sformatf("checker%0d", i)),
             .DATA_SIZE   (L3_SECTOR_SIZE),
             .TAG_WIDTH   (L3_MEM_TAG_WIDTH),
-            .FAULT_DEPTH (`VX_CFG_L3_MSHR_SIZE)
+            .FAULT_DEPTH (`VX_CFG_L3_MSHR_SIZE),
+            // Any enabled shared level is labeled, and the LLC is then a
+            // labeled write-back cache (asserted above).
+            .LABEL_MODE  (`VX_CFG_L2_ENABLED || `VX_CFG_L3_ENABLED)
         ) chk_inst (
             .clk            (clk),
             .reset          (reset),
@@ -232,7 +261,9 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .rsp_valid      (mem_bus_if[i].rsp_valid),
             .rsp_data       (mem_bus_if[i].rsp_data.data),
             .rsp_tag        (mem_bus_if[i].rsp_data.tag),
+            .rsp_label      (mem_bus_if[i].rsp_data.attr),
             .rsp_ready      (mem_bus_if[i].rsp_ready),
+            .epochs_out     (chk_epochs),
             `UNUSED_PIN (fault_overflow),
             `UNUSED_PIN (cnt_reqs),    `UNUSED_PIN (cnt_checked),
             `UNUSED_PIN (cnt_bypassed),`UNUSED_PIN (cnt_allows),
@@ -272,10 +303,12 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         assign mem_bus_if[i].req_ready = mem_req_ready[i];
 
         assign mem_bus_if[i].rsp_valid     = mem_rsp_valid[i];
+        assign mem_bus_if[i].rsp_data.attr = '0;
         assign mem_bus_if[i].rsp_data.data = mem_rsp_data[i];
         assign mem_bus_if[i].rsp_data.tag  = mem_rsp_tag[i];
         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
     end
+    assign label_epochs = '0;
 `endif
 
     wire [`VX_CFG_NUM_CLUSTERS-1:0] per_cluster_busy;
@@ -369,6 +402,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .dcr_bus_if         (per_cluster_dcr_bus_if[cluster_id]),
 
             .mem_bus_if         (per_cluster_mem_bus_if[cluster_id * L2_MEM_PORTS +: L2_MEM_PORTS]),
+            .label_epochs       (label_epochs),
 
             .kmu_bus_if         (per_cluster_kmu_bus_if[cluster_id +: 1]),
 
