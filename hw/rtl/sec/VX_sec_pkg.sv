@@ -109,7 +109,11 @@ package VX_sec_pkg;
         logic [CHK_EPOCH_W-1:0]    grant_epoch;  // grant holds while epoch(owner) <= this
     } chk_header_t;
 
+    // Used by the header store only; a build that labels caches without
+    // instantiating the checker (the cache unit-test top) never reads it.
+    /* verilator lint_off UNUSEDPARAM */
     localparam int CHK_HEADER_W = $bits(chk_header_t);
+    /* verilator lint_on UNUSEDPARAM */
 
     // ---------------------------------------------------------------------
     // The policy LABEL: a header minus the store's bookkeeping (valid, tag).
