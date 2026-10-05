@@ -18,6 +18,8 @@
 
 namespace vortex {
 
+class LabelAuthority;
+
 class Cache : public SimObject<Cache> {
 public:
 	enum ReplPolicy : uint8_t {
@@ -83,6 +85,10 @@ public:
 	// to tick the simulator until then. Write-through caches no-op.
 	void flush_begin();
 	bool flush_done() const;
+
+	// Labeled lines (sec/label.h): attach the data-plane checker's label
+	// authority. `edge` = the shared level that delivers to private L1s.
+	void set_label_authority(LabelAuthority* authority, bool edge);
 
 protected:
 	void on_reset();
