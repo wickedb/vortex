@@ -217,6 +217,23 @@ package VX_gpu_pkg;
     // above amo.
     localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS));
 
+    // Response attribute: the data-plane checker's policy LABEL (sec/
+    // VX_sec_pkg chk_label_t), resolved at the memory port and carried with
+    // the data into every shared cache line, like a packet header. Requests
+    // carry identity (owner, above); responses carry policy. Sized here, next
+    // to the owner width it contains, so the bus and the label cannot drift
+    // (VX_sec_pkg static-asserts against it). Zero without the checker: the
+    // field then collapses to one constant-zero bit (`UP) and every response
+    // behaves exactly as before.
+`ifdef VX_CFG_CHECKER_ENABLE
+    localparam MEM_RSP_ATTR_WIDTH = 1 + MEM_OWNER_WIDTH + 2 + 2 + `VX_CFG_CHECKER_EPOCH_WIDTH;
+`else
+    localparam MEM_RSP_ATTR_WIDTH = 0;
+`endif
+    // The live per-owner epoch table, flattened, as the checker exports it to
+    // every labeled cache (one CHECKER_EPOCH_WIDTH entry per owner).
+    localparam LABEL_EPOCHS_W = (1 << MEM_OWNER_WIDTH) * `VX_CFG_CHECKER_EPOCH_WIDTH;
+
     typedef struct packed {
         logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS = 4 + AMO_REQ_BITS
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4

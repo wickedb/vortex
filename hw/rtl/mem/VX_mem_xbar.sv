@@ -41,7 +41,7 @@ module VX_mem_xbar import VX_gpu_pkg::*; #(
     localparam LOG_NUM_REQS = `ARB_SEL_BITS(NUM_INPUTS, NUM_OUTPUTS);
     localparam TAG_UUID_W   = `UP(UUID_WIDTH);
     localparam REQ_DATAW    = 1 + ADDR_WIDTH + DATA_WIDTH + DATA_SIZE + ATTR_WIDTH + TAG_UUID_W;
-    localparam RSP_DATAW    = DATA_WIDTH + TAG_UUID_W;
+    localparam RSP_DATAW    = `UP(MEM_RSP_ATTR_WIDTH) + DATA_WIDTH + TAG_UUID_W;
     localparam SEL_COUNT    = `MIN(NUM_INPUTS, NUM_OUTPUTS);
 
     // handle requests ////////////////////////////////////////////////////////
@@ -148,7 +148,7 @@ module VX_mem_xbar import VX_gpu_pkg::*; #(
                 .data_out (rsp_tag_out)
             );
             assign rsp_valid_in[i] = bus_out_if[i].rsp_valid;
-            assign rsp_data_in[i]  = RSP_DATAW'({bus_out_if[i].rsp_data.data, rsp_tag_out});
+            assign rsp_data_in[i]  = RSP_DATAW'({bus_out_if[i].rsp_data.attr, bus_out_if[i].rsp_data.data, rsp_tag_out});
             assign bus_out_if[i].rsp_ready = rsp_ready_in[i];
         end
 
@@ -174,6 +174,7 @@ module VX_mem_xbar import VX_gpu_pkg::*; #(
         for (genvar i = 0; i < NUM_OUTPUTS; ++i) begin : g_rsp_data_in
             assign rsp_valid_in[i] = bus_out_if[i].rsp_valid;
             assign rsp_data_in[i] = RSP_DATAW'({
+                bus_out_if[i].rsp_data.attr,
                 bus_out_if[i].rsp_data.data,
                 bus_out_if[i].rsp_data.tag.uuid
             });
@@ -204,8 +205,10 @@ module VX_mem_xbar import VX_gpu_pkg::*; #(
         wire [TAG_UUID_W-1:0] rsp_tag_out;
         `UNUSED_VAR (rsp_tag_out)
         wire [DATA_WIDTH-1:0] rsp_data_dat;
-        assign {rsp_data_dat, rsp_tag_out} = rsp_data_out[i];
+        wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] rsp_data_attr;
+        assign {rsp_data_attr, rsp_data_dat, rsp_tag_out} = rsp_data_out[i];
         assign bus_in_if[i].rsp_valid = rsp_valid_out[i];
+        assign bus_in_if[i].rsp_data.attr = rsp_data_attr;
         assign bus_in_if[i].rsp_data.data = rsp_data_dat;
         assign bus_in_if[i].rsp_data.tag.uuid = rsp_tag_out[TAG_UUID_W-1:0];
         assign bus_in_if[i].rsp_data.tag.value = '0;

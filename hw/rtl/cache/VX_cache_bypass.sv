@@ -192,7 +192,12 @@ module VX_cache_bypass import VX_gpu_pkg::*; #(
         };
         assign core_bus_nc_arb_if[i].req_ready = mem_bus_out_nc_if[i].req_ready;
         assign core_bus_nc_arb_if[i].rsp_valid = mem_bus_out_nc_if[i].rsp_valid;
+        // Forward the response's label. In a PASSTHRU level every response
+        // takes this path, including the fills of the labeled cache above it,
+        // so the label must survive it; for genuinely uncached (IO) traffic
+        // it is ignored, since no labeled cache stores that response.
         assign core_bus_nc_arb_if[i].rsp_data = {
+            mem_bus_out_nc_if[i].rsp_data.attr,
             core_rsp_nc_arb_data_w,
             core_rsp_nc_arb_tag_w
         };
