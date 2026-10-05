@@ -48,7 +48,14 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // Denied reads in flight are bounded by the LLC's MSHR -- see
     // VX_checker_fault for the argument. Sized so the queue cannot fill, which
     // keeps a stall off the request path R5 measures.
-    parameter FAULT_DEPTH  = 16
+    parameter FAULT_DEPTH  = 16,
+    // Labeled lines. The shared caches above are labeled and the LLC is a
+    // labeled write-back cache, so every request here is a fill (judged where
+    // its data is delivered) or a writeback of bytes authorized on entry. The
+    // checker then never denies: it resolves each fill's header -- the lookup
+    // it always did, overlapped with DRAM -- and attaches the label to the
+    // response (rsp_label). Without it the checker judges every request.
+    parameter LABEL_MODE   = 0
 ) (
     input  wire clk,
     input  wire reset,
@@ -94,7 +101,12 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire                      rsp_valid,
     output wire [DATA_SIZE*8-1:0]    rsp_data,
     output wire [TAG_WIDTH-1:0]      rsp_tag,
+    // The policy label of the line this response fills (labeled lines).
+    output wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] rsp_label,
     input  wire                      rsp_ready,
+
+    // The live per-owner epoch table, flattened, for the labeled caches.
+    output wire [LABEL_EPOCHS_W-1:0] epochs_out,
 
     // The denied request's tag, captured so its injected response quotes it.
     input  wire [TAG_WIDTH-1:0]      req_tag,
@@ -124,6 +136,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID)
 
     localparam NUM_OWNERS = 1 << CHK_OWNER_W;
+`ifdef VX_CFG_CHECKER_ENABLE
+    `STATIC_ASSERT(CHK_LABEL_W == MEM_RSP_ATTR_WIDTH, ("the bus response attr must be exactly one policy label"))
+`endif
     localparam LAT_W      = `CLOG2(((HIT_LATENCY > MISS_LATENCY)
                                   ? HIT_LATENCY : MISS_LATENCY) + 2);
 
@@ -302,7 +317,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire [CHK_EPOCH_W-1:0] owner_epoch = epoch_table[rd_header.owner];
 
     wire authorized = chk_authorize(rd_header, s1_owner, s1_rw, owner_epoch);
-    wire denied     = s1_valid && ~s1_bypass && ~authorized;
+    wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
 
     // Under enforcement a denied request is NOT forwarded to DRAM: a read is
     // answered with poison instead (fast-fail, no DRAM round trip) and a write
@@ -325,6 +340,36 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // A blocked read must produce exactly one response, carrying its own tag.
     // A blocked write produces none -- writes are posted here.
     wire fault_push = retiring && blocked && ~s1_rw;
+
+    // ---------------------------------------------------------------------
+    // Labeled lines: the label table. A fill's label is captured when its
+    // read is forwarded to DRAM (S1 holds the resolved header) and attached to
+    // its response, found by the tag's value bits: outstanding reads have
+    // unique values (bank + MSHR id), and the response quotes its request's
+    // tag. Capturing at request time means a claim installed while the read is
+    // in flight cannot be raced; claims arrive at launch boundaries anyway.
+    // ---------------------------------------------------------------------
+    localparam LBL_IDX_W = `UP(TAG_WIDTH - UUID_WIDTH);
+    if (LABEL_MODE != 0) begin : g_label_tbl
+        reg [CHK_LABEL_W-1:0] label_tbl [1 << LBL_IDX_W];
+        wire [LBL_IDX_W-1:0] wr_idx = LBL_IDX_W'(s1_tag);
+        wire [LBL_IDX_W-1:0] rd_idx = LBL_IDX_W'(rsp_tag);
+        always @(posedge clk) begin
+            if (out_valid && out_ready && ~s1_rw) begin
+                label_tbl[wr_idx] <= chk_label_of(rd_header);
+            end
+        end
+        assign rsp_label = `UP(MEM_RSP_ATTR_WIDTH)'(label_tbl[rd_idx]);
+    end else begin : g_no_label_tbl
+        assign rsp_label = '0;
+    end
+
+    for (genvar o = 0; o < NUM_OWNERS; ++o) begin : g_epochs_out
+        assign epochs_out[o * CHK_EPOCH_W +: CHK_EPOCH_W] = epoch_table[o];
+    end
+    if (LABEL_EPOCHS_W > NUM_OWNERS * CHK_EPOCH_W) begin : g_epochs_pad
+        assign epochs_out[LABEL_EPOCHS_W-1:NUM_OWNERS * CHK_EPOCH_W] = '0;
+    end
 
     VX_checker_fault #(
         .DATA_SIZE (DATA_SIZE),
@@ -351,6 +396,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // ---------------------------------------------------------------------
     reg [31:0] reqs_r, checked_r, bypassed_r, allows_r, denies_r;
     reg [31:0] faulted_reads_r, dropped_writes_r;
+    reg [31:0] labeled_passed_r;
     wire retire = s1_retire;
 
     always @(posedge clk) begin
@@ -362,7 +408,11 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             denies_r   <= '0;
             faulted_reads_r  <= '0;
             dropped_writes_r <= '0;
+            labeled_passed_r <= '0;
         end else if (retire) begin
+            if ((LABEL_MODE != 0) && ~s1_bypass) begin
+                labeled_passed_r <= labeled_passed_r + 1;
+            end
             reqs_r <= reqs_r + 1;
             if (s1_bypass) begin
                 bypassed_r <= bypassed_r + 1;
@@ -410,6 +460,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                       INSTANCE_ID, cnt_claims, cnt_headers_written, cnt_epoch_bumps);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d",
                       INSTANCE_ID, cnt_rejected, cnt_aliased, cnt_reclaimed);
+            if (LABEL_MODE != 0)
+                $fdisplay(32'h8000_0002, "CHECKER[%s]: labels: port_passed=%0d", INSTANCE_ID, labeled_passed_r);
             if (fault_overflow)
                 $fdisplay(32'h8000_0002, "CHECKER[%s]: *** FAULT QUEUE OVERFLOW — the MSHR bound argument is wrong",
                           INSTANCE_ID);

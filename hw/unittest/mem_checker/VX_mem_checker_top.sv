@@ -120,6 +120,10 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .rsp_valid           (rsp_valid),
         .rsp_data            (rsp_data),
         .rsp_tag             (rsp_tag),
+        // Labeled lines are exercised in the GPU, not by this directed TB
+        // (LABEL_MODE = 0 here: the checker judges every request).
+        `UNUSED_PIN (rsp_label),
+        `UNUSED_PIN (epochs_out),
         .rsp_ready           (rsp_ready),
         .fault_overflow      (fault_overflow),
         .cnt_reqs            (cnt_reqs),
