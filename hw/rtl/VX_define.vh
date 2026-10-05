@@ -413,6 +413,7 @@
     assign dst.req_data.tag = src.req_data.tag; \
     assign src.req_ready = dst.req_ready; \
     assign src.rsp_valid = dst.rsp_valid; \
+    assign src.rsp_data.attr = dst.rsp_data.attr; \
     assign src.rsp_data.data = dst.rsp_data.data; \
     assign src.rsp_data.tag = dst.rsp_data.tag; \
     assign dst.rsp_ready = src.rsp_ready
@@ -427,6 +428,7 @@
     assign dst.req_data.tag = src.req_data.tag; \
     assign src.req_ready = dst.req_ready; \
     assign src.rsp_valid = dst.rsp_valid; \
+    assign src.rsp_data.attr = '0; \
     assign src.rsp_data.data = '0; \
     assign src.rsp_data.tag = '0; \
     assign dst.rsp_ready = src.rsp_ready
@@ -458,6 +460,7 @@
     end \
     assign src.req_ready = dst.req_ready; \
     assign src.rsp_valid = dst.rsp_valid; \
+    assign src.rsp_data.attr = dst.rsp_data.attr; \
     assign src.rsp_data.data = dst.rsp_data.data; \
     if (TD != TS) begin \
         if (UUID != 0) begin \

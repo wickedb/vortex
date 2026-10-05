@@ -38,7 +38,7 @@ module VX_mem_bus_slice import VX_gpu_pkg::*; #(
 );
     localparam DATA_WIDTH = (8 * DATA_SIZE);
     localparam REQ_DATAW  = 1 + ADDR_WIDTH + DATA_WIDTH + DATA_SIZE + ATTR_WIDTH + TAG_WIDTH;
-    localparam RSP_DATAW  = DATA_WIDTH + TAG_WIDTH;
+    localparam RSP_DATAW  = `UP(MEM_RSP_ATTR_WIDTH) + DATA_WIDTH + TAG_WIDTH;
 
     // ---- Request : bus_in -> bus_out ----
     wire [REQ_DATAW-1:0] req_data_in = bus_in_if.req_data;

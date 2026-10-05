@@ -35,7 +35,7 @@ module VX_mem_bus_arb import VX_gpu_pkg::*; #(
     localparam DATA_WIDTH   = (8 * DATA_SIZE);
     localparam LOG_NUM_REQS = `ARB_SEL_BITS(NUM_INPUTS, NUM_OUTPUTS);
     localparam REQ_DATAW    = 1 + ADDR_WIDTH + DATA_WIDTH + DATA_SIZE + ATTR_WIDTH + TAG_WIDTH;
-    localparam RSP_DATAW    = DATA_WIDTH + TAG_WIDTH;
+    localparam RSP_DATAW    = `UP(MEM_RSP_ATTR_WIDTH) + DATA_WIDTH + TAG_WIDTH;
     localparam SEL_COUNT    = `MIN(NUM_INPUTS, NUM_OUTPUTS);
 
     wire [NUM_INPUTS-1:0]                 req_valid_in;
@@ -127,7 +127,7 @@ module VX_mem_bus_arb import VX_gpu_pkg::*; #(
                 .data_out (rsp_tag_out)
             );
             assign rsp_valid_in[i] = bus_out_if[i].rsp_valid;
-            assign rsp_data_in[i]  = {bus_out_if[i].rsp_data.data, rsp_tag_out};
+            assign rsp_data_in[i]  = {bus_out_if[i].rsp_data.attr, bus_out_if[i].rsp_data.data, rsp_tag_out};
             assign bus_out_if[i].rsp_ready = rsp_ready_in[i];
         end
 

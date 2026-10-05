@@ -34,7 +34,10 @@ interface VX_mem_bus_if import VX_gpu_pkg::*; #(
         tag_t                   tag;
     } req_data_t;
 
+    // attr sits at the MOST significant end, so a site that still packs a bare
+    // {data, tag} zero-extends into it with data and tag in place.
     typedef struct packed {
+        logic [`UP(MEM_RSP_ATTR_WIDTH)-1:0] attr;   // policy label (VX_gpu_pkg)
         logic [DATA_SIZE*8-1:0] data;
         tag_t                   tag;
     } rsp_data_t;
