@@ -456,6 +456,12 @@ struct MemFlags {
       uint32_t dxa_notify_done   : 1;   // bit 4
       uint32_t dxa_notify_bar_id : 16;  // bits 5..20
     #endif
+      // Data-plane checker (sec/): set by a labeled cache on the fills and
+      // writebacks it issues. A labeled fill is judged where its data is
+      // delivered, not at the memory port, and a labeled writeback carries
+      // data that was authorized when it entered the cache; the memory-port
+      // checker passes both. Placed last so no existing bit moves.
+      uint32_t labeled           : 1;
     };
   };
 
@@ -1285,11 +1291,26 @@ struct MemReq {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// Data-plane checker policy label (sec/): the granule's policy header minus
+// its store bookkeeping, resolved once at the memory port where the lookup is
+// overlapped with DRAM and then carried with the data into every shared cache
+// line, like a packet header. A cache that delivers the line evaluates the
+// checker's own predicate against it. A label is constant across a line: a
+// line never straddles a granule (granules are >= 4 KB).
+struct MemLabel {
+  bool     valid        = false;
+  uint32_t owner        = 0;
+  uint32_t perms        = 0;
+  uint32_t shared_perms = 0;
+  uint64_t grant_epoch  = 0;
+};
+
 struct MemRsp {
   uint64_t tag;
   uint32_t hart_id;
   uint64_t uuid;
   std::shared_ptr<mem_block_t> data;
+  MemLabel label;   // set on a labeled cache's responses; empty otherwise
 
   MemRsp(uint64_t _tag = 0,
          uint32_t _hart_id = 0,
