@@ -56,11 +56,18 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
 
     parameter IS_LLC                = 0,      // Set when this cache is the LLC (enables AMO completion at this level).
 
-    parameter AMO_ENABLE            = 0       // Enable atomic operations in cache banks.
+    parameter AMO_ENABLE            = 0,      // Enable atomic operations in cache banks.
+
+    // Labeled lines (see VX_cache.sv). A PASSTHRU level stores nothing, and
+    // its bypass forwards the response label untouched.
+    parameter LABEL_ENABLE          = 0,
+    parameter LABEL_EDGE            = 0
  ) (
 
     input wire clk,
     input wire reset,
+
+    input wire [LABEL_EPOCHS_W-1:0] label_epochs,
 
 `ifdef PERF_ENABLE
     output cache_perf_t     cache_perf,
@@ -147,10 +154,13 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
             .CORE_OUT_BUF (BYPASS_ENABLE ? 1 : CORE_OUT_BUF),
             .MEM_OUT_BUF  (BYPASS_ENABLE ? 1 : MEM_OUT_BUF),
             .IS_LLC       (IS_LLC),
-            .AMO_ENABLE   (AMO_ENABLE)
+            .AMO_ENABLE   (AMO_ENABLE),
+            .LABEL_ENABLE (LABEL_ENABLE),
+            .LABEL_EDGE   (LABEL_EDGE)
         ) cache (
             .clk            (clk),
             .reset          (reset),
+            .label_epochs   (label_epochs),
         `ifdef PERF_ENABLE
             .cache_perf     (cache_perf),
         `endif
@@ -158,6 +168,7 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
             .mem_bus_if     (mem_bus_cache_if)
         );
     end else begin : g_passthru
+        `UNUSED_VAR (label_epochs)
         for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_bus_cache_if
             `UNUSED_VX_MEM_BUS_IF (core_bus_cache_if[i])
         end

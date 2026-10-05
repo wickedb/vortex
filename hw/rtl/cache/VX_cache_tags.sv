@@ -35,7 +35,10 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     parameter WORD_SIZE     = 1,              // Size of a word in bytes
     parameter SECTOR_SIZE   = LINE_SIZE,      // Size of a sector in bytes (fill/eviction granule); = LINE_SIZE => 1 sector
     parameter WRITEBACK     = 0,              // Enable cache writeback
-    parameter AMO_ENABLE    = 0               // Enable the AMO-passthrough line invalidate (non-LLC banks only)
+    parameter AMO_ENABLE    = 0,              // Enable the AMO-passthrough line invalidate (non-LLC banks only)
+    // Labeled lines: bits of policy label stored per way beside the tag
+    // (0 = no label store). Written only on a fill, with the tag.
+    parameter LABEL_W       = 0
 ) (
     input wire                          clk,
     input wire                          reset,
@@ -52,11 +55,8 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     input wire [`CS_LINE_SEL_BITS-1:0]  line_idx_n,
     input wire [`CS_TAG_SEL_BITS-1:0]   line_tag,
     input wire [`UP(`CS_SECTOR_SEL_BITS)-1:0] sector_idx, // requested sector within the line
-    // Owner of the request at THIS stage (st0), for the writer tag below.
-    // Must be the store being committed here, not a later request in flight
-    // behind it: stamping the right sector with the wrong tenant is §2.3's
-    // failure mode wearing a different hat, and counters cannot see it.
-    input wire [MEM_OWNER_WIDTH-1:0]    req_owner,
+    // The label the fill installs (labeled lines; ignored when LABEL_W == 0).
+    input wire [`UP(LABEL_W)-1:0]       fill_label,
     input wire [`CS_WAY_SEL_WIDTH-1:0]  evict_way,
     // fill target way as one-hot, taken from line_present/victim directly:
     // the binary evict_way round trip (encode, mux, per-way compare) put the
@@ -75,14 +75,9 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     // per-sector dirty vector of the evict way (drives the multi-beat per-sector
     // writeback); a single bit == evict_dirty when 1 sector/line.
     output wire [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask,
-    // Per-sector writer id of the evict way. A writeback is issued by whichever
-    // request triggered the eviction, NOT by whoever dirtied the line, so the
-    // memory-side checker would otherwise authorize every dirty eviction under
-    // the wrong principal (PROJECT.md §2.3 — 992/1024 errors in SimX, with
-    // counters identical to a correct run). Replayed into the writeback beat so
-    // requester identity survives the write-back cache.
-    output wire [`CS_SECTORS_PER_LINE-1:0][MEM_OWNER_WIDTH-1:0] evict_writer_ids,
-    output wire [`CS_TAG_SEL_BITS-1:0]  evict_tag
+    output wire [`CS_TAG_SEL_BITS-1:0]  evict_tag,
+    // Per-way label, aligned with tag_matches (same read, same fill bypass).
+    output wire [NUM_WAYS-1:0][`UP(LABEL_W)-1:0] read_label
 );
     //          tag store: tag only   (valid + dirty decoupled into side LUTRAMs)
     localparam SEC = `CS_SECTORS_PER_LINE;
@@ -94,20 +89,16 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     wire [NUM_WAYS-1:0][`CS_TAG_SEL_BITS-1:0] read_tag;
     wire [NUM_WAYS-1:0][SEC-1:0] read_valid;
     wire [NUM_WAYS-1:0][SEC-1:0] read_dirty;
-    wire [NUM_WAYS-1:0][SEC-1:0][MEM_OWNER_WIDTH-1:0] read_wtag;
 
     if (WRITEBACK) begin : g_evict_tag_wb
         assign evict_dirty = (| read_dirty[evict_way]); // dirty if any sector dirty
         assign evict_dirty_mask = read_dirty[evict_way];
-        assign evict_writer_ids = read_wtag[evict_way];
         assign evict_tag = read_tag[evict_way];
     end else begin : g_evict_tag_wt
         `UNUSED_VAR (read_dirty)
-        `UNUSED_VAR (read_wtag)
         `UNUSED_VAR (read_tag)
         assign evict_dirty = 1'b0;
         assign evict_dirty_mask = '0;
-        assign evict_writer_ids = '0;
         assign evict_tag = '0;
     end
 
@@ -132,9 +123,11 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
     wire [NUM_WAYS-1:0][SEC-1:0] dirty_wren;
     wire [NUM_WAYS-1:0][SEC-1:0] dirty_wdata;
     wire [NUM_WAYS-1:0][SEC-1:0] dirty_rdata;
-    wire [NUM_WAYS-1:0][SEC-1:0][MEM_OWNER_WIDTH-1:0] wtag_wren;
-    wire [NUM_WAYS-1:0][SEC-1:0][MEM_OWNER_WIDTH-1:0] wtag_wdata;
-    wire [NUM_WAYS-1:0][SEC-1:0][MEM_OWNER_WIDTH-1:0] wtag_rdata;
+
+    // Label store (labeled lines): same shape and access pattern as the tag
+    // store, written on exactly the same fills, so the label read out beside a
+    // tag is always the label that arrived with that tag's line.
+    wire [NUM_WAYS-1:0][`UP(LABEL_W)-1:0] label_rdata;
 
     for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_way_decode
         wire way_en   = (NUM_WAYS == 1) || (evict_way == i);
@@ -179,6 +172,16 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
         // and way_filled selects the result, so the set compare never sits in
         // series with the wide tag compare on the tag->data write-enable arc.
         wire tag_eq = way_filled ? (line_tag == rdw_tag) : (line_tag == tag_rdata[i]);
+
+        // The label rides the tag's bypass: a line filled last cycle is not in
+        // the label readout either, and its label is the one the fill carried.
+        if (LABEL_W != 0) begin : g_label_rd
+            wire [LABEL_W-1:0] rdw_label;
+            `BUFFER_EX(rdw_label, fill_label, ~stall, LABEL_W, 1);
+            assign read_label[i] = way_filled ? rdw_label : label_rdata[i];
+        end else begin : g_no_label_rd
+            assign read_label[i] = '0;
+        end
 
         // hit: tag match AND the requested sector is valid. read_valid folds in
         // a same-set fill from the previous cycle (see the bypass above), so
@@ -235,38 +238,13 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
             `BUFFER_EX(rdw_dset, (same_set ? dset_oh : {SEC{1'b0}}), ~stall, SEC, 1);
             `BUFFER_EX(rdw_dclr, (same_set ? dclr_oh : {SEC{1'b0}}), ~stall, SEC, 1);
             `BUFFER_EX(rdw_dclr_all, same_set && dclr_all, ~stall, 1, 1);
-            // The owner that accompanied last cycle's dirty-set, for forwarding.
-            wire [MEM_OWNER_WIDTH-1:0] rdw_owner;
-            `BUFFER_EX(rdw_owner, req_owner, ~stall, MEM_OWNER_WIDTH, 1);
             assign read_dirty[i] = (dirty_rdata[i] & ~rdw_dclr & ~{SEC{rdw_dclr_all}}) | rdw_dset;
 
-            // ---- per-sector writer id (SET ONLY) ----
-            // Stamped by the same event that sets the dirty bit: a write hit
-            // both dirties the sector and records who wrote it.
-            //
-            // No clear path, deliberately. A stale writer id is UNREACHABLE
-            // because `dirty` gates every read of it: evict_writer_ids is only
-            // consumed for sectors evict_dirty_mask marks dirty, and every
-            // clear of a dirty bit (fill / inval / init / flush) therefore
-            // retires the id with it. That is why this array is simpler than
-            // the dirty array sitting beside it.
-            for (genvar s2 = 0; s2 < SEC; ++s2) begin : g_wtag_lane
-                assign wtag_wren[i][s2]  = {MEM_OWNER_WIDTH{dset_oh[s2]}};
-                assign wtag_wdata[i][s2] = req_owner;
-                // Same same_set hazard the dirty array has: an id written last
-                // cycle is not in this cycle's readout. When rdw_dset marks the
-                // sector, the forwarded id is that request's owner.
-                assign read_wtag[i][s2] = rdw_dset[s2] ? rdw_owner : wtag_rdata[i][s2];
-            end
         end else begin : g_no_dirty
             `UNUSED_VAR (do_write)
-            `UNUSED_VAR (req_owner)
             assign dirty_wren[i]  = '0;
             assign dirty_wdata[i] = '0;
             assign read_dirty[i]  = {SEC{1'b0}};
-            assign wtag_wren[i]   = '0;
-            assign wtag_wdata[i]  = '0;
-            assign read_wtag[i]   = '0;
         end
 
         assign tag_matches[i] = raw_hit;
@@ -344,37 +322,37 @@ module VX_cache_tags import VX_gpu_pkg::*; #(
             .wdata (dirty_wdata),
             .rdata (dirty_rdata)
         );
-
-        // Writer-id store: same shape as dirty_store, MEM_OWNER_WIDTH bits per
-        // sector instead of one. Per-group write-enable so a stamp writes only
-        // its own sector's field and never reads the vector first.
-        // RESET_RAM: set-only and not swept by VX_cache_init, so without it the
-        // array powers up X. `dirty` gates every read, but SimX's
-        // sector_t::reset() zeroes writer_hart_id and this matches it.
-        VX_dp_ram #(
-            .DATAW     (NUM_WAYS * SEC * MEM_OWNER_WIDTH),
-            .WRENW     (NUM_WAYS * SEC * MEM_OWNER_WIDTH),
-            .SIZE      (`CS_LINES_PER_BANK),
-            .OUT_REG   (1),
-            .LUTRAM    (1),
-            .RESET_RAM (1),
-            .RDW_MODE  ("R")
-        ) wtag_store (
-            .clk   (clk),
-            .reset (reset),
-            .read  (~stall),
-            .write (| wtag_wren),
-            .wren  (wtag_wren),
-            .waddr (line_idx),
-            .raddr (line_idx_n),
-            .wdata (wtag_wdata),
-            .rdata (wtag_rdata)
-        );
     end else begin : g_no_dirty_store
         assign dirty_rdata = '0;
         `UNUSED_VAR ({dirty_wren, dirty_wdata, dirty_rdata})
-        assign wtag_rdata = '0;
-        `UNUSED_VAR ({wtag_wren, wtag_wdata, wtag_rdata})
+    end
+
+    if (LABEL_W != 0) begin : g_label_store
+        wire [NUM_WAYS-1:0][LABEL_W-1:0] label_wdata;
+        for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_label_wdata
+            assign label_wdata[i] = fill_label;
+        end
+        VX_dp_ram #(
+            .DATAW (NUM_WAYS * LABEL_W),
+            .WRENW (NUM_WAYS),
+            .SIZE  (`CS_LINES_PER_BANK),
+            .OUT_REG (1),
+            .RDW_MODE ("R")
+        ) label_store (
+            .clk   (clk),
+            .reset (reset),
+            .read  (~stall),
+            .write (fill),
+            .wren  (line_write),
+            .waddr (line_idx),
+            .raddr (line_idx_n),
+            .wdata (label_wdata),
+            .rdata (label_rdata)
+        );
+    end else begin : g_no_label_store
+        `UNUSED_VAR (fill_label)
+        assign label_rdata = '0;
+        `UNUSED_VAR (label_rdata)
     end
 
 endmodule
