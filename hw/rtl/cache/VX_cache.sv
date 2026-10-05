@@ -49,13 +49,23 @@ module VX_cache import VX_gpu_pkg::*; #(
 
     parameter IS_LLC                = 0,      // last-level cache: banks own AMO commit + RVA reservation tracking
 
-    parameter AMO_ENABLE            = 0       // synthesize atomic-op logic in the banks
+    parameter AMO_ENABLE            = 0,      // synthesize atomic-op logic in the banks
+
+    // Labeled lines (sec/VX_sec_pkg chk_label_t): store the policy label each
+    // fill carries (mem_bus rsp attr) and judge every write against it;
+    // LABEL_EDGE = the shared level serving private L1s, which also judges
+    // every read it delivers (poison on deny). Interior levels forward data
+    // plus label and let the edge decide.
+    parameter LABEL_ENABLE          = 0,
+    parameter LABEL_EDGE            = 0
  ) (
 `ifdef PERF_ENABLE
     output cache_perf_t     cache_perf,
 `endif
     input wire clk,
     input wire reset,
+    // Live per-owner epoch table (from the checker), what the predicate reads.
+    input wire [LABEL_EPOCHS_W-1:0] label_epochs,
     VX_mem_bus_if.slave     core_bus_if [NUM_REQS],
     VX_mem_bus_if.master    mem_bus_if [MEM_PORTS]
 );
@@ -74,10 +84,10 @@ module VX_cache import VX_gpu_pkg::*; #(
     localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
     localparam LINE_ADDR_WIDTH = (`CS_WORD_ADDR_WIDTH - BANK_SEL_BITS - WORD_SEL_BITS);
     localparam CORE_REQ_DATAW  = LINE_ADDR_WIDTH + 1 + WORD_SEL_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + `UP(MEM_ATTR_WIDTH);
-    localparam CORE_RSP_DATAW  = WORD_WIDTH + TAG_WIDTH;
+    localparam CORE_RSP_DATAW  = `UP(MEM_RSP_ATTR_WIDTH) + WORD_WIDTH + TAG_WIDTH;
     localparam BANK_MEM_TAG_WIDTH = UUID_WIDTH + MSHR_ADDR_WIDTH;
     localparam MEM_REQ_DATAW   = (`CS_LINE_SECTOR_ADDR_WIDTH + 1 + SECTOR_SIZE + `CS_SECTOR_WIDTH + BANK_MEM_TAG_WIDTH + `UP(MEM_ATTR_WIDTH));
-    localparam MEM_RSP_DATAW   = `CS_SECTOR_WIDTH + MEM_TAG_WIDTH;
+    localparam MEM_RSP_DATAW   = `UP(MEM_RSP_ATTR_WIDTH) + `CS_SECTOR_WIDTH + MEM_TAG_WIDTH;
     localparam MEM_PORTS_SEL_BITS = `CLOG2(MEM_PORTS);
     localparam MEM_PORTS_SEL_WIDTH = `UP(MEM_PORTS_SEL_BITS);
     localparam MEM_ARB_SEL_BITS = `CLOG2(`CDIV(NUM_BANKS, MEM_PORTS));
@@ -140,8 +150,9 @@ module VX_cache import VX_gpu_pkg::*; #(
     wire [MEM_PORTS-1:0][BANK_SEL_WIDTH-1:0] mem_rsp_queue_sel;
     for (genvar i = 0; i < MEM_PORTS; ++i) begin : g_mem_rsp_queue_data_s
         wire [BANK_MEM_TAG_WIDTH-1:0] mem_rsp_tag_s = mem_rsp_queue_data[i][MEM_TAG_WIDTH-1:MEM_ARB_SEL_BITS];
-        wire [`CS_SECTOR_WIDTH-1:0] mem_rsp_data_s = mem_rsp_queue_data[i][MEM_RSP_DATAW-1:MEM_TAG_WIDTH];
-        assign mem_rsp_queue_data_s[i] = {mem_rsp_data_s, mem_rsp_tag_s};
+        wire [`CS_SECTOR_WIDTH-1:0] mem_rsp_data_s = mem_rsp_queue_data[i][MEM_TAG_WIDTH +: `CS_SECTOR_WIDTH];
+        wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] mem_rsp_attr_s = mem_rsp_queue_data[i][MEM_RSP_DATAW-1 -: `UP(MEM_RSP_ATTR_WIDTH)];
+        assign mem_rsp_queue_data_s[i] = {mem_rsp_attr_s, mem_rsp_data_s, mem_rsp_tag_s};
     end
     for (genvar i = 0; i < MEM_PORTS; ++i) begin : g_mem_rsp_queue_sel
         if (NUM_BANKS > 1) begin : g_multibanks
@@ -184,9 +195,11 @@ module VX_cache import VX_gpu_pkg::*; #(
         `UNUSED_PIN (collisions)
     );
     wire [NUM_BANKS-1:0][`CS_SECTOR_WIDTH-1:0] per_bank_mem_rsp_data;
+    wire [NUM_BANKS-1:0][`UP(MEM_RSP_ATTR_WIDTH)-1:0] per_bank_mem_rsp_attr;
     wire [NUM_BANKS-1:0][BANK_MEM_TAG_WIDTH-1:0] per_bank_mem_rsp_tag;
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_mem_rsp_data
         assign {
+            per_bank_mem_rsp_attr[i],
             per_bank_mem_rsp_data[i],
             per_bank_mem_rsp_tag[i]
         } = per_bank_mem_rsp_pdata[i];
@@ -203,6 +216,7 @@ module VX_cache import VX_gpu_pkg::*; #(
     wire [NUM_BANKS-1:0]                        per_bank_core_req_ready;
     wire [NUM_BANKS-1:0]                        per_bank_core_rsp_valid;
     wire [NUM_BANKS-1:0][`CS_WORD_WIDTH-1:0]    per_bank_core_rsp_data;
+    wire [NUM_BANKS-1:0][`UP(MEM_RSP_ATTR_WIDTH)-1:0] per_bank_core_rsp_attr;
     wire [NUM_BANKS-1:0][TAG_WIDTH-1:0]         per_bank_core_rsp_tag;
     wire [NUM_BANKS-1:0][REQ_SEL_WIDTH-1:0]     per_bank_core_rsp_idx;
     wire [NUM_BANKS-1:0]                        per_bank_core_rsp_ready;
@@ -328,10 +342,13 @@ module VX_cache import VX_gpu_pkg::*; #(
             .CORE_OUT_BUF (CORE_RSP_BUF_ENABLE ? 3 : 0),
             .MEM_OUT_BUF  (MEM_REQ_BUF_ENABLE ? 3 : 0),
             .IS_LLC       (IS_LLC),
-            .AMO_ENABLE   (AMO_ENABLE)
+            .AMO_ENABLE   (AMO_ENABLE),
+            .LABEL_ENABLE (LABEL_ENABLE),
+            .LABEL_EDGE   (LABEL_EDGE)
         ) bank (
             .clk                (clk),
             .reset              (reset),
+            .label_epochs       (label_epochs),
         `ifdef PERF_ENABLE
             .perf_read_miss     (perf_read_miss_per_bank[bank_id]),
             .perf_write_miss    (perf_write_miss_per_bank[bank_id]),
@@ -350,6 +367,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             .core_req_ready     (per_bank_core_req_ready[bank_id]),
             .core_rsp_valid     (per_bank_core_rsp_valid[bank_id]),
             .core_rsp_data      (per_bank_core_rsp_data[bank_id]),
+            .core_rsp_attr      (per_bank_core_rsp_attr[bank_id]),
             .core_rsp_tag       (per_bank_core_rsp_tag[bank_id]),
             .core_rsp_idx       (per_bank_core_rsp_idx[bank_id]),
             .core_rsp_ready     (per_bank_core_rsp_ready[bank_id]),
@@ -363,6 +381,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             .mem_req_ready      (per_bank_mem_req_ready[bank_id]),
             .mem_rsp_valid      (per_bank_mem_rsp_valid[bank_id]),
             .mem_rsp_data       (per_bank_mem_rsp_data[bank_id]),
+            .mem_rsp_attr       (per_bank_mem_rsp_attr[bank_id]),
             .mem_rsp_tag        (per_bank_mem_rsp_tag[bank_id]),
             .mem_rsp_ready      (per_bank_mem_rsp_ready[bank_id]),
             .flush_begin        (per_bank_flush_begin[bank_id]),
@@ -375,7 +394,7 @@ module VX_cache import VX_gpu_pkg::*; #(
     wire [NUM_REQS-1:0]                  core_rsp_ready;
     wire [NUM_BANKS-1:0][CORE_RSP_DATAW-1:0] per_bank_core_rsp_pdata;
     for (genvar i = 0; i < NUM_BANKS; ++i) begin : g_per_bank_core_rsp_pdata
-        assign per_bank_core_rsp_pdata[i] = {per_bank_core_rsp_data[i], per_bank_core_rsp_tag[i]};
+        assign per_bank_core_rsp_pdata[i] = {per_bank_core_rsp_attr[i], per_bank_core_rsp_data[i], per_bank_core_rsp_tag[i]};
     end
     VX_stream_omega #(
         .NUM_INPUTS  (NUM_BANKS),
@@ -398,7 +417,7 @@ module VX_cache import VX_gpu_pkg::*; #(
     );
     for (genvar i = 0; i < NUM_REQS; ++i) begin : g_core_rsp
         assign core_bus2_if[i].rsp_valid = core_rsp_valid[i];
-        assign {core_bus2_if[i].rsp_data.data, core_bus2_if[i].rsp_data.tag} = core_rsp_pdata[i];
+        assign {core_bus2_if[i].rsp_data.attr, core_bus2_if[i].rsp_data.data, core_bus2_if[i].rsp_data.tag} = core_rsp_pdata[i];
         assign core_rsp_ready[i] = core_bus2_if[i].rsp_ready;
     end
     wire [NUM_BANKS-1:0][MEM_REQ_DATAW-1:0] per_bank_mem_req_pdata;

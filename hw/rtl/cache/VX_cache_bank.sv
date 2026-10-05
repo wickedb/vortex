@@ -13,7 +13,7 @@
 
 `include "VX_cache_define.vh"
 
-module VX_cache_bank import VX_gpu_pkg::*; #(
+module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter `STRING INSTANCE_ID= "",
     parameter BANK_ID           = 0,
     parameter NUM_REQS          = 1,
@@ -40,10 +40,16 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     parameter MSHR_ADDR_WIDTH   = `LOG2UP(MSHR_SIZE),
     parameter MEM_TAG_WIDTH     = UUID_WIDTH + MSHR_ADDR_WIDTH,
     parameter REQ_SEL_WIDTH     = `UP(`CS_REQ_SEL_BITS),
-    parameter WORD_SEL_WIDTH    = `UP(`CS_WORD_SEL_BITS)
+    parameter WORD_SEL_WIDTH    = `UP(`CS_WORD_SEL_BITS),
+    // Labeled lines (sec/VX_sec_pkg chk_label_t). See VX_cache.sv.
+    parameter LABEL_ENABLE      = 0,
+    parameter LABEL_EDGE        = 0
 ) (
     input wire clk,
     input wire reset,
+
+    // Live per-owner epoch table: what the delivery-side predicate reads.
+    input wire [LABEL_EPOCHS_W-1:0]     label_epochs,
 
 `ifdef PERF_ENABLE
     output wire perf_read_miss,
@@ -67,6 +73,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // Core response
     output wire                         core_rsp_valid,
     output wire [`CS_WORD_WIDTH-1:0]    core_rsp_data,
+    // The delivered line's label, for the shared level above to store.
+    output wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] core_rsp_attr,
     output wire [TAG_WIDTH-1:0]         core_rsp_tag,
     output wire [REQ_SEL_WIDTH-1:0]     core_rsp_idx,
     input  wire                         core_rsp_ready,
@@ -84,6 +92,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // Memory response
     input wire                          mem_rsp_valid,
     input wire [`CS_SECTOR_WIDTH-1:0]   mem_rsp_data,
+    // The fill's label (from the checker, or from the shared level below).
+    input wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] mem_rsp_attr,
     input wire [MEM_TAG_WIDTH-1:0]      mem_rsp_tag,
     output wire                         mem_rsp_ready,
 
@@ -101,6 +111,11 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // core-rsp queue depth (pow2): registered-skid minimum (2) plus CRSQ_SIZE extra slots
     localparam CRSQ_QUEUE_SIZE = 1 << `CLOG2(2 + CRSQ_SIZE);
     `STATIC_ASSERT(LATENCY >= 2, ("invalid parameter: cache bank LATENCY must be >= 2"))
+    // Labeled lines, stage L0: the AMO commit path is not yet judged.
+    `STATIC_ASSERT(!(LABEL_ENABLE && AMO_ENABLE), ("labeled lines do not yet cover AMOs"))
+    // One label per line is exact only if a line never straddles a granule.
+    `STATIC_ASSERT(!LABEL_ENABLE || (CHK_BUF_LOG2 >= `CLOG2(LINE_SIZE)), ("a cache line must not straddle a policy granule"))
+    localparam LABEL_W = LABEL_ENABLE ? CHK_LABEL_W : 0;
     `UNUSED_PARAM (MRSQ_SIZE)
 
     // ========================================================================
@@ -135,17 +150,17 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         logic                          is_hit, is_dirty, mshr_pending;
         logic                          is_refill; // fill into an already-resident line (sector refill)
         logic [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask; // per-sector dirty of the evict way
-        // Per-sector writer id of the evict way, read at S0 with the dirty mask
-        // and carried to the writeback beat at stC. Must travel with the mask:
-        // the beat that writes sector k back needs the id recorded for sector k
-        // (PROJECT.md §2.3).
-        logic [`CS_SECTORS_PER_LINE-1:0][MEM_OWNER_WIDTH-1:0] evict_writer_ids;
         logic [`CS_TAG_SEL_BITS-1:0]   evict_tag;
+        // Labeled lines: the hit way's label (what an interior level forwards)
+        // and whether the predicate denied this request against it.
+        logic                          label_deny;
+        logic [`UP(MEM_RSP_ATTR_WIDTH)-1:0] label;
         logic [MSHR_ADDR_WIDTH-1:0]    mshr_previd;
     } lookup_t;
 
     typedef struct packed {            // data-array drive (S0 -> stD)
         req_t                          req;
+        logic                          label_deny;  // a denied write never reaches the array
         logic [`CS_WORD_WIDTH-1:0]     wdata;
         logic [NUM_WAYS-1:0]           tag_matches;
     } data_t;
@@ -224,6 +239,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     // data; it feeds the data-array fill port and the forward-response word.
     reg [`CS_SECTOR_WIDTH-1:0] fbuf_data_r;
     reg [`CS_LINE_ADDR_WIDTH-1:0] fbuf_addr_r;
+    // The staged fill's label: written into the tags with the fill at S0 and
+    // judged against for the fill-forward responses, like fbuf_data_r.
+    reg [`UP(MEM_RSP_ATTR_WIDTH)-1:0] fbuf_label_r;
 
     // AMO sideband, extracted from the attr field (gated by AMO_ENABLE).
     amo_req_t core_req_amo;
@@ -533,7 +551,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
     wire [`CS_WAY_SEL_WIDTH-1:0] hit_idx_st0;
     wire evict_dirty_st0;
     wire [`CS_SECTORS_PER_LINE-1:0] evict_dirty_mask_st0;
-    wire [`CS_SECTORS_PER_LINE-1:0][MEM_OWNER_WIDTH-1:0] evict_writer_ids_st0;
+    wire [NUM_WAYS-1:0][`UP(LABEL_W)-1:0] read_label_st0;
     wire [`CS_TAG_SEL_BITS-1:0] evict_tag_st0;
 
     // A fill into a line that is already resident (a sector refill) must target
@@ -590,7 +608,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .WORD_SIZE  (WORD_SIZE),
         .SECTOR_SIZE(SECTOR_SIZE),
         .WRITEBACK  (WRITEBACK),
-        .AMO_ENABLE ((AMO_ENABLE != 0) && (IS_LLC == 0))
+        .AMO_ENABLE ((AMO_ENABLE != 0) && (IS_LLC == 0)),
+        .LABEL_W    (LABEL_W)
     ) cache_tags (
         .clk         (clk),
         .reset       (reset),
@@ -607,19 +626,57 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .line_idx_n  (sel_req.req.addr[`CS_LINE_SEL_BITS-1:0]),
         .line_tag    (line_tag_st0),
         .sector_idx  (sector_idx_st0),
-        // st0's own owner: the tags module operates entirely on st0, so this
-        // must be the request being committed there (see VX_cache_tags).
-        // Cast by offset, the same idiom core_req_amo uses for the AMO sideband.
-        .req_owner   (st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
+        // The fill at S0 is the one staged in the fill buffer at accept.
+        .fill_label  (`UP(LABEL_W)'(fbuf_label_r)),
         .evict_way   (evict_way_st0),
         .fill_way_oh (fill_way_oh_st0),
         .tag_matches (tag_matches_st0),
         .line_present (line_present_st0),
         .evict_dirty (evict_dirty_st0),
         .evict_dirty_mask (evict_dirty_mask_st0),
-        .evict_writer_ids (evict_writer_ids_st0),
-        .evict_tag   (evict_tag_st0)
+        .evict_tag   (evict_tag_st0),
+        .read_label  (read_label_st0)
     );
+
+    // ========================================================================
+    // Labeled lines: the delivery-side check (S0)
+    //
+    // Every way's label is judged in parallel with the tag compare, by the SAME
+    // predicate the memory-port checker evaluates (VX_sec_pkg), against the
+    // requester's owner (a replay carries it through the MSHR) and the live
+    // epoch of the label's owner. The compare only selects among the verdicts,
+    // so this adds one AND-OR after it. Writes are judged at every labeled
+    // level; reads only at the edge (the shared level serving private L1s).
+    // ========================================================================
+    wire label_deny_st0;
+    wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] label_hit_st0;
+    if (LABEL_ENABLE) begin : g_label_check
+        wire [MEM_OWNER_WIDTH-1:0] req_owner_st0 = st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH];
+        wire [NUM_WAYS-1:0] allow_w;
+        wire [NUM_WAYS-1:0][CHK_LABEL_W-1:0] hit_label_w;
+        for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_way
+            chk_label_t lbl;
+            assign lbl = chk_label_t'(read_label_st0[i]);
+            wire [CHK_EPOCH_W-1:0] owner_epoch = label_epochs[lbl.owner * CHK_EPOCH_W +: CHK_EPOCH_W];
+            assign allow_w[i] = chk_authorize_label(lbl, req_owner_st0, st0.req.rw, owner_epoch);
+            assign hit_label_w[i] = tag_matches_st0[i] ? read_label_st0[i] : '0;
+        end
+        wire judged = st0.req.rw || (LABEL_EDGE != 0);
+        assign label_deny_st0 = do_lookup_st0 && judged && (| (tag_matches_st0 & ~allow_w));
+        // tag_matches is one-hot, so OR-reducing the masked labels selects the hit way's.
+        reg [CHK_LABEL_W-1:0] hit_label_or;
+        always @(*) begin
+            hit_label_or = '0;
+            for (int i = 0; i < NUM_WAYS; ++i) begin
+                hit_label_or |= hit_label_w[i];
+            end
+        end
+        assign label_hit_st0 = `UP(MEM_RSP_ATTR_WIDTH)'(hit_label_or);
+    end else begin : g_no_label_check
+        `UNUSED_VAR ({read_label_st0, label_epochs})
+        assign label_deny_st0 = 1'b0;
+        assign label_hit_st0  = '0;
+    end
 
     VX_onehot_encoder #(
         .N (NUM_WAYS)
@@ -655,7 +712,8 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         lk_st0.is_dirty     = evict_dirty_st0;
         lk_st0.is_refill    = st0.req.is_fill && line_present_any_st0;
         lk_st0.evict_dirty_mask = evict_dirty_mask_st0;
-        lk_st0.evict_writer_ids = evict_writer_ids_st0;
+        lk_st0.label_deny   = label_deny_st0;
+        lk_st0.label        = label_hit_st0;
         lk_st0.evict_tag    = evict_tag_st0;
         lk_st0.mshr_previd  = mshr_previd;
         lk_st0.mshr_pending = mshr_pending_raw && ~is_amo_fwd_st0;
@@ -679,6 +737,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         dat_in = st0;
         dat_in.req.way_idx = evict_way_st0;
         dat_in.tag_matches = tag_matches_st0;
+        dat_in.label_deny = label_deny_st0;
     end
 
     // commit path: the request (with the resolved hit/victim way and MSHR id)
@@ -769,7 +828,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .fill         (do_fill_std && ~stD.req.is_passthru_fill && ~pipe_stall),
         .flush        (do_flush_std && ~pipe_stall),
         .read         (do_read_std && ~pipe_stall),
-        .write        (do_write_std && ~pipe_stall),
+        .write        (do_write_std && ~stD.label_deny && ~pipe_stall),
         .evict_way    (stD.req.way_idx),
         .tag_matches  (stD.tag_matches),
         .line_idx     (stD.req.addr[`CS_LINE_SEL_BITS-1:0]),
@@ -1062,8 +1121,12 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         `UNUSED_VAR ({amo_rd_fwd_mask, amo_rd_fwd_data})
     end
 
-    wire [`CS_WORD_WIDTH-1:0] crsp_queue_data = is_amo_replay_st1 ? amo_ptw_word_st1
-                                              : (amo_hit_st1 ? amo_rsp_data : read_word_fwd_stc);
+    // A read denied at the edge is answered with the checker's poison pattern;
+    // it lands only in the requester's private L1, never in a shared level.
+    wire [`CS_WORD_WIDTH-1:0] poison_word = {WORD_SIZE{8'hDD}};
+    wire [`CS_WORD_WIDTH-1:0] crsp_queue_data = (LABEL_EDGE != 0 && stC.lk.label_deny) ? poison_word
+                                              : (is_amo_replay_st1 ? amo_ptw_word_st1
+                                              : (amo_hit_st1 ? amo_rsp_data : read_word_fwd_stc));
 
     // ========================================================================
     // Fill forwarding
@@ -1109,6 +1172,7 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         if (fwd_stage) begin
             fbuf_data_r <= mem_rsp_data;
             fbuf_addr_r <= mem_rsp_addr;
+            fbuf_label_r <= mem_rsp_attr;
         end
     end
 
@@ -1119,11 +1183,24 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         assign fwd_word = fbuf_data_r[`CS_WORD_WIDTH-1:0];
     end
 
+    // Fill-forward is a delivery too: at the edge, judge the chained read
+    // against the staged fill's label and the requester the MSHR parked.
+    wire fwd_label_deny;
+    if (LABEL_ENABLE && LABEL_EDGE) begin : g_fwd_label
+        chk_label_t fwd_lbl;
+        assign fwd_lbl = chk_label_t'(fbuf_label_r[CHK_LABEL_W-1:0]);
+        wire [CHK_EPOCH_W-1:0] fwd_epoch = label_epochs[fwd_lbl.owner * CHK_EPOCH_W +: CHK_EPOCH_W];
+        assign fwd_label_deny = ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, fwd_epoch);
+    end else begin : g_no_fwd_label
+        assign fwd_label_deny = 1'b0;
+    end
+    wire [`CS_WORD_WIDTH-1:0] fwd_word_rsp = fwd_label_deny ? poison_word : fwd_word;
+
     `RUNTIME_ASSERT (~fwd_fire || (replay_addr == fbuf_addr_r), ("%t: %s fill-forward address mismatch: addr=0x%0h, staged=0x%0h", $time, INSTANCE_ID, `CS_BANK_TO_FULL_ADDR(replay_addr, BANK_ID), `CS_BANK_TO_FULL_ADDR(fbuf_addr_r, BANK_ID)))
     `RUNTIME_ASSERT (~(flush_fire && fwd_pending), ("%t: %s flush during fill-forward drain", $time, INSTANCE_ID))
 
     VX_elastic_buffer #(
-        .DATAW   (TAG_WIDTH + `CS_WORD_WIDTH + REQ_SEL_WIDTH),
+        .DATAW   (`UP(MEM_RSP_ATTR_WIDTH) + TAG_WIDTH + `CS_WORD_WIDTH + REQ_SEL_WIDTH),
         .SIZE    (CRSQ_QUEUE_SIZE),
         .OUT_REG (`TO_OUT_BUF_REG(CORE_OUT_BUF))
     ) core_rsp_queue (
@@ -1131,9 +1208,9 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         .reset     (reset),
         .valid_in  (crsp_queue_valid || fwd_head),
         .ready_in  (crsp_queue_ready),
-        .data_in   (crsp_queue_valid ? {stC.req.tag, crsp_queue_data, stC.req.req_idx}
-                                     : {replay_tag, fwd_word, replay_idx}),
-        .data_out  ({core_rsp_tag, core_rsp_data, core_rsp_idx}),
+        .data_in   (crsp_queue_valid ? {stC.lk.label, stC.req.tag, crsp_queue_data, stC.req.req_idx}
+                                     : {fbuf_label_r, replay_tag, fwd_word_rsp, replay_idx}),
+        .data_out  ({core_rsp_attr, core_rsp_tag, core_rsp_data, core_rsp_idx}),
         .valid_out (core_rsp_valid),
         .ready_out (core_rsp_ready)
     );
@@ -1283,32 +1360,12 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
         assign mreq_queue_tag = stC.req.mshr_id;
     end
 
-    // ---- REPLAY the writer id into the writeback (PROJECT.md §2.3) ----
-    // A writeback is issued by whichever request triggered the eviction, so
-    // stC.req.attr names the EVICTOR, not whoever dirtied the line. Authorizing
-    // a dirty eviction under the evictor is unsound in exactly the case the
-    // threat model cares about -- it produced 992/1024 errors in SimX, with
-    // counters identical to a correct run. On a writeback beat, substitute the
-    // owner recorded for that sector when it was dirtied; every other request
-    // (fill, write-through store, AMO forward) is issued by its own requester
-    // and keeps its attr untouched.
-    wire [`UP(MEM_ATTR_WIDTH)-1:0] mreq_queue_attr;
-    if (WRITEBACK) begin : g_mreq_attr_wb
-        wire [MEM_OWNER_WIDTH-1:0] wb_writer = stC.lk.evict_writer_ids[wb_sector];
-        // Overwrite just the owner field and leave every other attr bit alone.
-        // A field assignment rather than a concatenation, so this stays correct
-        // if another field is ever appended above owner.
-        reg [`UP(MEM_ATTR_WIDTH)-1:0] wb_attr;
-        always @(*) begin
-            wb_attr = stC.req.attr;
-            wb_attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH] = wb_writer;
-        end
-        assign mreq_queue_attr = is_wb_beat ? wb_attr : stC.req.attr;
-    end else begin : g_mreq_attr_wt
-        // Write-through: the store itself pushes the request, so its attr is
-        // already the requester's. Nothing to substitute.
-        assign mreq_queue_attr = stC.req.attr;
-    end
+    // Every request leaves with its own attr. A writeback's attr names the
+    // evictor, which is harmless now: under labeled lines a write is judged
+    // before it modifies a line, so a dirty sector holds only authorized
+    // bytes, and the memory-port checker passes writebacks rather than
+    // authorizing them by identity. (R2's per-sector writer id is retired.)
+    wire [`UP(MEM_ATTR_WIDTH)-1:0] mreq_queue_attr = stC.req.attr;
 
     assign mreq_queue_pop = mem_req_valid && mem_req_ready;
 
@@ -1432,6 +1489,33 @@ module VX_cache_bank import VX_gpu_pkg::*; #(
                 `TRACE(2, ("%t: %s fill-req: addr=0x%0h, mshr_id=%0d (#%0d)\n", $time, INSTANCE_ID,
                     mreq_queue_full_addr, stC.req.mshr_id, req_uuid_stc))
             end
+        end
+    end
+`endif
+
+`ifdef SIMULATION
+    // Labeled-lines counters for rtlsim, printed like the checker's (stderr,
+    // off the PERF stream). Reads count at the edge, writes at every level.
+    if (LABEL_ENABLE) begin : g_label_cnt
+        reg [31:0] label_rd_deny_r, label_wr_deny_r;
+        always @(posedge clk) begin
+            if (reset) begin
+                label_rd_deny_r <= '0;
+                label_wr_deny_r <= '0;
+            end else begin
+                if ((crsp_queue_valid && crsp_queue_ready && (LABEL_EDGE != 0) && stC.lk.label_deny)
+                 || (fwd_fire && fwd_label_deny)) begin
+                    label_rd_deny_r <= label_rd_deny_r + 1;
+                end
+                if (do_write_stc && stC.lk.label_deny && ~pipe_stall) begin
+                    label_wr_deny_r <= label_wr_deny_r + 1;
+                end
+            end
+        end
+        final begin
+            if (label_rd_deny_r != 0 || label_wr_deny_r != 0)
+                $fdisplay(32'h8000_0002, "LABEL[%s]: deliver_read_deny=%0d, deliver_write_deny=%0d",
+                          INSTANCE_ID, label_rd_deny_r, label_wr_deny_r);
         end
     end
 `endif

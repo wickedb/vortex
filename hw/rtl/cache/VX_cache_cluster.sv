@@ -152,6 +152,7 @@ module VX_cache_cluster import VX_gpu_pkg::*; #(
         `endif
             .clk         (clk),
             .reset       (reset),
+            .label_epochs('0),  // private caches carry no labels
             .core_bus_if (arb_core_bus_if[i * NUM_REQS +: NUM_REQS]),
             .mem_bus_if  (cache_mem_bus_if[i * MEM_PORTS +: MEM_PORTS])
         );
