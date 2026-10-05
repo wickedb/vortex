@@ -1505,7 +1505,10 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
 `ifdef SIMULATION
     // Labeled-lines counters for rtlsim, printed like the checker's (stderr,
-    // off the PERF stream). Reads count at the edge, writes at every level.
+    // off the PERF stream). Reads count at the edge. Writes are judged at
+    // every level but count only where the verdict is final: a write-through
+    // level forwards a denied write and the write-back level below judges it
+    // again, so counting both would report every denied write twice.
     if (LABEL_ENABLE) begin : g_label_cnt
         reg [31:0] label_rd_deny_r, label_wr_deny_r;
         always @(posedge clk) begin
@@ -1517,7 +1520,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                  || (fwd_fire && fwd_label_deny)) begin
                     label_rd_deny_r <= label_rd_deny_r + 1;
                 end
-                if (do_write_stc && stC.lk.label_deny && ~pipe_stall) begin
+                if ((WRITEBACK != 0) && do_write_stc && stC.lk.label_deny && ~pipe_stall) begin
                     label_wr_deny_r <= label_wr_deny_r + 1;
                 end
             end
