@@ -11,6 +11,7 @@
 #include <iosfwd>
 #include <vector>
 #include "types.h"
+#include "label.h"
 
 namespace vortex {
 
@@ -111,7 +112,7 @@ constexpr uint32_t DCR_CHECKER_END        = 0x340;
 // This mirrors what real memory-side protection hardware does (poison + log);
 // precise traps to the offending warp are architecturally out of reach from
 // behind the LLC. The first fault is latched in FaultStatus for readback.
-class MemChecker : public SimObject<MemChecker> {
+class MemChecker : public SimObject<MemChecker>, public LabelAuthority {
 public:
   struct Config {
     uint32_t num_ports = 1;
@@ -179,6 +180,12 @@ public:
     // counted here. Non-zero means the store is too small for the granularity
     // in use — a capacity result worth reporting, not a bug to route around.
     uint64_t claims_aliased = 0;
+    // Labeled lines. Requests the port passed because a labeled cache issued
+    // them (fills judged at delivery, writebacks authorized on entry), and
+    // the denies the caches made at delivery.
+    uint64_t labeled_passed = 0;
+    uint64_t label_read_denies = 0;
+    uint64_t label_write_denies = 0;
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
@@ -234,6 +241,12 @@ public:
   // VX_CHECKER is unset, in which case the checker is not constructed at all
   // and the l3→dram binding stays exactly as upstream leaves it.
   static bool env_config(Config* out);
+
+  // LabelAuthority: what a labeled cache consults (sec/label.h).
+  MemLabel resolve_label(uint64_t addr) const override;
+  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const override;
+  std::shared_ptr<mem_block_t> poison() const override;
+  void count_label_deny(bool is_write) override;
 
 protected:
   void on_reset();

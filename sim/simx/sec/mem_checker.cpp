@@ -364,6 +364,13 @@ public:
          << ", dropped_writes=" << perf_stats_.dropped_writes
          << std::endl;
     }
+    if (perf_stats_.labeled_passed != 0 || perf_stats_.label_read_denies != 0
+     || perf_stats_.label_write_denies != 0) {
+      os << "CHECKER: labels: port_passed=" << perf_stats_.labeled_passed
+         << ", deliver_read_deny=" << perf_stats_.label_read_denies
+         << ", deliver_write_deny=" << perf_stats_.label_write_denies
+         << std::endl;
+    }
     if (perf_stats_.dcr_claims != 0 || perf_stats_.epoch_bumps != 0) {
       os << "CHECKER: setup: dcr_claims=" << perf_stats_.dcr_claims
          << ", headers_written=" << perf_stats_.headers_written
@@ -401,6 +408,61 @@ private:
   // from the owner check and filed --cores=2 --l3cache as post-PoC work; that
   // is the configuration which then failed with 992 errors and forced the
   // opposite design. It is archived, not live — see playground_2626/PROJECT.md §17.)
+public:
+  // A header's label: the header minus the store's bookkeeping.
+  static MemLabel label_of(const BufferHeader& header) {
+    MemLabel label;
+    label.valid        = true;
+    label.owner        = header.owner_eid;
+    label.perms        = header.perms;
+    label.shared_perms = header.shared_perms;
+    label.grant_epoch  = header.grant_epoch;
+    return label;
+  }
+
+  MemLabel resolve_label(uint64_t addr) const {
+    if (get_addr_type(addr) != AddrType::Global)
+      return MemLabel{};
+    return label_of(this->header_for(addr >> config_.buffer_log2));
+  }
+
+  // THE predicate. check() applies it to a header at the memory port; a
+  // labeled cache applies it to the label it stored with the line. One
+  // function, so the placements cannot drift apart.
+  //
+  // Owner (and system/shared OWNER_ANY) access is not epoch-gated:
+  // revocation expires grants to *others*, it does not evict the owner.
+  // Non-owner access rides the shared grant, which the *granting* owner's
+  // epoch-table entry gates — bumped via DCR_CHECKER_REVOKE_OWNER +
+  // DCR_CHECKER_EPOCH, without writing any header (thesis §6). Scoped per
+  // owner: revoking owner A's grants never advances owner C's entry, so
+  // C's unrelated grant to D is untouched. The epoch is read live, which is
+  // what lets one bump expire every cached copy of a grant at once.
+  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const {
+    if (!label.valid)
+      return true;   // no policy: IO / local memory
+    uint32_t owner = this->owner_of(hart_id);
+    uint32_t need = is_write ? PERM_W : PERM_R;
+    bool ok;
+    if (label.owner == OWNER_ANY || label.owner == owner) {
+      ok = (label.perms & need) != 0;
+    } else {
+      ok = ((label.shared_perms & need) != 0)
+        && (this->epoch_for(label.owner) <= label.grant_epoch);
+    }
+    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
+      ok = false;
+    return ok;
+  }
+
+  std::shared_ptr<mem_block_t> poison() const { return poison_; }
+
+  void count_label_deny(bool is_write) {
+    if (is_write) ++perf_stats_.label_write_denies;
+    else          ++perf_stats_.label_read_denies;
+  }
+
+private:
   uint32_t owner_of(uint32_t hart_id) const {
     constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
     constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
@@ -558,7 +620,25 @@ private:
     }
     ++perf_stats_.checked;
 
+    // Labeled lines: a labeled cache's fill is judged where its data is
+    // delivered (the cache stores the label this port resolves for it), and
+    // its writeback carries data that was authorized when it entered the
+    // cache. Judging either here would be wrong twice over: a denied fill
+    // would install poison in a shared cache that the owner then reads, and a
+    // writeback names the evictor, not the writer. The header is still looked
+    // up, because that lookup is what resolves the fill's label.
     uint64_t buffer_id = req.addr >> config_.buffer_log2;
+    if (req.flags.labeled) {
+      bool hit = this->hcache_lookup(buffer_id);
+      if (hit) ++perf_stats_.hc_hits;
+      else     ++perf_stats_.hc_misses;
+      uint64_t added = hit ? config_.hit_latency : config_.miss_latency;
+      ++perf_stats_.labeled_passed;
+      ++perf_stats_.allows;
+      *allowed = true;
+      perf_stats_.added_cycles += added;
+      return added;
+    }
     bool hit = this->hcache_lookup(buffer_id);
     if (hit) {
       ++perf_stats_.hc_hits;
@@ -567,26 +647,8 @@ private:
     }
     uint64_t added = hit ? config_.hit_latency : config_.miss_latency;
 
-    const BufferHeader& header = this->header_for(buffer_id);
-    uint32_t owner = this->owner_of(req.hart_id);
-    uint32_t need = req.is_write() ? PERM_W : PERM_R;
-
-    // Owner (and system/shared OWNER_ANY) access is not epoch-gated:
-    // revocation expires grants to *others*, it does not evict the owner.
-    // Non-owner access rides the shared grant, which the *granting* owner's
-    // epoch-table entry gates — bumped via DCR_CHECKER_REVOKE_OWNER +
-    // DCR_CHECKER_EPOCH, without writing any header (thesis §6). Scoped per
-    // owner: revoking owner A's grants never advances owner C's entry, so
-    // C's unrelated grant to D is untouched.
-    bool ok;
-    if (header.owner_eid == OWNER_ANY || header.owner_eid == owner) {
-      ok = (header.perms & need) != 0;
-    } else {
-      ok = ((header.shared_perms & need) != 0)
-        && (this->epoch_for(header.owner_eid) <= header.grant_epoch);
-    }
-    if (config_.test_deny == 1 || (config_.test_deny == 2 && req.is_write()))
-      ok = false;
+    bool ok = this->authorize(label_of(this->header_for(buffer_id)),
+                              req.hart_id, req.is_write());
 
     if (ok) {
       ++perf_stats_.allows;
@@ -647,6 +709,22 @@ const MemChecker::FaultStatus& MemChecker::fault_status() const {
 
 void MemChecker::dump(std::ostream& os) const {
   impl_->dump(os);
+}
+
+MemLabel MemChecker::resolve_label(uint64_t addr) const {
+  return impl_->resolve_label(addr);
+}
+
+bool MemChecker::authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const {
+  return impl_->authorize(label, hart_id, is_write);
+}
+
+std::shared_ptr<mem_block_t> MemChecker::poison() const {
+  return impl_->poison();
+}
+
+void MemChecker::count_label_deny(bool is_write) {
+  impl_->count_label_deny(is_write);
 }
 
 bool MemChecker::env_config(Config* out) {
