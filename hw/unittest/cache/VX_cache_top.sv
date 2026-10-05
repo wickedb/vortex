@@ -71,10 +71,19 @@ module VX_cache_top import VX_gpu_pkg::*; #(
     // Memory request output buffer
     parameter MEM_OUT_BUF           = 3,
 
-    parameter MEM_TAG_WIDTH         = `CACHE_MEM_TAG_WIDTH(MSHR_SIZE, NUM_BANKS, MEM_PORTS, UUID_WIDTH)
+    parameter MEM_TAG_WIDTH         = `CACHE_MEM_TAG_WIDTH(MSHR_SIZE, NUM_BANKS, MEM_PORTS, UUID_WIDTH),
+
+    // Labeled lines (see VX_cache.sv). Needs AMO_ENABLE = 0 and a build with
+    // VX_CFG_CHECKER_ENABLE, which sizes the label (MEM_RSP_ATTR_WIDTH).
+    parameter LABEL_ENABLE          = 0,
+    parameter LABEL_EDGE            = 0
  ) (
     input wire clk,
     input wire reset,
+
+    // The checker's live per-owner epoch table, as a top-level input so the
+    // label predicate is not optimized away.
+    input  wire [LABEL_EPOCHS_W-1:0] label_epochs,
 
 // PERF
 `ifdef PERF_ENABLE
@@ -95,6 +104,7 @@ module VX_cache_top import VX_gpu_pkg::*; #(
     output wire                     core_rsp_valid [NUM_REQS],
     output wire[`CS_WORD_WIDTH-1:0] core_rsp_data [NUM_REQS],
     output wire[TAG_WIDTH-1:0]      core_rsp_tag [NUM_REQS],
+    output wire[`UP(MEM_RSP_ATTR_WIDTH)-1:0] core_rsp_attr [NUM_REQS],
     input  wire                     core_rsp_ready [NUM_REQS],
 
     // Memory request (sector-granular; = line when 1 sector/line)
@@ -110,6 +120,7 @@ module VX_cache_top import VX_gpu_pkg::*; #(
     input  wire                     mem_rsp_valid [MEM_PORTS],
     input  wire [`CS_SECTOR_WIDTH-1:0] mem_rsp_data [MEM_PORTS],
     input  wire [MEM_TAG_WIDTH-1:0] mem_rsp_tag [MEM_PORTS],
+    input  wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] mem_rsp_attr [MEM_PORTS],
     output wire                     mem_rsp_ready [MEM_PORTS]
 );
     VX_mem_bus_if #(
@@ -139,6 +150,7 @@ module VX_cache_top import VX_gpu_pkg::*; #(
         assign core_rsp_valid[i]= core_bus_if[i].rsp_valid;
         assign core_rsp_data[i] = core_bus_if[i].rsp_data.data;
         assign core_rsp_tag[i]  = core_bus_if[i].rsp_data.tag;
+        assign core_rsp_attr[i] = core_bus_if[i].rsp_data.attr;
         assign core_bus_if[i].rsp_ready = core_rsp_ready[i];
     end
 
@@ -158,6 +170,7 @@ module VX_cache_top import VX_gpu_pkg::*; #(
         assign mem_bus_if[i].rsp_valid = mem_rsp_valid[i];
         assign mem_bus_if[i].rsp_data.data = mem_rsp_data[i];
         assign mem_bus_if[i].rsp_data.tag = mem_rsp_tag[i];
+        assign mem_bus_if[i].rsp_data.attr = mem_rsp_attr[i];
         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
     end
 
@@ -183,13 +196,16 @@ module VX_cache_top import VX_gpu_pkg::*; #(
         .AMO_ENABLE     (AMO_ENABLE),
         .IS_LLC         (IS_LLC),
         .CORE_OUT_BUF   (CORE_OUT_BUF),
-        .MEM_OUT_BUF    (MEM_OUT_BUF)
+        .MEM_OUT_BUF    (MEM_OUT_BUF),
+        .LABEL_ENABLE   (LABEL_ENABLE),
+        .LABEL_EDGE     (LABEL_EDGE)
     ) cache (
     `ifdef PERF_ENABLE
         .cache_perf     (cache_perf),
     `endif
         .clk            (clk),
         .reset          (reset),
+        .label_epochs   (label_epochs),
         .core_bus_if    (core_bus_if),
         .mem_bus_if     (mem_bus_if)
     );
