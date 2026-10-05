@@ -173,6 +173,22 @@ ProcessorImpl::ProcessorImpl()
     // stacks, args — stay accessible to every tenant. Allow-all, so Phase 2's
     // single-owner rows reproduce unchanged.
     mem_checker_->install_single_owner(OWNER_ANY, PERM_R | PERM_W);
+
+    // Labeled lines (sec/label.h). A checker on the LLC->DRAM wire sees
+    // misses, not accesses: a hit in a cache shared between tenants never
+    // reaches it. So every enabled shared level stores the label this checker
+    // resolves for each fill and judges at delivery. The edge is the shared
+    // level whose requesters are private L1s: the L2 when it exists, else the
+    // L3. With no shared level (private caches only) nothing is labeled and
+    // the checker judges every request exactly as before.
+    if (VX_CFG_L2_ENABLED) {
+      for (auto& cluster : clusters_) {
+        cluster->set_label_authority(mem_checker_.get(), /*edge=*/true);
+      }
+    }
+    if (VX_CFG_L3_ENABLED) {
+      l3cache_->set_label_authority(mem_checker_.get(), /*edge=*/!VX_CFG_L2_ENABLED);
+    }
   }
 
   // connect L3 memory interfaces

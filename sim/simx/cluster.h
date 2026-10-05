@@ -41,6 +41,8 @@ class ProcessorImpl;
 
 class Socket;
 
+class LabelAuthority;
+
 class Cluster : public SimObject<Cluster> {
 public:
   struct PerfStats {
@@ -94,6 +96,10 @@ public:
   int get_exitcode() const;
 
   PerfStats perf_stats() const;
+
+  // Labeled lines (sec/label.h): hand the checker's label authority to this
+  // cluster's L2. `edge` = the L2 is the shared level serving private L1s.
+  void set_label_authority(LabelAuthority* authority, bool edge);
 
   int dcr_write(uint32_t addr, uint32_t value);
 

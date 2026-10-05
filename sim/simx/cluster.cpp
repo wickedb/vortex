@@ -394,6 +394,10 @@ public:
     }
   }
 
+  void set_label_authority(LabelAuthority* authority, bool edge) {
+    l2cache_->set_label_authority(authority, edge);
+  }
+
   Cluster::PerfStats perf_stats() const {
     Cluster::PerfStats perf_stats;
     perf_stats.l2cache = l2cache_->perf_stats();
@@ -661,6 +665,10 @@ int Cluster::get_exitcode() const {
 
 void Cluster::on_gbar_arrive(const GbarArrive& msg) {
   impl_->global_barrier_arrive(msg.bar_id, msg.count, msg.core_id);
+}
+
+void Cluster::set_label_authority(LabelAuthority* authority, bool edge) {
+  impl_->set_label_authority(authority, edge);
 }
 
 Cluster::PerfStats Cluster::perf_stats() const {
