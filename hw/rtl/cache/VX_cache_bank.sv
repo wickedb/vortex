@@ -118,6 +118,12 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     `STATIC_ASSERT(!(LABEL_ENABLE && AMO_ENABLE), ("labeled lines do not yet cover AMOs"))
     // One label per line is exact only if a line never straddles a granule.
     `STATIC_ASSERT(!LABEL_ENABLE || (CHK_BUF_LOG2 >= `CLOG2(LINE_SIZE)), ("a cache line must not straddle a policy granule"))
+    // A write-through level forwards a denied write for the level below to
+    // judge too, so there must be one: a labeled LLC is write-back.
+    `STATIC_ASSERT(!(LABEL_ENABLE && IS_LLC && !WRITEBACK), ("labeled lines: a labeled LLC must be write-back"))
+    // A denied write sets the dirty bit but writes no byte, which a per-byte
+    // dirty mask would flag as a dirty line with no dirty bytes.
+    `STATIC_ASSERT(!(LABEL_ENABLE && DIRTY_BYTES), ("labeled lines do not yet support DIRTY_BYTES"))
     localparam LABEL_W = LABEL_ENABLE ? CHK_LABEL_W : 0;
     `UNUSED_PARAM (MRSQ_SIZE)
 

@@ -135,6 +135,15 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     // write-through LLC would forward unjudged misses to DRAM.
     `STATIC_ASSERT(!(`VX_CFG_L3_ENABLED) || `VX_CFG_L3_WRITEBACK, ("labeled lines: a labeled L3 LLC must be write-back"))
     `STATIC_ASSERT((`VX_CFG_L3_ENABLED) || !(`VX_CFG_L2_ENABLED) || `VX_CFG_L2_WRITEBACK, ("labeled lines: a labeled L2 LLC must be write-back"))
+    // An L2 above a labeled L3 must be write-through. Its writebacks would
+    // reach the L3 as writes carrying the evictor's identity (R2's writer id
+    // is gone), and the L3 would judge, and drop, them as the evictor's. A
+    // write-through L2 forwards each store under its own requester instead.
+    `STATIC_ASSERT(!((`VX_CFG_L2_ENABLED) && (`VX_CFG_L3_ENABLED)) || !(`VX_CFG_L2_WRITEBACK), ("labeled lines: an L2 above a labeled L3 must be write-through"))
+    // Tenant identity is the core, and only the shared levels are labeled. An
+    // L1 shared by a socket's cores would be a shared cache whose hits nobody
+    // judges, the hole labeled lines exists to close.
+    `STATIC_ASSERT(`VX_CFG_SOCKET_SIZE == 1, ("the data-plane checker needs private L1s (SOCKET_SIZE == 1)"))
 `endif
 
     VX_cache_wrap #(
