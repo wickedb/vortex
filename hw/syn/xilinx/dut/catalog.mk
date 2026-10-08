@@ -10,8 +10,8 @@
 # Add a DUT: append its name to DUTS and define the five variables. No new
 # directory, no dispatcher edit.
 
-DUTS := cache core cp dxa fpu gfx issue lmem mem_unit om raster rtu \
-        scope tcu tensor tex top unittest vm vortex
+DUTS := cache cache_l2 cache_l3 core cp dxa fpu gfx issue lmem mem_checker \
+        mem_unit om raster rtu scope tcu tensor tex top unittest vm vortex
 
 # ---------------------------------------------------------------------------
 # shared include fragments
@@ -38,11 +38,45 @@ TCU_PKG = $(if $(filter -DVX_CFG_TCU_TYPE_FPNEW,$(XCONFIGS)),\
 
 # ---------------------------------------------------------------------------
 # per-DUT: _PRJ top module, _IP FPU IP, _CFG defines, _INC includes, _PKG pkgs,
+#          _PARAMS top-level parameter overrides (-G<name>=<value>),
 #          _EXT=1 to include extensions.mk
 # ---------------------------------------------------------------------------
 
 cache_PRJ := VX_cache_top
-cache_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(UNITTEST_DIR)/cache
+cache_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(RTL_DIR)/sec -I$(UNITTEST_DIR)/cache
+cache_PKG  = $(RTL_DIR)/sec/VX_sec_pkg.sv
+
+# The evaluation L2 and L3 (2 cores, L2+L3), each as one VX_cache_top, for the
+# labeled-lines area and timing runs. Labels are on whenever the build enables
+# the checker, and the label width follows the epoch width:
+#   (no checker)                                         label width 0
+#   -DVX_CFG_CHECKER_ENABLE -DVX_CFG_CHECKER_EPOCH_WIDTH=4    10 bits
+#   -DVX_CFG_CHECKER_ENABLE                                   22 bits
+# e.g. make -C <dir> DUT=cache_l2 CONFIGS="-DVX_CFG_CHECKER_ENABLE".
+# The top models neither the NC bypass nor AMOs, so every width shares them.
+CACHE_LABEL = $(if $(filter -DVX_CFG_CHECKER_ENABLE,$(CONFIGS)),1,0)
+
+cache_l2_PRJ    := VX_cache_top
+cache_l2_CFG    := -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE -DVX_CFG_L3_ENABLE
+cache_l2_PARAMS  = -GNUM_REQS=4 -GMEM_PORTS=2 -GCACHE_SIZE=1048576 -GLINE_SIZE=128 \
+                   -GSECTOR_SIZE=64 -GNUM_BANKS=4 -GNUM_WAYS=8 -GWORD_SIZE=64 \
+                   -GCRSQ_SIZE=0 -GMSHR_SIZE=16 -GMRSQ_SIZE=4 -GMREQ_SIZE=0 \
+                   -GWRITEBACK=0 -GDIRTY_BYTES=0 -GLATENCY=4 -GTAG_WIDTH=10 \
+                   -GAMO_ENABLE=0 -GIS_LLC=0 \
+                   -GLABEL_ENABLE=$(CACHE_LABEL) -GLABEL_EDGE=1
+cache_l2_INC     = $(cache_INC)
+cache_l2_PKG     = $(cache_PKG)
+
+cache_l3_PRJ    := VX_cache_top
+cache_l3_CFG    := -DVX_CFG_NUM_CORES=2 -DVX_CFG_L2_ENABLE -DVX_CFG_L3_ENABLE
+cache_l3_PARAMS  = -GNUM_REQS=2 -GMEM_PORTS=2 -GCACHE_SIZE=2097152 -GLINE_SIZE=128 \
+                   -GSECTOR_SIZE=64 -GNUM_BANKS=2 -GNUM_WAYS=8 -GWORD_SIZE=64 \
+                   -GCRSQ_SIZE=0 -GMSHR_SIZE=16 -GMRSQ_SIZE=4 -GMREQ_SIZE=0 \
+                   -GWRITEBACK=1 -GDIRTY_BYTES=0 -GLATENCY=4 -GTAG_WIDTH=12 \
+                   -GAMO_ENABLE=0 -GIS_LLC=1 \
+                   -GLABEL_ENABLE=$(CACHE_LABEL) -GLABEL_EDGE=0
+cache_l3_INC     = $(cache_INC)
+cache_l3_PKG     = $(cache_PKG)
 
 core_PRJ  := VX_core_top
 core_IP   := 1
@@ -82,6 +116,15 @@ issue_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm $(FP
 
 lmem_PRJ := VX_local_mem_top
 lmem_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(UNITTEST_DIR)/local_mem
+
+# The data-plane checker, as the directed testbench's top. The evaluation cache
+# configuration (2 cores, L2+L3) sizes the label table through LABEL_FILL_ID_W,
+# and LABEL_MODE=1 keeps that table in the netlist.
+mem_checker_PRJ    := VX_mem_checker_top
+mem_checker_CFG    := -DVX_CFG_NUM_CORES=2 -DVX_CFG_CHECKER_ENABLE -DVX_CFG_L2_ENABLE -DVX_CFG_L3_ENABLE
+mem_checker_PARAMS := -GLABEL_MODE=1
+mem_checker_INC     = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(RTL_DIR)/sec -I$(UNITTEST_DIR)/mem_checker
+mem_checker_PKG     = $(RTL_DIR)/sec/VX_sec_pkg.sv
 
 mem_unit_PRJ := VX_mem_unit_top
 mem_unit_INC  = $(BASE_INC) -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/core -I$(RTL_DIR)/fpu -I$(UNITTEST_DIR)/mem_unit
@@ -148,4 +191,5 @@ vm_PKG  = $(RTL_DIR)/vm/VX_tlb_pkg.sv
 vortex_PRJ := Vortex
 vortex_IP  := 1
 vortex_EXT := 1
-vortex_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INC)
+vortex_INC  = $(BASE_INC) -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache -I$(RTL_DIR)/sec $(FPU_INC)
+vortex_PKG  = $(RTL_DIR)/sec/VX_sec_pkg.sv

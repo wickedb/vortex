@@ -288,29 +288,44 @@ proc run_power_report {} {
   }
 }
 
+# Run one report, skipping it (with a warning) when this Vivado lacks the
+# command or it fails, so one missing report cannot lose the rest. Older
+# releases (2019.2) have no report_place_status, for example.
+proc try_report {args} {
+  set cmd [lindex $args 0]
+  if {[llength [info commands $cmd]] == 0} {
+    puts "WARNING: $cmd is not available in this Vivado; skipped"
+    return
+  }
+  if {[catch {uplevel 1 $args} emsg]} {
+    puts "WARNING: $cmd failed: $emsg"
+  }
+}
+
 proc run_report {} {
   # Generate the synthesis report
-  report_place_status -file place.rpt
-  report_route_status -file route.rpt
+  try_report report_place_status -file place.rpt
+  try_report report_route_status -file route.rpt
 
   # Generate methodology reports to check for any issues
-  report_methodology -file methodology.rpt
+  try_report report_methodology -file methodology.rpt
 
   # Generate timing report
-  report_timing -unique_pins -nworst 100 -delay_type max -sort_by group -file timing.rpt
+  try_report report_timing -unique_pins -nworst 100 -delay_type max -sort_by group -file timing.rpt
+  try_report report_timing_summary -file timing_summary.rpt
 
   # Generate a high fanout net report
-  report_high_fanout_nets -fanout_greater_than 100 -max_nets 50 -file high_fanout_nets.rpt
+  try_report report_high_fanout_nets -fanout_greater_than 100 -max_nets 50 -file high_fanout_nets.rpt
 
   # Generate clock utilization report to see register usage
-  report_clock_utilization -file clock_utilization.rpt
+  try_report report_clock_utilization -file clock_utilization.rpt
 
   # Generate detailed RAM report
-  report_ram_utilization -detail -file ram_utilization.rpt
+  try_report report_ram_utilization -detail -file ram_utilization.rpt
 
   # Generate power report(s) and drc
-  run_power_report
-  report_drc -file drc.rpt
+  try_report run_power_report
+  try_report report_drc -file drc.rpt
 
   # Consolidated machine-readable summary in one file (Fmax + LUT/LUTRAM/FF/BRAM/
   # URAM/DSP). This Vivado lacks report_qor_summary and report_utilization -format
@@ -362,6 +377,12 @@ if { [file exists $checkpoint_impl] } {
   open_checkpoint $checkpoint_synth
   run_implementation
   run_report
+} elseif {[info exists ::env(SYNTH_ONLY)] && $::env(SYNTH_ONLY) ne "" && $::env(SYNTH_ONLY) ne "0"} {
+  # Synthesis only (SYNTH_ONLY=1): area for designs too large to implement
+  # here. run_synthesis already writes the hierarchical utilization.
+  run_setup
+  run_synthesis
+  try_report report_timing_summary -file post_synth_timing_summary.rpt
 } else {
   # Execute full pipeline
   run_setup

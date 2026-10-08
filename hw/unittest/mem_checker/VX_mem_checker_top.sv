@@ -10,8 +10,8 @@
 module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter HIT_LATENCY  = `VX_CFG_CHECKER_HIT_LATENCY,
     parameter MISS_LATENCY = `VX_CFG_CHECKER_MISS_LATENCY,
-    // Labeled lines. The directed TB runs with 0 (the checker judges every
-    // request); R5 synthesizes with 1 so the label table is in the numbers.
+    // Labeled lines. The directed TB runs with 0, where the checker judges
+    // every request. R5 synthesizes with 1 so the label table is in the numbers.
     // The index width follows the build's cache configuration, as in the GPU,
     // so build with the evaluation L2/L3 defines to size the table for it.
     parameter LABEL_MODE   = 0,
