@@ -28,6 +28,8 @@ include ../common.mk
 
 RTL_INCLUDE = $($(DUT)_INC)
 RTL_PKGS   += $($(DUT)_PKG)
+# Top-level parameter overrides; gen_sources.sh rewrites the top's defaults.
+CFLAGS     += $($(DUT)_PARAMS)
 
 ifeq ($($(DUT)_EXT),1)
 include $(VORTEX_HOME)/hw/syn/extensions.mk

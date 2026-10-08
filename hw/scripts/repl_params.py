@@ -40,7 +40,10 @@ def check_module_and_parameter_existence(file_content, top_module, params):
 def replace_parameter(file_content, top_module, param, value):
     # Define a pattern to locate the specified top module's parameter section
     module_header_pattern = re.compile(rf'(module\s+{top_module}\s*.*?\(\s*)(.*?)(\)\s*;)', re.DOTALL)
-    param_declaration_pattern = re.compile(rf'(\bparameter\b\s+(?:\w+\s+)?{param}\s*=\s*)([^,;]+)', re.DOTALL)
+    # The old value ends at a comma, a semicolon or the end of its line: the
+    # last parameter has no trailing comma, and matching past the line would
+    # swallow the header's closing ") (" and the first port.
+    param_declaration_pattern = re.compile(rf'(\bparameter\b\s+(?:\w+\s+)?{param}\s*=\s*)([^,;\n]+)', re.DOTALL)
 
     def parameter_replacer(match):
         before_params, params_section, after_params = match.groups()

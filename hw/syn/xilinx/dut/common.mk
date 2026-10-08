@@ -64,7 +64,9 @@ project_1/sources.txt:
 
 build: $(PROJECT).xpr
 $(PROJECT).xpr: project_1/sources.txt
-ifdef FPU_IP
+# FPU_IP is $($(DUT)_IP), which is never empty as written, so ifdef would
+# generate the FPU IP for every DUT; test its expanded value instead.
+ifneq ($(strip $(FPU_IP)),)
 	MAX_JOBS=$(JOBS) OPT_LEVEL=$(OPT_LEVEL) FPU_IP=project_1/ip TOOL_DIR=$(SCRIPT_DIR) $(VIVADO) -mode batch -source $(SRC_DIR)/project.tcl -tclargs $(TOP_LEVEL_ENTITY) $(DEVICE) project_1/sources.txt $(SRC_DIR)/project.xdc
 else
 	MAX_JOBS=$(JOBS) OPT_LEVEL=$(OPT_LEVEL) TOOL_DIR=$(SCRIPT_DIR) $(VIVADO) -mode batch -source $(SRC_DIR)/project.tcl -tclargs $(TOP_LEVEL_ENTITY) $(DEVICE) project_1/sources.txt $(SRC_DIR)/project.xdc
