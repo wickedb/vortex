@@ -181,6 +181,9 @@ VX_DCR_CHECKER_BUF_COMMIT   = 0x305  # write installs the staged claim
 VX_DCR_CHECKER_EPOCH        = 0x306  # set staged owner's epoch (the revoke)
 VX_DCR_CHECKER_BUF_SHARED   = 0x307  # staged: non-owner perms (grant to others)
 VX_DCR_CHECKER_REVOKE_OWNER = 0x308  # stage whose epoch the next EPOCH write bumps
+VX_DCR_CHECKER_BUF_JOINT    = 0x309  # staged: co-owner bitmask (taint PoC, SimX only)
+VX_DCR_CHECKER_BUF_CONFINED = 0x30A  # staged: shared grant is confined (taint PoC, SimX only)
+VX_DCR_CHECKER_BUF_LEAVE    = 0x30B  # owner (value) leaves the staged range (taint PoC, SimX only)
 VX_DCR_CHECKER_STATE_END    = 0x340
 
 # Checker policy constants.

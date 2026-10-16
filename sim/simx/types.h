@@ -1268,6 +1268,11 @@ struct MemLabel {
   uint32_t perms        = 0;
   uint32_t shared_perms = 0;
   uint64_t grant_epoch  = 0;
+  // Confinement (kernel_identity_oct16.md, SimX proof of concept). `joint` is
+  // the bitmask of co-owners beside `owner`; `confined` marks the shared
+  // grant as confined, so a non-owner reading under it is tainted.
+  uint32_t joint        = 0;
+  bool     confined     = false;
 };
 
 struct MemRsp {

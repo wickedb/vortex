@@ -32,6 +32,8 @@ struct BufferHeader {
   uint32_t perms = 0;         // owner access — not epoch-gated
   uint32_t shared_perms = 0;  // non-owner access, valid while the grant holds
   uint64_t grant_epoch = 0;   // shared grant valid while current_epoch <= grant_epoch
+  uint32_t joint = 0;         // co-owners beside owner_eid (bitmask by eid)
+  bool     confined = false;  // shared grant is confined: readers are tainted
 };
 
 constexpr uint32_t PERM_R = 0x1;
@@ -78,6 +80,15 @@ constexpr uint32_t DCR_CHECKER_BUF_SHARED = 0x307;  // staged non-owner perms (g
 // owner needs no re-stage. Only owner_eid's *own* grants are affected —
 // revoking owner A never touches owner C's unrelated grant to D.
 constexpr uint32_t DCR_CHECKER_REVOKE_OWNER = 0x308;
+// Confinement by taint (kernel_identity_oct16.md, SimX proof of concept;
+// active only with VX_CHECKER_TAINT=1). BUF_JOINT stages the co-owner mask
+// and BUF_CONFINED the confined bit for the next BUF_COMMIT. BUF_LEAVE
+// removes one owner (the value) from every granule of the staged range:
+// the release. Until authorship lands, who may write these is unchecked,
+// exactly as BUF_OWNER is today.
+constexpr uint32_t DCR_CHECKER_BUF_JOINT    = 0x309;
+constexpr uint32_t DCR_CHECKER_BUF_CONFINED = 0x30A;
+constexpr uint32_t DCR_CHECKER_BUF_LEAVE    = 0x30B;
 constexpr uint32_t DCR_CHECKER_END        = 0x340;
 
 // Spliced into the l3cache_→memsim_ binding, which is the off-chip boundary in
@@ -142,6 +153,10 @@ public:
     // 2 = deny writes only, which completes cleanly under enforcement: the
     // kernel's output never reaches RAM and host verification fails.
     uint32_t test_deny = 0;
+    // Confinement by taint (VX_CHECKER_TAINT=1). Off: joint owners and the
+    // confined bit are stored but ignored, so every existing result is
+    // unchanged by construction.
+    bool     taint = false;
   };
 
   struct PerfStats {
@@ -186,6 +201,14 @@ public:
     uint64_t labeled_passed = 0;
     uint64_t label_read_denies = 0;
     uint64_t label_write_denies = 0;
+    // Confinement by taint. taint_raises: reads that added a contributor to
+    // a core's taint. taint_denies: writes the permissions allowed but the
+    // covering rule refused (owners do not cover the writer's taint).
+    // leaves / leaves_refused: BUF_LEAVE commands applied or refused.
+    uint64_t taint_raises = 0;
+    uint64_t taint_denies = 0;
+    uint64_t leaves = 0;
+    uint64_t leaves_refused = 0;
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
