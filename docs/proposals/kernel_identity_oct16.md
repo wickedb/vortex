@@ -708,3 +708,146 @@ program after the other owner agreed:
 Two holes remained open in it: with VM on, the allocator's page tables can remap
 the measured program's scratch or code; and with unclaimed memory open, the
 agreed kernel can write into it. The taint design closes both by construction.
+
+## SimX proof of concept (built 16 Oct 2026)
+
+A deliberately minimal cut, built so that the paper can say confinement by
+taint runs, not only that it is designed. It is SimX only, off by default, and
+changes nothing unless `VX_CHECKER_TAINT=1`.
+
+### What is built
+
+| Piece | Where | What it does |
+|---|---|---|
+| Owner sets | `MemLabel` (`sim/simx/types.h`), `BufferHeader` (`sec/mem_checker.h`) | `joint`: a co-owner bitmask beside the existing binary `owner`. The owner set is `{owner} ∪ joint`; the unclaimed default (`OWNER_ANY`) has an empty set. Every owner gets the owner permissions |
+| Confined grants | same | `confined`: the existing shared grant (`shared_perms`) taints whoever reads under it |
+| Taint | `MemChecker::Impl::taint_` | One bitmask per core (`eid = core id`, as today). Raised when the delivery edge allows a read: by the other owners of a joint granule, or by the owners behind a confined grant. Read when a write is judged: the write is refused unless the granule's owners cover the taint |
+| Covering rule | `authorize_taint()` (`sec/mem_checker.cpp`) | The same predicate function the port and every labeled cache already call, so all four cache configurations get it at once |
+| Setup registers | `VX_types.toml`, `sec/mem_checker.h` | `BUF_JOINT` (0x309) and `BUF_CONFINED` (0x30A) are staged for the next `BUF_COMMIT`. `BUF_LEAVE` (0x30B) removes one owner from every granule of the staged range, all or nothing (the release). A re-claim may add co-owners but never drop one. All three sit in the existing privileged window, so the command processor already refuses them from device-resident bundles |
+| Kernel boundary | `Impl::reset()` | The taint is cleared at every launch, which resets the platform. One kernel occupies the device at a time, so a launch is every core's kernel change |
+| Counters | `VX_CHECKER_STATS=1` | `CHECKER: taint: raises, write_denies, leaves, leaves_refused` |
+| Regression | `tests/regression/confine` | The hospital walk-through on two cores; below |
+
+About 180 lines in the simulator and 360 in the regression.
+
+### What it leaves out, on purpose
+
+- **The socket boundary.** The taint lives in the checker and is updated when
+  a read is judged at the delivery edge, not when a response enters the L1. A
+  write is judged against the taint at the time it is judged, not the taint
+  stamped on it when it left the L1. Both times are no earlier than the RTL
+  design's, so the model can only over-restrict, never leak. `MemReq` and
+  `MemRsp` are untouched.
+- **A grantee field, the X permission, zero-and-reclaim (S3), and the download
+  rule (S6).** The grant still goes to every non-owner, as today; host copies
+  are still unjudged (issue 2), which the test uses to read results back.
+- **Authorship.** `BUF_LEAVE`'s value and `BUF_OWNER` are chosen by the writer,
+  as today. The test shows the mechanism, not who may invoke it (issue 1).
+- **The residue scrub.** Registers and local memory are not cleared between
+  launches. The taint is, so a kernel that inherits confined data in a register
+  could launder it. The `residue` exhibit waits for the scrub.
+- **Tenants other than cores.** `eid = core id`, as in every existing
+  regression.
+
+### The regression
+
+`tests/regression/confine`, run with `VX_CHECKER=1 VX_CHECKER_ENFORCE=1
+VX_CHECKER_TAINT=1 --cores=2`. Core 0 is H, core 1 is M. H owns the images and
+grants M a confined read. M owns its own buffer. The output, a bookkeeping
+buffer and the stack granule are owned by `{M, H}`. Three launches:
+
+1. **Train.** M reads the images, writes `out = image ^ KEY` to the joint
+   output, and tries to copy the raw images into its own buffer and into
+   unclaimed memory.
+2. **Export, early.** M copies the joint output into its own buffer.
+3. H leaves the output's owner set (`BUF_LEAVE`). **Export, late.** The same
+   copy again.
+
+Every word is checked by value, keyed by the core each task actually ran on.
+
+| Configuration | Training output | Launder into M's buffer | Launder into unclaimed | Export before release | Export after release | Result |
+|---|---|---|---|---|---|---|
+| Taint off (control), private caches | 16/16 | **16 landed** | **16 landed** | **16 landed** | 16/16 | FAILED, as intended |
+| Taint on, private caches | 16/16 | 0 | 0 | 0 | 16/16 | PASSED |
+| Taint on, L2 | 16/16 | 0 | 0 | 0 | 16/16 | PASSED |
+| Taint on, L3 | 16/16 | 0 | 0 | 0 | 16/16 | PASSED |
+| Taint on, L2 + L3 | 16/16 | 0 | 0 | 0 | 16/16 | PASSED |
+| Taint on, private caches, stack left unclaimed (`-S`) | 16/16 | 0 | 0 | 0 | 16/16 | PASSED |
+
+In every taint-on run the checker reports `taint: raises=2, write_denies=24,
+leaves=1, leaves_refused=0`: one raise per launch in which M read H-derived
+data, and no raise in the third launch, after the release. The last row shows
+the kernel does not spill after its first confined read; claiming the stack
+jointly is still the safe default for kernels that do.
+
+Behaviour-neutral gate. `twotenant`, `revoke`, `revoke_scope`, `sharedhit
+-m0`, `sharedhit -m1` and `vecadd_claimed`, in the private-cache and L2+L3
+configurations, plus `header_alias` (with `VX_CHECKER_HEADER_ENTRIES=1`), each
+run with `VX_CHECKER_TAINT` off and on in the same tree: every pair passes, and
+every checker counter and every `PERF` cycle count is identical between the
+two. None of these tests sets a co-owner or a confined grant, so the taint
+stays empty and the covering rule never fires; the gate shows that the code
+path itself changes nothing. Script and logs: `build_taint/gate/` (not
+committed).
+
+### Wrinkles for rtlsim
+
+Each is something the SimX cut sidesteps and the RTL cannot.
+
+1. **Where the taint lives, and when it moves.** RTL keeps it in a register at
+   the socket boundary (`VX_socket`), stamps it on every request leaving the
+   L1s, and ORs in the contributor mask of every response entering them. That
+   means new request attr bits (`TENANTS` of them) through the L1 memory side,
+   the L2 and L3 MSHRs and replays, and a response attr that means "label"
+   below the delivery edge and "contributor mask" above it. SimX avoided all of
+   it by judging against a table.
+2. **Every response path must carry the mask.** Hits, MSHR replays,
+   fill-forward (`VX_cache_bank.sv:1205`) and the non-cacheable bypass
+   (`VX_cache_bypass.sv:200`). Labeled lines already showed that one forgotten
+   path hangs or leaks: a zeroed label on the PASSTHRU path hung the L2-only
+   configuration. A missed mask under-taints silently, which is worse.
+3. **The timing invariant.** The taint must be updated before the loaded value
+   reaches a register. At the socket boundary that holds with margin, but it
+   has to be checked, with `taint_timing`, not assumed.
+4. **Write-back L1.** `VX_CFG_DCACHE_WRITEBACK` is 1 when the D-cache is the
+   LLC on one core. A writeback then carries the taint at eviction, not at the
+   store, and over-denies. Static assert it off with taint.
+5. **Write judges at two levels.** A write-through L2 under a labeled L3
+   forwards the request attr, so the L3 sees the same taint, and a denied write
+   must be counted once (labeled lines' rule). SimX counts `write_denies` at
+   every judging point that refuses.
+6. **Label width and encoding.** The PoC keeps the binary `owner` (it indexes
+   the epoch table) and adds a `joint` mask and a `confined` bit: 22 → 22 +
+   `TENANTS` + 1 bits at today's layout. The proposal's header v2 (a pure
+   owner bitmask, one-hot epoch select) is narrower in logic but has to be
+   built and re-synthesized. Either way R5's sweep must go past 22 bits.
+7. **The setup installer.** `VX_checker_dcr.sv`'s scan (lines 174–245) gains
+   the joint and confined registers, the no-shrink rule on re-claim, and
+   `BUF_LEAVE` as a second all-or-nothing pass over a range. It is a small
+   FSM change, but it is where a half-applied release would hide.
+8. **Kernel change and the scrub.** SimX clears the taint at every platform
+   reset. RTL must clear it per core when `ctx_id` changes
+   (`VX_cta_dispatch.sv:468`), after the scrub (L1 invalidate, local memory,
+   GPRs, CSRs), and hold the next CTA until both are done. Neither model has the
+   scrub yet.
+9. **Fetches.** In SimX an instruction fetch is a read like any other and taints.
+   RTL needs `is_fetch` on the request, so the X permission can be added, and
+   the I-cache response must feed the same snoop.
+10. **AMOs.** SimX judges AMOs; RTL refuses to build labels with AMOs
+    (`VX_cache_bank.sv:118`). An AMO is a read and a write, so with taint it
+    raises and is judged for covering in one step.
+11. **Counter parity.** `raises` and `write_denies` are per judging point in
+    SimX. The RTL counters should be defined first, then SimX matched, or the
+    model-parity check will compare different things.
+12. **Synthesis.** The covering check adds an AND and an OR-reduce per way, and
+    the contributor mask a mux on the edge's response; neither is on the tag
+    compare's path, but R5's "no measurable Fmax" claim has to be re-earned at
+    the new width.
+
+### Next, in order
+
+1. Authorship (issue 1) in SimX, so `BUF_LEAVE` and claims are attributed to
+   the issuing queue. About 2–3 days.
+2. The scrub in SimX and the `residue` exhibit.
+3. Wrinkles 1–8 in RTL, then the `confine` regression on rtlsim in all four
+   configurations as the parity check.
