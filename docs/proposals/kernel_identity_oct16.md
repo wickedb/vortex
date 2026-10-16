@@ -1,8 +1,8 @@
 # Confinement by data-plane taint, and policy header v2
 
-Status: draft, 16 Oct 2026. Branch `sec-mem-checker`. Proposes a replacement for
-the measurement design in `kernel_identity_proposal.md` (12 Oct, revised 15 and
-16 Oct). That design is summarised in the appendix so the two can be compared;
+Status: draft, 16 Oct 2026, with the Vortex implementation plan added the same
+day. Branch `sec-mem-checker`. Proposes a replacement for the measurement design
+in `kernel_identity_proposal.md` (12 Oct, revised 15 and 16 Oct). That design is summarised in the appendix so the two can be compared;
 nothing in either is built.
 
 ## Why
@@ -88,11 +88,15 @@ know when the kernel on a core changes, and it has that already in `ctx_id`.
 
 ### Where it lives: per core, one kernel per core
 
-`VX_cta_dispatch` holds the launching tenant and the taint in per-core registers,
-next to the launch counter it already keeps: `kmu_req.ctx_id`
-(`VX_kmu.sv:255`) is held per core in `cur_ctx_id_r` (`VX_cta_dispatch.sv:468`).
-The KMU attaches the tenant to each CTA dispatch alongside `ctx_id`. The LSU and
-fetch tag each request with the core's tenant and taint.
+The KMU attaches the launching tenant to each CTA dispatch alongside `ctx_id`,
+which `VX_cta_dispatch` already holds per core in `cur_ctx_id_r`
+(`VX_cta_dispatch.sv:468`; `kmu_req.ctx_id` from `VX_kmu.sv:255`). The tenant
+and the taint live in two registers at the **socket boundary** (`VX_socket`),
+where the L1s meet the shared hierarchy. Labeled lines already require one core
+per socket (`SOCKET_SIZE == 1`), so the socket boundary is the core's boundary.
+Every request leaving the L1s is stamped there with the tenant and taint, and
+every response entering them updates the taint (*Implementation on Vortex*).
+The LSU and fetch do not change.
 
 **A core runs one kernel at a time.** `VX_cta_dispatch` holds a CTA from a
 different launch until every warp on the core has retired, then runs the
@@ -125,14 +129,37 @@ writeback to the register file.** A write that depends on the value, by data or
 by a branch, issues after that writeback, so it carries the updated taint. A
 write that issued earlier cannot contain the value.
 
-L1 hits need nothing new. A line in a private L1 was filled through a delivery
-edge during this kernel on this core, so its contributors are already in the
-taint. Across kernels the L1s are invalidated by the scrub.
-
 The contributor mask travels on the read response from the delivery edge (L2, or
-L3 with no L2, or the port with private caches only) back through the L1 to the
-LSU and fetch. That is `TENANTS` bits on the response path, alongside the label
-bits that path already carries.
+L3 with no L2, or the port with private caches only) to the L1. Below the edge
+the response attr carries the label, as today; above it, it carries the mask.
+
+### Does the L1 need labels? No
+
+The taint register is updated when a response *enters* the L1, at the socket
+boundary, not when data reaches the LSU. So every line in an L1 was counted into
+the taint at the moment it was filled, and a later L1 hit on it adds nothing the
+taint does not already hold. That needs four things, all already true or
+enforced here:
+
+1. **The L1 is private to one core.** `SOCKET_SIZE == 1` is already a static
+   assert for labeled lines.
+2. **One kernel per core.** Every line was filled for the kernel now running.
+3. **The L1s are invalidated at a kernel change** (the scrub). No line outlives
+   the kernel whose taint counted it.
+4. **The taint is taken at the fill**, which reaches the socket boundary before
+   the data reaches the register file. That also satisfies the timing invariant
+   with margin.
+
+Writes need no L1 labels either. A write-through L1 forwards every store to the
+shared hierarchy, stamped with the taint at the moment it leaves the L1, which is
+a superset of the taint at issue, and the shared level judges it. A store that
+hits the L1 and is later denied at the shared level leaves the new bytes in the
+L1 for the same kernel to read, which is its own data; the scrub drops them.
+
+L1 state becomes necessary only with **co-resident kernels** (per-warp taint): a
+hit by kernel B on a line kernel A filled would then have to add the line's
+contributors relative to B. Even then the L1 stores an owner set per line
+(`TENANTS` bits), not a full label, and it judges nothing.
 
 ### Every global-memory requester carries it
 
@@ -375,47 +402,263 @@ v2, scrub) depends on none of these and can be built first. The **security** of
 confinement depends on issues 1 and 2. The paper states confinement, like P1,
 as holding by design until both land.
 
-## Plan
+## Implementation on Vortex
 
-1. **Header v2 and the predicate** in RTL, SimX, `VX_types.toml` and the host
-   claim path: owner sets, X, grantee, confined bit. Before the L2+L3 evaluation
-   runs, because it changes the label width.
-2. **Requester plumbing, behaviour-neutral.** Tenant and taint in `kmu_req_t`
-   and per-core registers in `VX_cta_dispatch`; request attr from those in the
-   LSU and fetch; the contributor mask on read responses back to the core; SimX
-   core state and `MemChecker` likewise. A test mode sets `tenant = core id` and
-   never sets `confined`, so every existing regression and the model_parity gate
-   stay green unchanged. Static assert refusing DXA and RTU with the checker on.
-3. **Kernel-change scrub and the one-kernel-per-core rule** in RTL and SimX.
-4. **Authorship and CP DMA through the checker** (issues 1 and 2), with S5 and
-   S6.
-5. **S1–S4** in the command-processor model: owner-set claims, leave, zero,
-   trusting and confined grants.
-6. **Regressions.**
-   - `hospital`: the walk-through, each step checked by value and deny count.
-   - `launder`: M's tainted kernel writes images into M's own buffer, into
-     unclaimed memory, and through a remapped VA; all denied, on both models.
-   - `release`: M downloads the output before H leaves (refused) and after
-     (allowed); M tries to remove H (refused).
-   - `trusting`: a trusting grant behaves exactly as today's grant; the reader
-     is not tainted.
-   - `residue`: kernel A reads confined data and leaves it in local memory and
-     registers; kernel B, next on the same cores with an empty taint, reads
-     zeros. The same run with the scrub disabled shows the pattern and lets B
-     write it to its own buffer; that is the exhibit.
-   - `taint_timing`: a store dependent on a just-returned confined load is
-     denied; a store issued before the load is not.
-   - `crosscore`: core A writes derived data to a joint granule; core B reads it
-     and becomes tainted.
-   - Time-slice: two tenants' kernels with the per-launch flush disabled;
-     0 breaches.
-   - Fetch from a claimed granule (review issue 6), with X: allowed with RX,
-     denied without.
-7. **Re-synthesis** at the new label width, with the covering-write check, the
-   contributor mask on the response path, and the scrub FSM.
+Everything below is gated by a new build option, `VX_CFG_CHECKER_TAINT`, under
+`VX_CFG_CHECKER_ENABLE`. Each step lands in RTL and SimX together and keeps
+every existing regression green before the next starts.
 
-Per-warp tenant and taint, labeled L1s, per-CTA local-memory bounds, and the
-attested launch log remain design unless time allows.
+### Where each piece goes
+
+```
+ core ─ LSU/fetch (unchanged)
+   │
+ MMU ─ L1 D$ / I$ (unchanged: no labels, judge nothing)
+   │
+ ══╪══ VX_socket boundary: tenant + taint registers ═══════════════════
+   │     stamp  req.attr ← {tenant, taint, is_fetch}
+   │     snoop  rsp fire → taint |= rsp.attr[TENANTS-1:0]
+   │
+ L2  (delivery edge: judge reads, return contrib; judge writes: covering)
+   │
+ L3  (judge writes: covering)
+   │
+ port checker (resolve label on fill; with private caches only, it is the edge)
+```
+
+### Step 0: refusals (static asserts)
+
+- `SOCKET_SIZE == 1` (exists for labeled lines; now also required by taint).
+- `VX_CFG_EXT_DXA_ENABLE` and the RTU off with the checker on
+  (`VX_dxa_gmem_req.sv:203`, `VX_rtu_core.sv:247` drive `attr = '0`).
+- `VX_CFG_DCACHE_WRITEBACK == 0` with taint. It is 1 only when the D-cache is
+  the LLC on one core (`VX_config.toml:198`). There a writeback would carry the
+  taint at eviction rather than at the store, which over-denies stores made
+  before the kernel's first confined read.
+- AMOs stay refused under labels (`VX_cache_bank.sv:118`), as today.
+
+### Step 1: types and config
+
+`hw/VX_config.toml`, `VX_types.toml`, `hw/rtl/VX_gpu_pkg.sv`,
+`hw/rtl/sec/VX_sec_pkg.sv`.
+
+- New `VX_CFG_CHECKER_TENANTS` (default 8) and `TENANT_W = CLOG2(TENANTS)`.
+  The tenant count no longer derives from the core count.
+- `mem_bus_attr_t`: `owner` (`MEM_OWNER_WIDTH`, `VX_gpu_pkg.sv:218,238`) is
+  replaced by `tenant` (`TENANT_W`), `taint` (`TENANTS`) and `is_fetch` (1),
+  all above `amo` as the field-order comment requires. `MEM_ATTR_OWNER_OFFS`
+  becomes `MEM_ATTR_TENANT_OFFS`, `MEM_ATTR_TAINT_OFFS`, `MEM_ATTR_FETCH_OFFS`.
+- `MEM_RSP_ATTR_WIDTH` (`VX_gpu_pkg.sv:229`) becomes
+  `max(CHK_LABEL_W, TENANTS)`. Below the delivery edge it carries the label;
+  above it, the contributor mask in the low `TENANTS` bits.
+- `chk_label_t`: `owners[TENANTS]`, `perms[3]` (R, W, X), `grantee[TENANT_W]`,
+  `grant_perms[3]`, `confined`, `grant_epoch`. `owner_any` goes.
+- `LABEL_EPOCHS_W` is indexed by tenant. A grant exists only on a sole-owner
+  granule, so its epoch is selected with `owners` as a one-hot mux select. No
+  encoder, and no longer than today's binary-indexed mux.
+- `chk_authorize_label` (`VX_sec_pkg.sv:169`) is replaced by `chk_judge(lbl,
+  tenant, taint, is_write, is_fetch, epochs) → {allow, contrib}`: the predicate
+  and contributor mask of *The predicate* and *Updating the taint*. The covering
+  term is `~|(taint & ~lbl.owners)`.
+
+### Step 2: the socket boundary
+
+`hw/rtl/VX_socket.sv` (D-cache at line 194; I-cache alongside).
+
+- Two registers, `tenant_r` and `taint_r`, loaded by the core's dispatch at a
+  kernel change (step 5) and cleared with the scrub.
+- **Stamp.** On every request into `dcache_mem_bus_if` and
+  `icache_mem_bus_if`, overwrite `attr.tenant` and `attr.taint`, and set
+  `attr.is_fetch` on the I-cache side. Stamping at the boundary uses the taint
+  when the request leaves the L1, which contains the taint at issue.
+- **Snoop.** On every response fire on those buses, `taint_r |=
+  rsp_data.attr[TENANTS-1:0]`. That covers cached fills, MSHR merges and the
+  non-cacheable path (`VX_cache_bypass.sv:200`) alike, because all of them
+  arrive on the L1's memory side.
+- The LSU's `owner = CORE_ID` (`VX_lsu_slice.sv:120`) and the fetch's
+  (`VX_fetch.sv:235`) stay. The socket overwrites them, and with taint off the
+  socket passes them through, so the non-taint build is bit-identical.
+- MMU page-table walks travel on the TLB bus, not these buses, so they neither
+  taint nor are stamped. Page tables must therefore not live in confined
+  granules: a walk would carry confined data into write addresses unseen. A
+  static rule in the claim path (S1 refuses `confined` on the page-table
+  region) closes it.
+
+### Step 3: the delivery edge and the write judges
+
+`hw/rtl/cache/VX_cache_bank.sv`.
+
+- The per-way predicate (`VX_cache_bank.sv:663-688`) becomes `chk_judge`, with
+  the requester from `st0.req.attr` (tenant, taint, is_fetch). The MSHR already
+  replays `attr`, so replays judge with the stamped values.
+- Writes, at every labeled level: deny unless `allow` and covering. That is one
+  more AND per way, in parallel with today's term.
+- Reads, at the edge only (`LABEL_EDGE`): `core_rsp_attr` carries the
+  contributor mask for the hit way instead of the label (`label_hit_st0`). The
+  fill-forward path (`VX_cache_bank.sv:1205-1214`) computes it from
+  `fbuf_label_r` and the replayed requester. A denied read returns poison and
+  `contrib = ∅`.
+- Below the edge nothing changes: the L3 stores and forwards labels, and the L2
+  stores the label it is filled with.
+- A write-through L2 under the L3 forwards the request `attr`, so the L3's write
+  judge sees the same taint.
+
+### Step 4: the port checker and the setup registers
+
+`hw/rtl/sec/VX_mem_checker.sv`, `hw/rtl/sec/VX_checker_dcr.sv`, the header
+store.
+
+- Header store entries take the v2 layout; the boot default is `owners = ∅`
+  with today's default perms.
+- With private caches only (`LABEL_MODE == 0`, `VX_mem_checker.sv:323`), the
+  port is the edge. It judges with `chk_judge` and returns the contributor mask
+  on the response attr.
+- Setup registers: `BUF_OWNER` becomes `BUF_OWNERS` (bitmask); new
+  `BUF_GRANTEE`; `BUF_PERMS` and `BUF_SHARED` gain X; `BUF_SHARED` gains the
+  confined bit; new `BUF_ISSUER` (the tenant issuing the command; writer-chosen
+  until authorship replaces it with the queue's tenant).
+- The installer's scan (`VX_checker_dcr.sv:174-245`) applies S1, S2 and S4 per
+  granule, and refuses the whole range if any granule fails, as it does today:
+  - unclaimed, and `ISSUER ∈ OWNERS`: claim (S1);
+  - `owners == {ISSUER}` and the new owners are the same: perms or grant change
+    (S4);
+  - `ISSUER ∈ owners` and the new owners are `owners \ {ISSUER}`, non-empty,
+    with perms unchanged: leave (S2);
+  - otherwise refused and counted.
+- Revocation (`REVOKE_OWNER`, `EPOCH`) is unchanged.
+- S3 (zero) needs memory writes, so it lives in the command processor (step 6),
+  which zeroes the range and then commits `OWNERS = {ISSUER}` with a privileged
+  flag that only the command processor can set.
+
+### Step 5: dispatch rule, tenant and scrub
+
+`hw/rtl/core/VX_kmu.sv`, `VX_cta_dispatch.sv`, `VX_opc_unit.sv`, the local
+memory, the CSR unit.
+
+- `kmu_req_t` gains `tenant`, set by the command processor at launch.
+- `VX_cta_dispatch`: when `kmu_req.ctx_id != cur_ctx_id_r`
+  (`VX_cta_dispatch.sv:468`), hold the CTA until every warp on the core has
+  retired, then run the scrub FSM and load the new tenant into the socket.
+- Scrub FSM, one per core:
+  1. invalidate the D-cache and I-cache, through the existing flush path;
+  2. zero local memory through its write port (16 KB at `LMEM_NUM_BANKS` × 4 B
+     per cycle, about 1K cycles);
+  3. zero int and FP registers through the GPR banks' write ports. This reuses
+     the shape of the `GPR_RESET` initialization in `VX_opc_unit.sv:16-22,289`,
+     which today runs only in debug simulation at reset;
+  4. reset per-warp CSRs;
+  5. clear `taint_r` and load `tenant_r`.
+- Skip the scrub when the outgoing taint is empty and the tenant is unchanged
+  (optimization, step 9).
+
+### Step 6: command-processor model and host runtime
+
+`sim/common/cmd_processor.cpp` (drives both SimX and rtlsim), `sw/runtime/`.
+
+- `CMD_LAUNCH` carries the launching tenant into the KMU descriptor. Until
+  authorship it is a launch field; with authorship it is the queue's tenant.
+- S3 zero: a `CMD_BUF_ZERO { range }` that fills the range with zeros through
+  the command processor's own writes, then commits `OWNERS = {issuer}`.
+- S5 and S6 in the model: `CMD_MEM_WRITE` judged as an untainted write by the
+  queue's tenant; `CMD_MEM_READ` allowed only from sole-owned granules or under
+  a trusting grant. The RTL equivalent is issue 2.
+- Host runtime (`sw/runtime/common/buffer.cpp:105-108`, today's claim at
+  allocation): claims with an owner set, a `confined` flag on grants, and
+  calls for leave and zero. Existing call sites keep their meaning:
+  `owners = {caller}`, and a grant is trusting unless asked otherwise.
+- The fixed stack range (`VX_MEM_STACK_BASE_ADDR`, `VX_types.toml:22`) lies in
+  the top granule of the address space. A tainted kernel needs it claimed with
+  the joint owner set before launch, then zeroed after.
+
+### Step 7: SimX
+
+`sim/simx/types.h`, `sim/simx/socket.cpp`, `sim/simx/mem/cache.cpp`,
+`sim/simx/sec/label.h`, `sim/simx/sec/mem_checker.cpp`,
+`sim/simx/cta_dispatcher.cpp`.
+
+- `MemReq` (`types.h:1248`) gains `tenant`, `taint`, `is_fetch`; `MemRsp`
+  (`types.h:1308`) gains `contrib` beside its `label`.
+- `MemLabel` (`types.h:1300`) takes the v2 fields.
+- `LabelAuthority::authorize(label, hart_id, is_write)` (`label.h`) becomes
+  `judge(label, tenant, taint, op) → {allow, contrib}`. `MemChecker::owner_of`
+  is retired; requests carry the requester.
+- The socket stamps and snoops at the L1s' memory side, as in RTL, so the two
+  models update the taint at the same point.
+- `cta_dispatcher.cpp` applies the one-kernel-per-core rule and the scrub.
+  Zeroing is instant in SimX; it charges the cycle estimate from step 5.
+
+### Step 8: regressions
+
+The behaviour-neutral gate first. With taint on, a test mode sets `tenant = core
+id`, and no test sets `confined`. The taint then stays empty and the covering
+check is vacuous. `twotenant`, `revoke`, `revoke_scope`, `revoke_window`,
+`sharedhit`, `vecadd_claimed` and `header_alias` must pass unchanged in all four
+cache configurations on both models. Their claim code moves from `BUF_OWNER` to
+`BUF_OWNERS = {core}`, and their grant from "every non-owner" to the one other
+tenant (`revoke_scope` names its grantee explicitly).
+
+New, under `tests/regression/`:
+
+- `hospital`: the walk-through, each step checked by value and deny count.
+- `launder`: a tainted kernel writes images into M's own buffer, into
+  unclaimed memory, and, with VM on, through a remapped virtual address. All
+  denied.
+- `release`: M downloads the output before H leaves (refused) and after
+  (allowed); M tries to remove H (refused).
+- `trusting`: a trusting grant behaves as today's grant; the reader is not
+  tainted.
+- `residue`: kernel A reads confined data and leaves it in local memory and
+  registers; kernel B, next on the same cores with an empty taint, reads zeros.
+  The same run with the scrub disabled shows the pattern and lets B write it to
+  its own buffer; that is the exhibit.
+- `taint_timing`: a store dependent on a just-returned confined load is denied;
+  a store issued before the load is not.
+- `crosscore`: core A writes derived data to a joint granule; core B reads it
+  and becomes tainted.
+- `nc_taint`: the same as `hospital` with the confined buffer accessed through
+  the non-cacheable path.
+- Time-slice: two tenants' kernels with the per-launch flush disabled;
+  0 breaches.
+- Fetch from a claimed granule (review issue 6), with X: allowed with RX,
+  denied without; a fetch from a joint granule taints.
+
+### Step 9: synthesis and cost
+
+Re-run R5's flow (`playground_2626/R5_results.md`) with:
+
+- the label at 34 bits (8 tenants) and 29 bits (4 tenants), extending the sweep
+  past 22;
+- the covering-write term and the contributor-mask mux in the L2- and L3-shaped
+  caches;
+- the socket registers, stamp and snoop in full Vortex;
+- the scrub FSM in full Vortex.
+
+Then measure the scrub on rtlsim at the default configuration before quoting
+its cost, and try the skip optimization.
+
+### Order and rough size
+
+| Step | Depends on | Rough size (estimate) |
+|---|---|---|
+| 0 refusals | — | under a day |
+| 1 types | — | 1–2 days, mostly fallout |
+| 2 socket | 1 | 1–2 days |
+| 3 edge and write judges | 1 | 2–3 days |
+| 4 port and setup registers | 1 | 2–3 days |
+| 5 dispatch and scrub | 2 | 3–5 days; the GPR zeroing is the unknown |
+| 6 CP model and runtime | 4 | 2–3 days |
+| 7 SimX | 1–6, in step with each | 3–4 days alongside |
+| 8 regressions | 2–7 | 3–5 days |
+| 9 synthesis | 3–5 | 2 days of runs |
+
+Steps 1–4 and the neutral gate come first and change no result. Header v2 must
+land before the L2+L3 evaluation runs, because it changes the label width. The
+security of S1–S6 still waits on authorship and CP DMA through the checker
+(issues 1 and 2). Until then, `BUF_ISSUER` and the launch tenant are
+writer-chosen, as `BUF_OWNER` is today.
+
+Per-warp tenant and taint, per-line owner sets in the L1, per-CTA local-memory
+bounds and the attested launch log remain design unless time allows.
 
 ## Open questions
 
