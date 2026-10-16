@@ -42,6 +42,9 @@ static_assert(DCR_CHECKER_BUF_COMMIT   == VX_DCR_CHECKER_BUF_COMMIT,   "BUF_COMM
 static_assert(DCR_CHECKER_EPOCH        == VX_DCR_CHECKER_EPOCH,        "EPOCH drifted from VX_types.toml");
 static_assert(DCR_CHECKER_BUF_SHARED   == VX_DCR_CHECKER_BUF_SHARED,   "BUF_SHARED drifted from VX_types.toml");
 static_assert(DCR_CHECKER_REVOKE_OWNER == VX_DCR_CHECKER_REVOKE_OWNER, "REVOKE_OWNER drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_JOINT    == VX_DCR_CHECKER_BUF_JOINT,    "BUF_JOINT drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_CONFINED == VX_DCR_CHECKER_BUF_CONFINED, "BUF_CONFINED drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_LEAVE    == VX_DCR_CHECKER_BUF_LEAVE,    "BUF_LEAVE drifted from VX_types.toml");
 static_assert(DCR_CHECKER_BASE         == VX_DCR_CHECKER_STATE_BEGIN,  "window start drifted from VX_types.toml");
 static_assert(DCR_CHECKER_END          == VX_DCR_CHECKER_STATE_END,    "window end drifted from VX_types.toml");
 static_assert(PERM_R    == VX_CHECKER_PERM_R,    "PERM_R drifted from VX_types.toml");
@@ -79,6 +82,15 @@ constexpr uint32_t MAX_HEADER_ENTRIES = 1u << 20;
 // table unboundedly.
 constexpr uint32_t MAX_OWNERS = 1u << 12;
 
+// Owner sets and taints are bitmasks by eid, so confinement covers eids
+// below 32. Eids are core ids in this prototype; 32 is far above any
+// configuration the evaluation runs.
+constexpr uint32_t MAX_TAINT_EIDS = 32;
+
+inline uint32_t eid_bit(uint32_t eid) {
+  return (eid < MAX_TAINT_EIDS) ? (1u << eid) : 0u;
+}
+
 }
 
 class MemChecker::Impl {
@@ -98,8 +110,21 @@ private:
 
   MemChecker*  simobject_;
   Config       config_;
-  PerfStats    perf_stats_;
+  // mutable: the predicate is const (a labeled cache only reads policy), but
+  // with confinement on it also raises the requesting core's taint and counts.
+  mutable PerfStats perf_stats_;
   FaultStatus  fault_;
+
+  // Confinement by taint (kernel_identity_oct16.md). One taint per core: the
+  // set of owners whose confined data the kernel on that core has read. In
+  // this proof of concept the taint lives here rather than at the socket
+  // boundary, so it is raised when a read is *judged* at the delivery edge
+  // and read when a write is *judged*. Both are no earlier than the RTL
+  // design's points (stamp when a request leaves the L1, snoop when a
+  // response enters it), so the model can only over-restrict, never leak.
+  // Cleared on reset(), which every launch performs: one kernel at a time on
+  // the device, so a launch boundary is every core's kernel change.
+  mutable std::vector<uint32_t> taint_;
 
   // One shared poison block backs every fault response. The cache does
   // copy-on-write on shared fill data, so handing out the same block is safe.
@@ -166,6 +191,8 @@ private:
     uint32_t perms = 0;
     uint32_t shared = 0;
     uint32_t epoch = 0xFFFFFFFFu;
+    uint32_t joint = 0;
+    uint32_t confined = 0;
   } claim_;
 
 public:
@@ -208,6 +235,7 @@ public:
     std::memset(poison_->data(), 0xDD, poison_->size());
     fault_q_.resize(config_.num_ports);
     rsp_ports_.resize(config_.num_ports, nullptr);
+    taint_.assign(MAX_TAINT_EIDS, 0);
   }
 
   void attach_rsp_port(uint32_t port, SimChannel<MemRsp>* chan) {
@@ -270,6 +298,11 @@ public:
     case DCR_CHECKER_BUF_PERMS:  claim_.perms = value; break;
     case DCR_CHECKER_BUF_EPOCH:  claim_.epoch = value; break;
     case DCR_CHECKER_BUF_SHARED: claim_.shared = value; break;
+    case DCR_CHECKER_BUF_JOINT:    claim_.joint = value; break;
+    case DCR_CHECKER_BUF_CONFINED: claim_.confined = value; break;
+    case DCR_CHECKER_BUF_LEAVE:
+      this->leave(value);
+      break;
     case DCR_CHECKER_BUF_COMMIT:
       this->install_claim();
       break;
@@ -302,6 +335,10 @@ public:
       q.clear();
     }
     fault_ = FaultStatus{};
+    // A launch starts every core on a new kernel with an empty taint. The
+    // residue scrub (registers, local memory) that makes this sound is not
+    // modelled yet; see the proposal's SimX section.
+    std::fill(taint_.begin(), taint_.end(), 0u);
   }
 
   void tick() {
@@ -371,6 +408,13 @@ public:
          << ", deliver_write_deny=" << perf_stats_.label_write_denies
          << std::endl;
     }
+    if (config_.taint) {
+      os << "CHECKER: taint: raises=" << perf_stats_.taint_raises
+         << ", write_denies=" << perf_stats_.taint_denies
+         << ", leaves=" << perf_stats_.leaves
+         << ", leaves_refused=" << perf_stats_.leaves_refused
+         << std::endl;
+    }
     if (perf_stats_.dcr_claims != 0 || perf_stats_.epoch_bumps != 0) {
       os << "CHECKER: setup: dcr_claims=" << perf_stats_.dcr_claims
          << ", headers_written=" << perf_stats_.headers_written
@@ -417,6 +461,8 @@ public:
     label.perms        = header.perms;
     label.shared_perms = header.shared_perms;
     label.grant_epoch  = header.grant_epoch;
+    label.joint        = header.joint;
+    label.confined     = header.confined;
     return label;
   }
 
@@ -443,6 +489,8 @@ public:
       return true;   // no policy: IO / local memory
     uint32_t owner = this->owner_of(hart_id);
     uint32_t need = is_write ? PERM_W : PERM_R;
+    if (config_.taint)
+      return this->authorize_taint(label, owner, need, is_write);
     bool ok;
     if (label.owner == OWNER_ANY || label.owner == owner) {
       ok = (label.perms & need) != 0;
@@ -453,6 +501,48 @@ public:
     if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
       ok = false;
     return ok;
+  }
+
+  // The predicate with confinement (kernel_identity_oct16.md, "The
+  // predicate"). The owner set is {owner} plus the joint co-owners; the
+  // unclaimed default (OWNER_ANY) has an empty owner set. Every owner gets the
+  // owner permissions, unchanged; a non-owner rides the shared grant, gated by
+  // the granting owner's epoch, unchanged. Two additions:
+  //   - an allowed read raises the reader's taint by its contributors: the
+  //     other owners of a joint granule, or the owners behind a confined grant;
+  //   - an allowed write must land in a granule whose owners cover the
+  //     writer's taint. Unclaimed memory covers only an empty taint.
+  bool authorize_taint(const MemLabel& label, uint32_t eid, uint32_t need,
+                       bool is_write) const {
+    const bool     unclaimed = (label.owner == OWNER_ANY);
+    const uint32_t owners    = unclaimed ? 0u : (eid_bit(label.owner) | label.joint);
+    const uint32_t me        = eid_bit(eid);
+    const bool     is_owner  = unclaimed || (owners & me) != 0;
+    bool ok;
+    uint32_t contrib = 0;
+    if (is_owner) {
+      ok = (label.perms & need) != 0;
+      contrib = owners & ~me;
+    } else {
+      ok = ((label.shared_perms & need) != 0)
+        && (this->epoch_for(label.owner) <= label.grant_epoch);
+      contrib = label.confined ? owners : 0u;
+    }
+    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
+      ok = false;
+    if (!ok || eid >= MAX_TAINT_EIDS)
+      return ok;
+    uint32_t& taint = taint_[eid];
+    if (is_write) {
+      if ((taint & ~owners) != 0) {
+        ++perf_stats_.taint_denies;
+        return false;
+      }
+    } else if ((contrib & ~taint) != 0) {
+      taint |= contrib;
+      ++perf_stats_.taint_raises;
+    }
+    return true;
   }
 
   bool enforcing() const { return config_.enforce; }
@@ -532,6 +622,13 @@ private:
         ++perf_stats_.claims_rejected;
         return;
       }
+      // A re-claim may add co-owners but never drop one: only a co-owner
+      // removes itself (BUF_LEAVE). Otherwise the owner could release joint
+      // data to itself by re-claiming without its co-owners.
+      if (entry.valid && (header.joint & ~this->staged_joint()) != 0) {
+        ++perf_stats_.claims_rejected;
+        return;
+      }
     }
 
     for (uint64_t id = first; id <= last; ++id) {
@@ -550,9 +647,59 @@ private:
       entry.header.shared_perms = claim_.shared;
       entry.header.grant_epoch = (claim_.epoch == 0xFFFFFFFFu) ? UINT64_MAX
                                                                : uint64_t(claim_.epoch);
+      entry.header.joint    = this->staged_joint();
+      entry.header.confined = (claim_.confined != 0);
       ++perf_stats_.headers_written;
     }
     ++perf_stats_.dcr_claims;
+  }
+
+  // The staged co-owner mask, minus the owner itself; empty for an OWNER_ANY
+  // claim, which has no owners to add to.
+  uint32_t staged_joint() const {
+    if (claim_.owner == OWNER_ANY)
+      return 0;
+    return claim_.joint & ~eid_bit(claim_.owner);
+  }
+
+  // Release (S2): owner `eid` leaves every granule of the staged range. All
+  // or nothing, like a claim: refused if any granule is unclaimed, does not
+  // list `eid` as an owner, or would be left with no owner. When the leaving
+  // owner is owner_eid, the lowest remaining co-owner takes its place, so the
+  // owner set is exactly the old one minus `eid`.
+  void leave(uint32_t eid) {
+    const uint32_t me = eid_bit(eid);
+    if (claim_.size == 0 || me == 0) {
+      ++perf_stats_.leaves_refused;
+      return;
+    }
+    uint64_t first = uint64_t(claim_.base) >> config_.buffer_log2;
+    uint64_t last  = (uint64_t(claim_.base) + claim_.size - 1) >> config_.buffer_log2;
+    for (uint64_t id = first; id <= last; ++id) {
+      const StoreEntry& entry = header_store_[id & header_mask_];
+      if (!entry.valid || entry.tag != id || entry.header.owner_eid == OWNER_ANY) {
+        ++perf_stats_.leaves_refused;
+        return;
+      }
+      uint32_t owners = eid_bit(entry.header.owner_eid) | entry.header.joint;
+      if ((owners & me) == 0 || owners == me) {
+        ++perf_stats_.leaves_refused;
+        return;
+      }
+    }
+    for (uint64_t id = first; id <= last; ++id) {
+      BufferHeader& header = header_store_[id & header_mask_].header;
+      if (header.owner_eid == eid) {
+        uint32_t next = 0;
+        while (((header.joint >> next) & 1u) == 0)
+          ++next;
+        header.owner_eid = next;
+        header.joint &= ~eid_bit(next);
+      } else {
+        header.joint &= ~me;
+      }
+    }
+    ++perf_stats_.leaves;
   }
 
   bool hcache_lookup(uint64_t buffer_id) {
@@ -744,5 +891,6 @@ bool MemChecker::env_config(Config* out) {
   out->miss_latency   = env_u32("VX_CHECKER_MISS_LAT", 4);
   out->enforce        = env_flag("VX_CHECKER_ENFORCE", false);
   out->test_deny      = env_u32("VX_CHECKER_TEST_DENY", 0);
+  out->taint          = env_flag("VX_CHECKER_TAINT", false);
   return true;
 }
