@@ -14,10 +14,18 @@ Two pieces live here:
 | | Role |
 |---|---|
 | `checker.{h,cpp}` | **Pass-through observer.** Counts and classifies every request crossing the LLC→DRAM boundary. Attached to `Memory`'s pre-send hook, whose `const&` signature makes stalling or mutating a request structurally impossible. Always present. |
-| `mem_checker.{h,cpp}` | **Inline checker.** Per-buffer headers (owner, perms, shared perms, grant epoch) behind a header cache, programmed over DCR. Can stall, deny, and inject faults. Constructed *only* when `VX_CHECKER=1`. |
+| `mem_checker.{h,cpp}` | **Inline checker.** Per-buffer headers (owner, perms, shared perms, grant epoch) in an on-chip header store, programmed over DCR. Can stall, deny, and inject faults. Constructed *only* when `VX_CHECKER=1`. |
 
 When `VX_CHECKER` is unset, `MemChecker` is never constructed and the L3→DRAM
 binding is byte-for-byte what upstream does.
+
+> **The header cache was removed on 23 Oct 2026.** It held granule ids only and
+> chose between a modelled hit (`HIT_LAT`, 0) and miss (`MISS_LAT`, 4) stall; it
+> never held a label or changed a verdict, and the store it fronted is on chip.
+> Every lookup now costs `VX_CHECKER_LOOKUP_LAT` (default 0, which R5 showed
+> the store read meets at 300 MHz). Measurements recorded below before that
+> date still show `hcache:` lines and miss-latency cycles; with the default
+> config, their `added_cycles` is now 0 and the cycle counts drop by the same.
 
 ## Build
 
@@ -351,10 +359,7 @@ checker is never built into the datapath.
 | `VX_CHECKER_STATS` | off | Dump counters to **stderr** at teardown (kept out of the `PERF` stream the harness parses) |
 | `VX_CHECKER_BUF_LOG2` | `20` | log2 bytes covered by one header (default 1 MB) |
 | `VX_CHECKER_HEADER_ENTRIES` | `0` | Header-store entries, rounded up to a power of two. `0` sizes the store to cover the whole address space at the current granularity, which is the design point. A smaller value models a store that cannot, so colliding claims are refused (`aliased`) — see demo 5 |
-| `VX_CHECKER_HCACHE_ENTRIES` | `16` | Header-cache entries; `0` disables it so every check misses |
-| `VX_CHECKER_HCACHE_ASSOC` | `4` | Header-cache associativity |
-| `VX_CHECKER_HIT_LAT` | `0` | Cycles added on a header-cache hit |
-| `VX_CHECKER_MISS_LAT` | `4` | Cycles added on a miss |
+| `VX_CHECKER_LOOKUP_LAT` | `0` | Cycles every header-store lookup adds. Raise it to model a store pushed off chip by a fine granularity |
 | `VX_CHECKER_TEST_DENY` | `0` | Synthetic denies, for exercising the fault path without policy |
 
 ## Reading the stats
@@ -363,9 +368,8 @@ With `VX_CHECKER_STATS=1`, teardown writes `CHECKER:` lines to stderr:
 
 ```
 CHECKER: reqs=…, checked=…, bypassed=…, allow=…, deny=…
-CHECKER: hcache: hits=…, misses=…, hit_rate=…%
 CHECKER: added_cycles=…, per_req=… cyc
-CHECKER: config: buffer=…B, header_entries=…, hcache_entries=…, assoc=…, hit_lat=…, miss_lat=…, enforce=…
+CHECKER: config: buffer=…B, header_entries=…, lookup_lat=…, enforce=…
 CHECKER: enforce: faulted_reads=…, dropped_writes=…      (only when enforcing)
 CHECKER: setup: dcr_claims=…, headers_written=…          (only when claims were made)
 CHECKER: claims: rejected=…, aliased=…, reclaimed=…, unaligned=…
@@ -384,38 +388,21 @@ CHECKER: claims: rejected=…, aliased=…, reclaimed=…, unaligned=…
 
 ## Sweeping the overhead
 
-The header cache is the whole performance story, so the interesting sweep is its
-size against a fixed workload:
+With the store on chip, lookup latency is a single knob, and the sweep that
+matters is that latency against a fixed workload (a fine granularity pushes the
+store off chip and is what a non-zero value models):
 
 ```sh
-for e in 0 4 16 64; do
-  echo "== hcache_entries=$e =="
-  VX_CHECKER=1 VX_CHECKER_STATS=1 VX_CHECKER_HCACHE_ENTRIES=$e \
+for l in 0 1 4; do
+  echo "== lookup_lat=$l =="
+  VX_CHECKER=1 VX_CHECKER_STATS=1 VX_CHECKER_LOOKUP_LAT=$l \
     ./ci/blackbox.sh --driver=simx --app=vecadd_claimed --perf=1 2>&1 \
     | grep -E "CHECKER:|^PERF: instrs"
 done
 ```
 
-**Measured** (baseline `vecadd` = 1266 cycles), re-run 22 Sep 2026:
-
-| `hcache_entries` | cycles | vs baseline | `added_cycles` | hit rate |
-|---:|---:|---:|---:|---:|
-| 0 (disabled) | 1300 | +34 | 76 | 0% |
-| 4 | 1276 | +10 | 8 | 89.5% |
-| 16 (default) | 1276 | +10 | 8 | 89.5% |
-| 64 | 1276 | +10 | 8 | 89.5% |
-
-All four `PASSED!`. Two things to point at during a demo:
-
-- **4 entries already saturate.** Going to 16 or 64 changes nothing, because the
-  1 MB header granule keeps the working set to a handful of headers. That is the
-  granule size doing its job.
-- **`entries=0` is the worst case** — every one of the 19 checks misses and pays
-  the full 4-cycle penalty. Even then it is +34 cycles on 1266, about 2.7%.
-
-Each row carries the +6 splice cost described in §1 on top of its
-`added_cycles`; the column differences between rows are pure header-cache
-effect.
-
-The residual 89.5% (not 100%) is the compulsory miss floor: 2 cold misses out of
-19 checks.
+Until 23 Oct 2026 this section swept a header cache in front of the store. At
+`-n64` (22 Sep), 4 entries already saturated at 89.5% hits, the residue being 2
+compulsory misses out of 19 checks, and the cache-disabled worst case cost +34
+cycles on 1266. That cache never held policy, so removing it changes timing
+only.

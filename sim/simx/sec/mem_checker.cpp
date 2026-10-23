@@ -95,12 +95,6 @@ inline uint32_t eid_bit(uint32_t eid) {
 
 class MemChecker::Impl {
 private:
-  struct HCacheEntry {
-    uint64_t tag = 0;
-    bool     valid = false;
-    uint64_t lru = 0;
-  };
-
   // A synthesized response for a denied read, waiting for a free slot on the
   // response bus. `delay` carries the check latency it was charged.
   struct PendingFault {
@@ -164,10 +158,6 @@ private:
   // "claimed" — the property the tag check depends on.
   BufferHeader default_header_;
 
-  std::vector<HCacheEntry> hcache_;
-  uint32_t hc_sets_;
-  uint64_t hc_clock_;
-
   // Per-owner epoch table (fix for the global-revocation bug: owner A
   // revoking its grant to B must not also expire owner C's unrelated grant
   // to D). Indexed by BufferHeader::owner_eid — the *granting* owner, not
@@ -198,8 +188,7 @@ private:
 public:
   Impl(MemChecker* simobject, const Config& config)
     : simobject_(simobject)
-    , config_(config)
-    , hc_clock_(0) {
+    , config_(config) {
     // Size the store to cover the device address space at this granularity,
     // unless the harness pins a capacity to model a store that cannot.
     uint64_t entries;
@@ -221,15 +210,6 @@ public:
     default_header_.perms = PERM_R | PERM_W;
     default_header_.shared_perms = 0;
     default_header_.grant_epoch = UINT64_MAX;
-
-    if (config_.hcache_entries != 0) {
-      uint32_t assoc = std::max<uint32_t>(1, std::min(config_.hcache_assoc, config_.hcache_entries));
-      hc_sets_ = std::max<uint32_t>(1, config_.hcache_entries / assoc);
-      config_.hcache_assoc = assoc;
-      hcache_.resize(size_t(hc_sets_) * assoc);
-    } else {
-      hc_sets_ = 0;
-    }
 
     poison_ = make_mem_block();
     std::memset(poison_->data(), 0xDD, poison_->size());
@@ -287,8 +267,7 @@ public:
   }
 
   // The who's-who setup path. Configuration writes take effect immediately:
-  // the header cache only models lookup *timing* (presence tags — the policy
-  // check always reads header_store_ directly), so no invalidation is needed
+  // every check reads header_store_ directly, so nothing needs invalidating
   // for a claim to become visible.
   int dcr_write(uint32_t addr, uint32_t value) {
     switch (addr) {
@@ -327,10 +306,6 @@ public:
   }
 
   void reset() {
-    for (auto& entry : hcache_) {
-      entry.valid = false;
-    }
-    hc_clock_ = 0;
     for (auto& q : fault_q_) {
       q.clear();
     }
@@ -373,16 +348,11 @@ public:
   }
 
   void dump(std::ostream& os) const {
-    uint64_t lookups = perf_stats_.hc_hits + perf_stats_.hc_misses;
     os << "CHECKER: reqs=" << perf_stats_.reqs
        << ", checked=" << perf_stats_.checked
        << ", bypassed=" << perf_stats_.bypassed
        << ", allow=" << perf_stats_.allows
        << ", deny=" << perf_stats_.denies
-       << std::endl;
-    os << "CHECKER: hcache: hits=" << perf_stats_.hc_hits
-       << ", misses=" << perf_stats_.hc_misses
-       << ", hit_rate=" << (lookups ? (100.0 * double(perf_stats_.hc_hits) / double(lookups)) : 0.0) << "%"
        << std::endl;
     os << "CHECKER: added_cycles=" << perf_stats_.added_cycles
        << ", per_req=" << (perf_stats_.reqs ? (double(perf_stats_.added_cycles) / double(perf_stats_.reqs)) : 0.0)
@@ -390,10 +360,7 @@ public:
        << std::endl;
     os << "CHECKER: config: buffer=" << (1ull << config_.buffer_log2) << "B"
        << ", header_entries=" << config_.header_entries
-       << ", hcache_entries=" << config_.hcache_entries
-       << ", assoc=" << config_.hcache_assoc
-       << ", hit_lat=" << config_.hit_latency
-       << ", miss_lat=" << config_.miss_latency
+       << ", lookup_lat=" << config_.lookup_latency
        << ", enforce=" << (config_.enforce ? 1 : 0)
        << std::endl;
     if (config_.enforce) {
@@ -702,36 +669,6 @@ private:
     ++perf_stats_.leaves;
   }
 
-  bool hcache_lookup(uint64_t buffer_id) {
-    if (hcache_.empty())
-      return false;   // no cache: every check pays the store fetch
-
-    uint32_t set = uint32_t(buffer_id % hc_sets_);
-    uint64_t tag = buffer_id / hc_sets_;
-    size_t base = size_t(set) * config_.hcache_assoc;
-    ++hc_clock_;
-
-    for (uint32_t w = 0; w < config_.hcache_assoc; ++w) {
-      auto& entry = hcache_[base + w];
-      if (entry.valid && entry.tag == tag) {
-        entry.lru = hc_clock_;
-        return true;
-      }
-    }
-
-    // Miss: install, evicting the least-recently-used way.
-    size_t victim = base;
-    for (uint32_t w = 0; w < config_.hcache_assoc; ++w) {
-      auto& entry = hcache_[base + w];
-      if (!entry.valid) { victim = base + w; break; }
-      if (entry.lru < hcache_[victim].lru) victim = base + w;
-    }
-    hcache_[victim].valid = true;
-    hcache_[victim].tag = tag;
-    hcache_[victim].lru = hc_clock_;
-    return false;
-  }
-
   // A denied request under enforcement never reaches DRAM. Reads get a poison
   // response after the check latency (fast-fail: the requester is unblocked
   // without paying a DRAM round-trip); writes are posted at this boundary and
@@ -778,23 +715,14 @@ private:
     // up, because that lookup is what resolves the fill's label.
     uint64_t buffer_id = req.addr >> config_.buffer_log2;
     if (req.flags.labeled) {
-      bool hit = this->hcache_lookup(buffer_id);
-      if (hit) ++perf_stats_.hc_hits;
-      else     ++perf_stats_.hc_misses;
-      uint64_t added = hit ? config_.hit_latency : config_.miss_latency;
+      uint64_t added = config_.lookup_latency;
       ++perf_stats_.labeled_passed;
       ++perf_stats_.allows;
       *allowed = true;
       perf_stats_.added_cycles += added;
       return added;
     }
-    bool hit = this->hcache_lookup(buffer_id);
-    if (hit) {
-      ++perf_stats_.hc_hits;
-    } else {
-      ++perf_stats_.hc_misses;
-    }
-    uint64_t added = hit ? config_.hit_latency : config_.miss_latency;
+    uint64_t added = config_.lookup_latency;
 
     bool ok = this->authorize(label_of(this->header_for(buffer_id)),
                               req.hart_id, req.is_write());
@@ -885,10 +813,7 @@ bool MemChecker::env_config(Config* out) {
     return false;
   out->buffer_log2    = env_u32("VX_CHECKER_BUF_LOG2", 20);
   out->header_entries = env_u32("VX_CHECKER_HEADER_ENTRIES", 0);
-  out->hcache_entries = env_u32("VX_CHECKER_HCACHE_ENTRIES", 16);
-  out->hcache_assoc   = env_u32("VX_CHECKER_HCACHE_ASSOC", 4);
-  out->hit_latency    = env_u32("VX_CHECKER_HIT_LAT", 0);
-  out->miss_latency   = env_u32("VX_CHECKER_MISS_LAT", 4);
+  out->lookup_latency = env_u32("VX_CHECKER_LOOKUP_LAT", 0);
   out->enforce        = env_flag("VX_CHECKER_ENFORCE", false);
   out->test_deny      = env_u32("VX_CHECKER_TEST_DENY", 0);
   out->taint          = env_flag("VX_CHECKER_TAINT", false);

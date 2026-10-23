@@ -16,8 +16,8 @@
 namespace vortex {
 
 // Buffer policy header. One of these covers a whole buffer chunk
-// (2^buffer_log2 bytes, ~MB by design), which is what makes the metadata
-// working set small enough for the header cache to hold.
+// (2^buffer_log2 bytes, ~MB by design), which is what makes the header store
+// small enough to keep on chip.
 //
 // Read-only in steady state: revocation advances `current_epoch` on the
 // checker rather than writing headers, so the check stays a pure cacheable
@@ -98,14 +98,14 @@ constexpr uint32_t DCR_CHECKER_END        = 0x340;
 //
 // PHASE 2 SCOPE — static single-owner. The header store is populated at
 // construction with one owner covering all of global memory; the checker
-// resolves a request's buffer, looks the header up through the header cache,
+// resolves a request's buffer, reads its header from the store,
 // and allows or denies on owner + permission match. The DCR-driven who's-who
 // setup that populates this from the host is Phase 3; the epoch register is
 // wired but never advanced until Phase 4.
 //
-// Latency model: a header-cache hit forwards with `hit_latency` added, a miss
-// with `miss_latency` (the cost of fetching the header from the isolated
-// store). Nothing else about the request is touched — no data, no reordering.
+// Latency model: every lookup forwards with `lookup_latency` added (0 at the
+// design point: the store is on chip). Nothing else about the request is
+// touched — no data, no reordering.
 //
 // PHASE 3 — fault delivery. The DRAM→LLC response binding stays direct and
 // untouched (splicing a buffered stage into it measurably perturbs baseline
@@ -136,16 +136,11 @@ public:
     // so the capacity limit shows up as claims_aliased instead of as silent
     // policy corruption. Rounded up to a power of two.
     uint32_t header_entries = 0;
-    uint32_t hcache_entries = 16;   // 0 disables the cache: every check is a miss
-    uint32_t hcache_assoc = 4;
-    uint32_t hit_latency = 0;       // cycles added on a header-cache hit
-    // Cycles added on a miss (isolated-store fetch). 4 is Vortex's own array
-    // latency for an on-chip SRAM of the size the 1 MB-granularity design point
-    // implies (a 64 KB header store); both VX_CFG_DCACHE_LATENCY's and
-    // VX_CFG_L2_LATENCY's scaling rules give 4 there. Fine granularities push
-    // the store off chip and cost a real memory access instead — the harness
-    // sets those explicitly. Derivation: playground_2626/PROJECT.md §8.3.
-    uint32_t miss_latency = 4;
+    // Cycles every header-store lookup adds. 0 is the design point: the store
+    // is on chip and R5 closed its read at 300 MHz with slack (there is no
+    // header cache in front of it). Fine granularities push the store off chip
+    // and cost a real memory access instead; the harness sets those explicitly.
+    uint32_t lookup_latency = 0;
     bool     enforce = false;       // Phase 3: a deny actually blocks the request
     // Mechanism self-test. 0 = off; 1 = deny every check (with enforce this
     // poisons instruction fetches too — the victim executes garbage and the
@@ -165,8 +160,6 @@ public:
     uint64_t bypassed = 0;      // IO / local-mem — carries no header, never gated
     uint64_t allows = 0;
     uint64_t denies = 0;
-    uint64_t hc_hits = 0;
-    uint64_t hc_misses = 0;
     uint64_t added_cycles = 0;  // total latency injected across all requests
     uint64_t faulted_reads = 0;   // enforced denies answered with a poison MemRsp
     uint64_t dropped_writes = 0;  // enforced denies dropped (writes are posted)
@@ -260,7 +253,7 @@ public:
   void dump(std::ostream& os) const;
 
   // Config is read from the environment so a sweep can vary granularity and
-  // header-cache size without a rebuild. Returns enabled=false when
+  // lookup latency without a rebuild. Returns enabled=false when
   // VX_CHECKER is unset, in which case the checker is not constructed at all
   // and the l3→dram binding stays exactly as upstream leaves it.
   static bool env_config(Config* out);
