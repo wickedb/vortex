@@ -27,7 +27,7 @@ module VX_cp_gpu_slice (
 );
     // DCR request: valid/ready stream, fully registered (skid) both directions.
     VX_elastic_buffer #(
-        .DATAW   (1 + `VX_DCR_ADDR_BITS + `VX_DCR_DATA_BITS),
+        .DATAW   (1 + `VX_DCR_ADDR_BITS + `VX_DCR_DATA_BITS + `VX_DCR_ISSUER_BITS),
         .SIZE    (2),
         .OUT_REG (1)
     ) req_buf (
@@ -35,8 +35,8 @@ module VX_cp_gpu_slice (
         .reset     (reset),
         .valid_in  (cp_side.dcr_req_valid),
         .ready_in  (cp_side.dcr_req_ready),
-        .data_in   ({cp_side.dcr_req_rw, cp_side.dcr_req_addr, cp_side.dcr_req_data}),
-        .data_out  ({gpu_side.dcr_req_rw, gpu_side.dcr_req_addr, gpu_side.dcr_req_data}),
+        .data_in   ({cp_side.dcr_req_rw, cp_side.dcr_req_addr, cp_side.dcr_req_data, cp_side.dcr_req_issuer}),
+        .data_out  ({gpu_side.dcr_req_rw, gpu_side.dcr_req_addr, gpu_side.dcr_req_data, gpu_side.dcr_req_issuer}),
         .valid_out (gpu_side.dcr_req_valid),
         .ready_out (gpu_side.dcr_req_ready)
     );

@@ -45,6 +45,7 @@ module rtlsim_shim import VX_gpu_pkg::*; #(
     input  wire                             dcr_req_rw,
     input  wire [VX_DCR_ADDR_WIDTH-1:0]     dcr_req_addr,
     input  wire [VX_DCR_DATA_WIDTH-1:0]     dcr_req_data,
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0]   dcr_req_issuer,
 
     // DCR read response
     output wire                             dcr_rsp_valid,
@@ -98,6 +99,7 @@ module rtlsim_shim import VX_gpu_pkg::*; #(
         .dcr_req_rw     (dcr_req_rw),
         .dcr_req_addr   (dcr_req_addr),
         .dcr_req_data   (dcr_req_data),
+        .dcr_req_issuer (dcr_req_issuer),
 
         .dcr_rsp_valid  (dcr_rsp_valid),
         .dcr_rsp_data   (dcr_rsp_data),

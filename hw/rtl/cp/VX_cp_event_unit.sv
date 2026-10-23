@@ -56,6 +56,7 @@ module VX_cp_event_unit
   // remaining fields are forwarded but unused by this unit.
   input  cmd_t                      cmd,
   output logic                      done,
+  output logic                      idle,   // no command in flight: the arbiter may grant
 
   VX_mem_axi_if.master             axi_m
 );
@@ -168,6 +169,7 @@ module VX_cp_event_unit
 
     // Done pulse
     done = (state == S_DONE);
+    idle = (state == S_IDLE);
   end
 
   // Sanity / unused.

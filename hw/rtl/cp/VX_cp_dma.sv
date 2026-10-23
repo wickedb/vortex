@@ -70,6 +70,7 @@ module VX_cp_dma
   input  wire                       grant,
   input  cmd_t                      cmd,
   output logic                      done,
+  output logic                      idle,   // no command in flight: the arbiter may grant
 
   // Host-memory AXI master (command-ring side / upload source / download dst).
   VX_mem_axi_if.master             axi_host,
@@ -296,6 +297,7 @@ module VX_cp_dma
     axi_dev.bready   = wr_bready  & ~wr_to_host;
 
     done = (state == S_DONE);
+    idle = (state == S_IDLE);
   end
 
   // Sanity / unused.

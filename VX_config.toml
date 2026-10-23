@@ -292,6 +292,19 @@ VX_CFG_CHECKER_BUF_LOG2 = 20
 # refused rather than aliased.
 VX_CFG_CHECKER_HEADER_ENTRIES = 0
 
+# Tenants the setup path can tell apart. Each tenant is one command-processor
+# queue, and the queue a setup command arrives on is its issuer, so a tenant can
+# configure only its own policy (P1_and_taint_specv2.md D1-D3). A build-time
+# parameter, independent of the core count. The command processor has this many
+# queues (the C++ model always; the RTL with the checker enabled).
+VX_CFG_CHECKER_TENANTS = 8
+
+# Reads of the checker's DCR window (0x300-0x340) through the command processor.
+# 0 refuses them, as a production build must: per-owner state such as epochs and
+# deny counters must not be readable by other tenants (spec D5). Simulation keeps
+# its counters on stderr, so nothing in-tree needs this.
+VX_CFG_CHECKER_DEBUG_READS = 0
+
 # Cycles every header-store lookup adds. 0 is the design point: the store is
 # on chip, and R5 closed its read at 300 MHz with slack, so the lookup overlaps
 # the DRAM access it gates. There is no header cache in front of the store; it

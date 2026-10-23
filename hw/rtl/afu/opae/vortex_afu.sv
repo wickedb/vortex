@@ -371,6 +371,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     wire                         vx_dcr_req_rw    = cp_gpu_if.dcr_req_rw;
     wire [VX_DCR_ADDR_WIDTH-1:0] vx_dcr_req_addr  = cp_gpu_if.dcr_req_addr;
     wire [VX_DCR_DATA_WIDTH-1:0] vx_dcr_req_data  = cp_gpu_if.dcr_req_data;
+    wire [VX_DCR_ISSUER_WIDTH-1:0] vx_dcr_req_issuer = cp_gpu_if.dcr_req_issuer;
     wire                         vx_dcr_rsp_valid;
     wire [VX_DCR_DATA_WIDTH-1:0] vx_dcr_rsp_data;
 
@@ -739,6 +740,7 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
         .dcr_req_rw     (vx_dcr_req_rw),
         .dcr_req_addr   (vx_dcr_req_addr),
         .dcr_req_data   (vx_dcr_req_data),
+        .dcr_req_issuer (vx_dcr_req_issuer),
         .dcr_rsp_valid  (vx_dcr_rsp_valid),
         .dcr_rsp_data   (vx_dcr_rsp_data),
 

@@ -9,15 +9,14 @@
 // header is touched by either, which is the whole reason policy change is
 // cheap (PROJECT.md §2.2, measured zero in `churn.md`).
 //
-// WHAT THIS MODULE CANNOT DO, stated because it is the top open item: it
-// enforces policy without authenticating its author. A DCR write is
-// {addr, value} with no requester identity, so it cannot distinguish an owner
-// re-claiming its own buffer from a tenant trying to steal one (PROJECT.md
-// §10 #4b). BUF_OWNER is a value the writer *selects*. Deriving the owner from
-// the originating command queue instead is what would make the principal
-// unforgeable at the interface rather than trusted by convention — and that is
-// a second-queue change in the command processor, not something this module
-// can fix on its own.
+// Authorship: every write arrives with its issuer, the command-processor
+// queue it came from (dcr_issuer, beside the bus). A tenant stages into its
+// own registers, claims only for itself (a staged BUF_OWNER naming anyone
+// else, OWNER_ANY included, makes the COMMIT install nothing, counted in
+// cnt_foreign), and an EPOCH write advances only the issuer's own epoch. So an
+// owner re-claiming its buffer and a tenant trying to steal one are now
+// different requests, decided by where they came from rather than by a value
+// the writer chose (P1_and_taint_specv2.md D1-D3).
 //
 // Reachability, as distinct from authorship, is closed elsewhere: the whole
 // 0x300-0x340 window is refused when it arrives from a device-resident,
@@ -36,6 +35,10 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
     VX_dcr_bus_if.slave  dcr_bus_if,      // from the device DCR input
     VX_dcr_bus_if.master dcr_bus_out_if,  // onward to the cluster DCR arb
+    // The command-processor queue (tenant) the current DCR write came from.
+    // It travels beside the bus, valid with req_valid; the checker is its only
+    // consumer.
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0] dcr_issuer,
 
     // Boot default for granules with no claim of their own.
     output chk_header_t              default_header,
@@ -71,7 +74,9 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0]               cnt_epoch_bumps,
     output wire [31:0]               cnt_rejected,
     output wire [31:0]               cnt_aliased,
-    output wire [31:0]               cnt_reclaimed
+    output wire [31:0]               cnt_reclaimed,
+    // Claims refused because they named an owner other than their issuer.
+    output wire [31:0]               cnt_foreign
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -88,43 +93,60 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire is_epoch  = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_EPOCH);
     wire is_shared = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_SHARED);
     wire is_commit = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_COMMIT);
-    wire is_revown = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_REVOKE_OWNER);
     wire is_bump   = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_EPOCH);
+    // VX_DCR_CHECKER_REVOKE_OWNER is retired (authorship): it let any writer
+    // pick whose epoch the next EPOCH write advanced. Writes to it are ignored.
 
     // ---------------------------------------------------------------------
-    // Staged claim. Persists across commits by design.
+    // Authorship (P1_and_taint_specv2.md D1-D3). Every setup write carries its
+    // issuer, the queue it arrived on, which is the tenant. A tenant stages
+    // into its own registers, may claim only for itself, and revokes only its
+    // own grants. Issuers are owner ids: today a tenant is a core, so an
+    // issuer that names no core cannot claim (it would truncate onto another
+    // owner's id).
     // ---------------------------------------------------------------------
-    reg [31:0] stg_base, stg_size;
-    reg [31:0] stg_owner;      // full width: OWNER_ANY is 32'hFFFFFFFF
-    reg [1:0]  stg_perms, stg_shared;
-    reg [31:0] stg_epoch;
+    localparam NUM_ISSUERS = `VX_CFG_CHECKER_TENANTS;
+    wire [`UP(`CLOG2(NUM_ISSUERS))-1:0] iss = `UP(`CLOG2(NUM_ISSUERS))'(dcr_issuer);
+    wire iss_is_owner = (32'(dcr_issuer) < 32'(NUM_OWNERS));
 
-    // Staged revoke target. OWNER_ANY means "nothing staged", and a bare EPOCH
-    // write with nothing staged is a NO-OP: the checker fails closed rather
-    // than falling back to a device-wide revocation.
-    reg [31:0] stg_revoke_owner;
+    // ---------------------------------------------------------------------
+    // Staged claims, one set per issuer, so another queue's writes between a
+    // tenant's staging and its COMMIT cannot retarget its claim. Persist
+    // across commits by design. The staged owner is kept only as "did the
+    // issuer name itself": that is all a commit needs.
+    // ---------------------------------------------------------------------
+    reg [NUM_ISSUERS-1:0][31:0] stg_base, stg_size, stg_epoch;
+    reg [NUM_ISSUERS-1:0][1:0]  stg_perms, stg_shared;
+    reg [NUM_ISSUERS-1:0]       stg_owner_self;
 
     always @(posedge clk) begin
         if (reset) begin
-            stg_base         <= '0;
-            stg_size         <= '0;
-            stg_owner        <= '0;
-            stg_perms        <= '0;
-            stg_shared       <= '0;
-            stg_epoch        <= 32'hFFFFFFFF;
-            stg_revoke_owner <= `VX_CHECKER_OWNER_ANY;
+            for (int i = 0; i < NUM_ISSUERS; ++i) begin
+                stg_base[i]   <= '0;
+                stg_size[i]   <= '0;
+                stg_perms[i]  <= '0;
+                stg_shared[i] <= '0;
+                stg_epoch[i]  <= 32'hFFFFFFFF;
+                // An unwritten BUF_OWNER reads as owner 0, as in SimX.
+                stg_owner_self[i] <= (i == 0);
+            end
         end else begin
-            if (is_base)   stg_base   <= dcr_wdata;
-            if (is_size)   stg_size   <= dcr_wdata;
-            if (is_owner)  stg_owner  <= dcr_wdata;
-            if (is_perms)  stg_perms  <= dcr_wdata[1:0];
-            if (is_shared) stg_shared <= dcr_wdata[1:0];
-            if (is_epoch)  stg_epoch  <= dcr_wdata;
-            if (is_revown) stg_revoke_owner <= dcr_wdata;
+            if (is_base)   stg_base[iss]   <= dcr_wdata;
+            if (is_size)   stg_size[iss]   <= dcr_wdata;
+            if (is_owner)  stg_owner_self[iss] <= (dcr_wdata == 32'(dcr_issuer));
+            if (is_perms)  stg_perms[iss]  <= dcr_wdata[1:0];
+            if (is_shared) stg_shared[iss] <= dcr_wdata[1:0];
+            if (is_epoch)  stg_epoch[iss]  <= dcr_wdata;
         end
     end
 
-    wire stg_owner_any = (stg_owner == `VX_CHECKER_OWNER_ANY);
+    // The claim being installed, latched at COMMIT: its owner is the issuer.
+    reg [CHK_OWNER_W-1:0] ins_owner;
+    reg [1:0]             ins_perms, ins_shared;
+    reg [31:0]            ins_epoch;
+    // A COMMIT whose issuer named someone else (or names no owner) installs
+    // nothing and is counted, apart from rejected/aliased.
+    wire commit_self = stg_owner_self[iss] && iss_is_owner;
 
     // The installer reads only the occupant's owner and owner_any: valid and
     // tag are resolved by the store, and perms/epoch belong to the occupant's
@@ -143,14 +165,10 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg [CHK_EPOCH_W-1:0] epoch_r [NUM_OWNERS];
     reg [31:0] bumps_r;
 
-    wire revoke_targets_any = (stg_revoke_owner == `VX_CHECKER_OWNER_ANY);
-    wire [CHK_OWNER_W-1:0] revoke_idx = stg_revoke_owner[CHK_OWNER_W-1:0];
-    wire revoke_in_range = !revoke_targets_any
-                        && (stg_revoke_owner < 32'(NUM_OWNERS));
+    // The issuer's own entry: an owner revokes only its own grants.
+    wire [CHK_OWNER_W-1:0] revoke_idx = CHK_OWNER_W'(dcr_issuer);
     wire [CHK_EPOCH_W-1:0] bump_value = dcr_wdata[CHK_EPOCH_W-1:0];
-    // OWNER_ANY headers are never epoch-gated, so scoping a revoke to
-    // OWNER_ANY would be a host mistake rather than a real grant to expire.
-    wire do_bump = is_bump && revoke_in_range
+    wire do_bump = is_bump && iss_is_owner
                 && (bump_value > epoch_r[revoke_idx]);
 
     always @(posedge clk) begin
@@ -199,10 +217,52 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg [CHK_BUF_ID_W-1:0] first_id, last_id, cur_id;
     reg refuse_alias, refuse_owner;
 
-    // granule id = address >> BUF_LOG2
-    wire [31:0] claim_end = stg_base + stg_size - 1;
-    wire [CHK_BUF_ID_W-1:0] first_of = CHK_BUF_ID_W'(stg_base  >> CHK_BUF_LOG2);
+    // granule id = address >> BUF_LOG2, from the committing issuer's staging
+    wire [31:0] claim_end = stg_base[iss] + stg_size[iss] - 1;
+    wire [CHK_BUF_ID_W-1:0] first_of = CHK_BUF_ID_W'(stg_base[iss] >> CHK_BUF_LOG2);
     wire [CHK_BUF_ID_W-1:0] last_of  = CHK_BUF_ID_W'(claim_end >> CHK_BUF_LOG2);
+    wire refuse_foreign = is_commit && (stg_size[iss] != 0) && !commit_self;
+
+    // ---------------------------------------------------------------------
+    // Pending claims. The DCR bus has no back-pressure and an install takes
+    // ~2N cycles, so a COMMIT can arrive while another claim is installing --
+    // with several queues, routinely. Each accepted COMMIT is snapshotted
+    // here (issuer, range, perms, grant) and the installer drains them in
+    // order. The snapshot is what makes a later staging write by the same
+    // tenant unable to alter a claim it has already committed.
+    // ---------------------------------------------------------------------
+    localparam PEND_DEPTH = 2 * NUM_ISSUERS;
+    localparam PEND_W     = CHK_OWNER_W + 2 * CHK_BUF_ID_W + 2 + 2 + 32;
+    wire              pend_empty, pend_full, pend_pop;
+    wire [PEND_W-1:0] pend_out;
+    wire commit_accept = is_commit && (stg_size[iss] != 0) && commit_self;
+    wire pend_push     = commit_accept && !pend_full;
+    wire pend_drop     = commit_accept && pend_full;
+
+    VX_fifo_queue #(
+        .DATAW (PEND_W),
+        .DEPTH (PEND_DEPTH)
+    ) pending (
+        .clk      (clk),
+        .reset    (reset),
+        .push     (pend_push),
+        .pop      (pend_pop),
+        .data_in  ({CHK_OWNER_W'(dcr_issuer), first_of, last_of,
+                    stg_perms[iss], stg_shared[iss], stg_epoch[iss]}),
+        .data_out (pend_out),
+        .empty    (pend_empty),
+        `UNUSED_PIN (alm_empty),
+        .full     (pend_full),
+        `UNUSED_PIN (alm_full),
+        `UNUSED_PIN (size)
+    );
+
+    wire [CHK_OWNER_W-1:0]  p_owner;
+    wire [CHK_BUF_ID_W-1:0] p_first, p_last;
+    wire [1:0]              p_perms, p_shared;
+    wire [31:0]             p_epoch;
+    assign {p_owner, p_first, p_last, p_perms, p_shared, p_epoch} = pend_out;
+    wire start_install = !pend_empty;
 
     // ALIAS: the entry this granule indexes is occupied by a DIFFERENT buffer.
     // Refuse whoever owns the occupant — two buffers is the problem, not two
@@ -215,21 +275,20 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // owner. The invariant the per-sector writer tag depends on (§2.3).
     wire scan_owner_conflict = probe_claimed
                             && !probe_header.owner_any
-                            && !stg_owner_any
-                            && (probe_header.owner != stg_owner[CHK_OWNER_W-1:0]);
+                            && (probe_header.owner != ins_owner);
 
     // RE-CLAIM by the same owner (e.g. a re-grant). Legal and counted, so
     // "no owner ever silently replaced another" stays a measured zero rather
     // than an assumption. Only an installed header can be re-claimed.
     wire scan_is_reclaim = probe_claimed
-                        && (probe_header.owner == stg_owner[CHK_OWNER_W-1:0]);
+                        && (probe_header.owner == ins_owner);
 
     wire at_last = (cur_id == last_id);
 
     always @(*) begin
         state_n = state;
         case (state)
-            ST_IDLE:  if (is_commit && (stg_size != 0)) state_n = ST_SCAN;
+            ST_IDLE:  if (start_install)                  state_n = ST_SCAN;   // pops one
             // The combinational conflict signals MUST be in this condition, not
             // just the registered flags. refuse_* only updates at the clock
             // edge, so on the cycle a conflict is detected they still read 0 —
@@ -250,7 +309,7 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         endcase
     end
 
-    reg [31:0] claims_r, written_r, rejected_r, aliased_r, reclaimed_r;
+    reg [31:0] claims_r, written_r, rejected_r, aliased_r, reclaimed_r, foreign_r;
     reg [31:0] reclaim_acc;
 
     always @(posedge clk) begin
@@ -267,17 +326,28 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             aliased_r    <= '0;
             reclaimed_r  <= '0;
             reclaim_acc  <= '0;
+            foreign_r    <= '0;
+            ins_owner    <= '0;
+            ins_perms    <= '0;
+            ins_shared   <= '0;
+            ins_epoch    <= '0;
         end else begin
             state <= state_n;
+            if (refuse_foreign)
+                foreign_r <= foreign_r + 1;
             case (state)
                 ST_IDLE: begin
-                    if (is_commit && (stg_size != 0)) begin
-                        first_id     <= first_of;
-                        last_id      <= last_of;
-                        cur_id       <= first_of;
+                    if (start_install) begin
+                        first_id     <= p_first;
+                        last_id      <= p_last;
+                        cur_id       <= p_first;
                         refuse_alias <= 1'b0;
                         refuse_owner <= 1'b0;
                         reclaim_acc  <= '0;
+                        ins_owner    <= p_owner;
+                        ins_perms    <= p_perms;
+                        ins_shared   <= p_shared;
+                        ins_epoch    <= p_epoch;
                     end
                 end
                 ST_SCAN: begin
@@ -319,19 +389,22 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     always @(*) begin
         wr_header              = '0;
         wr_header.valid        = 1'b1;
-        wr_header.owner_any    = stg_owner_any;
-        wr_header.owner        = stg_owner[CHK_OWNER_W-1:0];
-        wr_header.perms        = stg_perms;
-        wr_header.shared_perms = stg_shared;
+        wr_header.owner_any    = 1'b0;   // a tenant claims for itself, never for all
+        wr_header.owner        = ins_owner;
+        wr_header.perms        = ins_perms;
+        wr_header.shared_perms = ins_shared;
         // 0xFFFFFFFF means "no expiry": saturate rather than truncate, or a
         // never-expiring grant would silently become one that expires at
         // epoch 0xFFFF's wrap.
-        wr_header.grant_epoch  = (stg_epoch == 32'hFFFFFFFF)
+        wr_header.grant_epoch  = (ins_epoch == 32'hFFFFFFFF)
                                ? {CHK_EPOCH_W{1'b1}}
-                               : stg_epoch[CHK_EPOCH_W-1:0];
+                               : ins_epoch[CHK_EPOCH_W-1:0];
     end
 
-    assign install_busy = (state != ST_IDLE);
+    assign pend_pop = (state == ST_IDLE) && start_install;
+
+    // The check path stalls while a claim installs or waits to.
+    assign install_busy = (state != ST_IDLE) || !pend_empty;
 
     // ---------------------------------------------------------------------
     // Boot default: unclaimed memory is system/shared, so kernel code, stacks
@@ -356,6 +429,13 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     assign cnt_rejected        = rejected_r;
     assign cnt_aliased         = aliased_r;
     assign cnt_reclaimed       = reclaimed_r;
+    assign cnt_foreign         = foreign_r;
+
+`ifdef SIMULATION
+    // PEND_DEPTH covers two outstanding COMMITs per tenant. More than that
+    // before the installer catches up would lose a claim; say so loudly.
+    `RUNTIME_ASSERT (reset || !pend_drop, ("%t: %s COMMIT from issuer %0d dropped: %0d claims already pending", $time, INSTANCE_ID, dcr_issuer, PEND_DEPTH))
+`endif
 
     // Checker registers are consumed here; everything else fans onward
     // unchanged. Reads are not answered yet — the counter/fault read-back path

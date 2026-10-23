@@ -192,6 +192,7 @@ static void run_copy(vl_simulator<T>& sim, AxiSlave& slave, uint64_t& tick,
     // master starts issuing AXI traffic). Dropping grant too early is a
     // common race — IDLE -> REQ_AR is on a posedge so the FSM must see
     // grant=1 at that exact edge.
+    EXPECT(sim->idle, "DMA should be idle before the grant");
     sim->grant = 1;
     bool latched = false;
     for (int g = 0; g < 8 && !latched; ++g) {
@@ -201,12 +202,17 @@ static void run_copy(vl_simulator<T>& sim, AxiSlave& slave, uint64_t& tick,
     sim->grant = 0;
     EXPECT(latched, "DMA never asserted arvalid (grant capture failed)");
 
+    // `idle` gates the DMA arbiter in VX_cp_core: it must stay low for the
+    // whole transfer, or a second queue would be granted mid-command.
     bool got_done = false;
     for (int g = 0; g < 50 && !got_done; ++g) {
+        EXPECT(!sim->idle, "DMA reported idle mid-transfer");
         cycle(sim, slave, tick);
         if (sim->done) got_done = true;
     }
     EXPECT(got_done, "DMA did not signal done within 50 cycles");
+    cycle(sim, slave, tick);
+    EXPECT(sim->idle, "DMA should be idle after done");
 }
 
 int main(int argc, char** argv) {

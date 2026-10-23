@@ -102,6 +102,10 @@ module VX_cp_axil_regfile_top
   endgenerate
 
   wire q_clear_ack_arr [NUM_QUEUES];
+  wire [31:0] zero_arr  [NUM_QUEUES];
+  for (genvar i = 0; i < NUM_QUEUES; ++i) begin : g_zero
+    assign zero_arr[i] = 32'd0;
+  end
 
   VX_cp_axil_regfile #(.NUM_QUEUES(NUM_QUEUES), .ADDR_W(ADDR_W)) u_dut (
     .clk            (clk),
@@ -112,7 +116,8 @@ module VX_cp_axil_regfile_top
     .q_head         (q_head_arr),
     .q_seqnum       (q_seqnum_arr),
     .q_error        (q_error_arr),
-    .last_dcr_rsp   (32'd0),
+    .last_dcr_rsp   (zero_arr),
+    .dcr_blocked    (zero_arr),
     .q_state        (q_state_arr),
     .q_reset_pulse  (q_reset_arr),
     .dbg_host_w_counts (32'd0),

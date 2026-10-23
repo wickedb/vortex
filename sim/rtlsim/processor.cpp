@@ -249,11 +249,12 @@ public:
     this->cout_flush();
   }
 
-  int dcr_write(uint32_t addr, uint32_t value) {
-    device_->dcr_req_valid = 1;
-    device_->dcr_req_rw    = 1;
-    device_->dcr_req_addr  = addr;
-    device_->dcr_req_data  = value;
+  int dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
+    device_->dcr_req_valid  = 1;
+    device_->dcr_req_rw     = 1;
+    device_->dcr_req_addr   = addr;
+    device_->dcr_req_data   = value;
+    device_->dcr_req_issuer = issuer;
     this->tick();
     device_->dcr_req_valid = 0;
     this->tick();
@@ -261,10 +262,11 @@ public:
   }
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
-    device_->dcr_req_valid = 1;
-    device_->dcr_req_rw    = 0;
-    device_->dcr_req_addr  = addr;
-    device_->dcr_req_data  = tag;
+    device_->dcr_req_valid  = 1;
+    device_->dcr_req_rw     = 0;
+    device_->dcr_req_addr   = addr;
+    device_->dcr_req_data   = tag;
+    device_->dcr_req_issuer = 0;
     this->tick();
     device_->dcr_req_valid = 0;
     this->tick();
@@ -534,8 +536,8 @@ void Processor::run(HostMonitor* monitor, CoutDrainer* cout_drainer) {
   impl_->run(monitor, cout_drainer);
 }
 
-int Processor::dcr_write(uint32_t addr, uint32_t value) {
-  return impl_->dcr_write(addr, value);
+int Processor::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
+  return impl_->dcr_write(addr, value, issuer);
 }
 
 int Processor::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {

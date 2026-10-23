@@ -36,7 +36,8 @@ public:
   // runtime path leaves it null and drains COUT itself.
   void run(HostMonitor* monitor = nullptr, CoutDrainer* cout_drainer = nullptr);
 
-  int dcr_write(uint32_t addr, uint32_t value);
+  // `issuer` is the command-processor queue (tenant) that sent the write.
+  int dcr_write(uint32_t addr, uint32_t value, uint32_t issuer = 0);
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
 

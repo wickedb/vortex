@@ -257,6 +257,8 @@ package VX_gpu_pkg;
 
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = `VX_DCR_DATA_BITS;
+    // Command-processor queue = tenant that issued a DCR write (authorship).
+    localparam VX_DCR_ISSUER_WIDTH = `VX_DCR_ISSUER_BITS;
 
 `ifdef VX_DBG_STALL_TIMEOUT
     localparam STALL_TIMEOUT = `VX_DBG_STALL_TIMEOUT;

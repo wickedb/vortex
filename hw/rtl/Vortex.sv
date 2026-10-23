@@ -40,6 +40,9 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     input  wire                             dcr_req_rw,
     input  wire [VX_DCR_ADDR_WIDTH-1:0]     dcr_req_addr,
     input  wire [VX_DCR_DATA_WIDTH-1:0]     dcr_req_data,
+    // The command-processor queue (tenant) the DCR write came from. Only the
+    // checker's setup path reads it (authorship); tie to 0 with one queue.
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0]   dcr_req_issuer,
 
     // DCR read response
     output wire                             dcr_rsp_valid,
@@ -247,6 +250,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .reset          (reset),
             .dcr_bus_if     (chk_dcr_if[i]),
             .dcr_bus_out_if (chk_dcr_if[i+1]),
+            .dcr_issuer     (dcr_req_issuer),
             // The bus carries a BLOCK address; the checker resolves granules
             // from a byte address, as SimX does.
             .req_valid      (mem_bus_if[i].req_valid),
@@ -284,7 +288,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             `UNUSED_PIN (cnt_claims),
             `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
             `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
-            `UNUSED_PIN (cnt_reclaimed)
+            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign)
         );
 
         // Request side: the checker gates what reaches DRAM. Payload fields it
@@ -326,6 +330,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         assign mem_rsp_ready[i] = mem_bus_if[i].rsp_ready;
     end
     assign label_epochs = '0;
+    `UNUSED_VAR (dcr_req_issuer)   // only the checker's setup path reads it
 `endif
 
     wire [`VX_CFG_NUM_CLUSTERS-1:0] per_cluster_busy;

@@ -133,6 +133,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     wire                         dcr_req_rw;
     wire [VX_DCR_ADDR_WIDTH-1:0] dcr_req_addr;
     wire [VX_DCR_DATA_WIDTH-1:0] dcr_req_data;
+    wire [VX_DCR_ISSUER_WIDTH-1:0] dcr_req_issuer;   // command queue (tenant)
     wire                         dcr_rsp_valid;
     wire [VX_DCR_DATA_WIDTH-1:0] dcr_rsp_data;
 
@@ -412,6 +413,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
     assign dcr_req_rw    = cp_gpu_if.dcr_req_rw;
     assign dcr_req_addr  = cp_gpu_if.dcr_req_addr;
     assign dcr_req_data  = cp_gpu_if.dcr_req_data;
+    assign dcr_req_issuer = cp_gpu_if.dcr_req_issuer;
 
     assign cp_gpu_if.dcr_req_ready = 1'b1;          // Vortex DCR always accepts
     assign cp_gpu_if.dcr_rsp_valid = dcr_rsp_valid;
@@ -562,6 +564,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .dcr_req_rw		(dcr_req_rw),
             .dcr_req_addr	(dcr_req_addr),
             .dcr_req_data	(dcr_req_data),
+            .dcr_req_issuer	(dcr_req_issuer),
             .dcr_rsp_valid	(dcr_rsp_valid),
             .dcr_rsp_data	(dcr_rsp_data),
 
@@ -756,6 +759,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .dcr_req_rw     (dcr_req_rw),
             .dcr_req_addr   (dcr_req_addr),
             .dcr_req_data   (dcr_req_data),
+            .dcr_req_issuer (dcr_req_issuer),
 
             .dcr_rsp_valid  (dcr_rsp_valid),
             .dcr_rsp_data   (dcr_rsp_data),

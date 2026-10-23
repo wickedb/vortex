@@ -64,6 +64,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // DCR control surface (staged claims, epoch table, installer).
     VX_dcr_bus_if.slave  dcr_bus_if,
     VX_dcr_bus_if.master dcr_bus_out_if,
+    // The queue (tenant) the current DCR write came from; see VX_checker_dcr.
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0] dcr_issuer,
 
     // Request in (LLC side).
     input  wire                      req_valid,
@@ -130,7 +132,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0] cnt_epoch_bumps,
     output wire [31:0] cnt_rejected,
     output wire [31:0] cnt_aliased,
-    output wire [31:0] cnt_reclaimed
+    output wire [31:0] cnt_reclaimed,
+    output wire [31:0] cnt_foreign
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -157,6 +160,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .reset               (reset),
         .dcr_bus_if          (dcr_bus_if),
         .dcr_bus_out_if      (dcr_bus_out_if),
+        .dcr_issuer          (dcr_issuer),
         .default_header      (default_header),
         .probe_en            (probe_en),
         .probe_buf_id        (probe_buf_id),
@@ -173,7 +177,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .cnt_epoch_bumps     (cnt_epoch_bumps),
         .cnt_rejected        (cnt_rejected),
         .cnt_aliased         (cnt_aliased),
-        .cnt_reclaimed       (cnt_reclaimed)
+        .cnt_reclaimed       (cnt_reclaimed),
+        .cnt_foreign         (cnt_foreign)
     );
 
     // ---------------------------------------------------------------------
@@ -468,8 +473,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                       INSTANCE_ID, cnt_faulted_reads, cnt_dropped_writes);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: setup: dcr_claims=%0d, headers_written=%0d, epoch_bumps=%0d",
                       INSTANCE_ID, cnt_claims, cnt_headers_written, cnt_epoch_bumps);
-            $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d",
-                      INSTANCE_ID, cnt_rejected, cnt_aliased, cnt_reclaimed);
+            $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d, foreign=%0d",
+                      INSTANCE_ID, cnt_rejected, cnt_aliased, cnt_reclaimed, cnt_foreign);
             if (LABEL_MODE != 0)
                 $fdisplay(32'h8000_0002, "CHECKER[%s]: labels: port_passed=%0d", INSTANCE_ID, labeled_passed_r);
             if (fault_overflow)

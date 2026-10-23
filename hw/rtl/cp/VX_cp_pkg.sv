@@ -200,6 +200,76 @@ package VX_cp_pkg;
     return base + (profiled ? 8 : 0);
   endfunction
 
+  // ------------------------------------------------------------------------
+  // Launch shadow (authorship, P1_and_taint_specv2.md D4).
+  //
+  // The launch registers -- the KMU block, and the MMU root under VM -- are
+  // captured per queue by the DCR proxy instead of being written through, and
+  // replayed into the GPU by VX_cp_launch when that queue's launch holds the
+  // KMU. Another queue's writes in between therefore cannot change what a
+  // launch runs. Shadow slot i holds DCR shadow_addr(i); reset values are the
+  // KMU's own (dims, cluster dims and warp steps 1, all else 0), matching
+  // sim/common/cmd_processor.cpp.
+  // ------------------------------------------------------------------------
+
+  localparam int SHADOW_KMU_N = int'(`VX_DCR_KMU_STATE_END) - int'(`VX_DCR_KMU_STATE_BEGIN);
+`ifdef VX_CFG_VM_ENABLE
+  localparam int NUM_SHADOW   = SHADOW_KMU_N + 2;   // + MMU SATP_LO/HI
+`else
+  localparam int NUM_SHADOW   = SHADOW_KMU_N;
+`endif
+  localparam int SHADOW_IDX_W = $clog2(NUM_SHADOW);
+
+  function automatic logic is_shadow_addr(input logic [`VX_DCR_ADDR_BITS-1:0] addr);
+    if (addr >= `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_BEGIN)
+     && addr <  `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_END))
+      return 1'b1;
+`ifdef VX_CFG_VM_ENABLE
+    if (addr == `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_LO)
+     || addr == `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_HI))
+      return 1'b1;
+`endif
+    return 1'b0;
+  endfunction
+
+  function automatic logic [SHADOW_IDX_W-1:0] shadow_index(input logic [`VX_DCR_ADDR_BITS-1:0] addr);
+`ifdef VX_CFG_VM_ENABLE
+    if (addr == `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_LO)) return SHADOW_IDX_W'(SHADOW_KMU_N);
+    if (addr == `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_HI)) return SHADOW_IDX_W'(SHADOW_KMU_N + 1);
+`endif
+    return SHADOW_IDX_W'(addr - `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_BEGIN));
+  endfunction
+
+  function automatic logic [`VX_DCR_ADDR_BITS-1:0] shadow_addr(input logic [SHADOW_IDX_W-1:0] idx);
+`ifdef VX_CFG_VM_ENABLE
+    if (int'(idx) == SHADOW_KMU_N)     return `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_LO);
+    if (int'(idx) == SHADOW_KMU_N + 1) return `VX_DCR_ADDR_BITS'(`VX_DCR_MMU_SATP_HI);
+`endif
+    return `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_BEGIN) + `VX_DCR_ADDR_BITS'(idx);
+  endfunction
+
+  function automatic logic [`VX_DCR_DATA_BITS-1:0] shadow_reset(input int idx);
+    logic [`VX_DCR_ADDR_BITS-1:0] a;
+    a = `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_BEGIN) + `VX_DCR_ADDR_BITS'(idx);
+    case (a)
+      `VX_DCR_KMU_BLOCK_DIM_X,   `VX_DCR_KMU_BLOCK_DIM_Y,   `VX_DCR_KMU_BLOCK_DIM_Z,
+      `VX_DCR_KMU_GRID_DIM_X,    `VX_DCR_KMU_GRID_DIM_Y,    `VX_DCR_KMU_GRID_DIM_Z,
+      `VX_DCR_KMU_CLUSTER_DIM_X, `VX_DCR_KMU_CLUSTER_DIM_Y, `VX_DCR_KMU_CLUSTER_DIM_Z,
+      `VX_DCR_KMU_WARP_STEP_X,   `VX_DCR_KMU_WARP_STEP_Y,   `VX_DCR_KMU_WARP_STEP_Z:
+        return (idx < SHADOW_KMU_N) ? `VX_DCR_DATA_BITS'(1) : '0;
+      default:
+        return '0;
+    endcase
+  endfunction
+
+  // The checker's configuration window. Reads of it are refused (answered
+  // with 0 and counted) unless the build sets VX_CFG_CHECKER_DEBUG_READS:
+  // per-owner state must not be readable by other tenants (spec D5).
+  function automatic logic is_checker_addr(input logic [`VX_DCR_ADDR_BITS-1:0] addr);
+    return (addr >= `VX_DCR_ADDR_BITS'(`VX_DCR_CHECKER_STATE_BEGIN))
+        && (addr <  `VX_DCR_ADDR_BITS'(`VX_DCR_CHECKER_STATE_END));
+  endfunction
+
 endpackage : VX_cp_pkg
 
 `IGNORE_UNUSED_END

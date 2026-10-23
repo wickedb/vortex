@@ -20,6 +20,18 @@
 //      into last_rsp_data and visible while done pulses.
 //   4. Back-to-back write→read: FSM re-arms cleanly.
 //   5. WAIT_RSP hangs if rsp_valid never arrives (no spurious done).
+// Authorship (P1_and_taint_specv2.md D2, D4, D5):
+//   6. The request carries the granted queue as its issuer; idle is low
+//      while a command is in flight; rsp_update/cur_q name the reading queue.
+//   7. A write to a launch register goes to the issuing queue's shadow: one
+//      shadow_wr pulse in the grant cycle with the slot and data, and no DCR
+//      bus request at all.
+//   8. A read of a launch register is answered from the shadow (the
+//      shadow_rd_data the core supplies for that slot), with no bus request.
+//   9. A read of the checker window is refused: no bus request, one blocked
+//      pulse, response 0.
+//  10. A write to the checker window is NOT refused: it reaches the bus with
+//      its issuer (the checker judges it).
 // ============================================================================
 
 #include "vl_simulator.h"
@@ -95,6 +107,8 @@ int main(int argc, char** argv) {
 
     // Initial state.
     sim->grant         = 0;
+    sim->grant_q       = 0;
+    sim->shadow_rd_data = 0;
     sim->dcr_rsp_valid = 0;
     sim->dcr_rsp_data  = 0;
     set_cmd(sim.operator->(), 0);
@@ -192,6 +206,98 @@ int main(int argc, char** argv) {
     sim->grant = 0;
     sim->eval();
     EXPECT(sim->done == 1, "re-arm: done not asserted");
+    cycle(sim, tick);
+
+    // ----- Test 6: the issuer is the granted queue. -----
+    set_cmd(sim.operator->(), OP_DCR_WRITE, 0x123, 0x11112222);
+    sim->grant   = 1;
+    sim->grant_q = 2;
+    sim->eval();
+    EXPECT(sim->idle == 1, "issuer: idle should be high before the grant edge");
+    cycle(sim, tick);
+    sim->grant   = 0;
+    sim->grant_q = 1;                          // later grant_q must not matter
+    sim->eval();
+    EXPECT(sim->idle == 0,           "issuer: idle must drop while a command is in flight");
+    EXPECT(sim->dcr_req_valid == 1,  "issuer: req_valid not asserted");
+    EXPECT(sim->dcr_req_issuer == 2, "issuer: request must carry the granted queue");
+    EXPECT(sim->cur_q == 2,          "issuer: cur_q must be the granted queue");
+    cycle(sim, tick);
+    sim->eval();
+    EXPECT(sim->done == 1 && sim->rsp_update == 0, "issuer: a write updates no response");
+    cycle(sim, tick);
+
+    // ----- Test 7: a launch-register write is captured, not sent. -----
+    constexpr uint32_t ARG0 = 0x014;           // VX_DCR_KMU_STARTUP_ARG0
+    constexpr uint32_t ARG0_SLOT = ARG0 - 0x010;
+    set_cmd(sim.operator->(), OP_DCR_WRITE, ARG0, 0xA5A5F00D);
+    sim->grant   = 1;
+    sim->grant_q = 3;
+    sim->eval();
+    EXPECT(sim->shadow_wr == 1,              "shadow: no shadow_wr pulse in the grant cycle");
+    EXPECT(sim->shadow_idx == ARG0_SLOT,     "shadow: wrong slot");
+    EXPECT(sim->shadow_wr_data == 0xA5A5F00D,"shadow: wrong data");
+    EXPECT(sim->dcr_req_valid == 0,          "shadow: launch register must not reach the bus");
+    cycle(sim, tick);
+    sim->grant = 0;
+    sim->eval();
+    EXPECT(sim->shadow_wr == 0,     "shadow: shadow_wr must be one cycle");
+    EXPECT(sim->dcr_req_valid == 0, "shadow: no request after the capture");
+    EXPECT(sim->done == 1,          "shadow: captured write should retire next cycle");
+    cycle(sim, tick);
+    sim->eval();
+    EXPECT(sim->done == 0 && sim->idle == 1, "shadow: back to idle");
+
+    // ----- Test 8: a launch-register read is answered from the shadow. -----
+    set_cmd(sim.operator->(), OP_DCR_READ, ARG0, 0);
+    sim->grant   = 1;
+    sim->grant_q = 1;
+    sim->eval();
+    EXPECT(sim->shadow_idx == ARG0_SLOT, "shadow read: wrong slot looked up");
+    sim->shadow_rd_data = 0x0BADCAFE;
+    sim->eval();
+    EXPECT(sim->dcr_req_valid == 0, "shadow read: must not reach the bus");
+    cycle(sim, tick);
+    sim->grant = 0;
+    sim->shadow_rd_data = 0;
+    sim->eval();
+    EXPECT(sim->dcr_req_valid == 0,          "shadow read: no request");
+    EXPECT(sim->done == 1,                   "shadow read: should retire next cycle");
+    EXPECT(sim->rsp_update == 1,             "shadow read: response must update");
+    EXPECT(sim->cur_q == 1,                  "shadow read: response is for the reading queue");
+    EXPECT(sim->last_rsp_data == 0x0BADCAFE, "shadow read: wrong value");
+    cycle(sim, tick);
+
+    // ----- Test 9: a checker-window read is refused. -----
+    set_cmd(sim.operator->(), OP_DCR_READ, 0x306, 0);   // VX_DCR_CHECKER_EPOCH
+    sim->grant   = 1;
+    sim->grant_q = 2;
+    sim->eval();
+    EXPECT(sim->blocked == 1,       "refused read: no blocked pulse");
+    EXPECT(sim->dcr_req_valid == 0, "refused read: must not reach the bus");
+    cycle(sim, tick);
+    sim->grant = 0;
+    sim->eval();
+    EXPECT(sim->blocked == 0,        "refused read: blocked must be one cycle");
+    EXPECT(sim->dcr_req_valid == 0,  "refused read: no request");
+    EXPECT(sim->done == 1,           "refused read: should retire next cycle");
+    EXPECT(sim->last_rsp_data == 0,  "refused read: response must be 0");
+    cycle(sim, tick);
+
+    // ----- Test 10: a checker-window write reaches the bus. -----
+    set_cmd(sim.operator->(), OP_DCR_WRITE, 0x305, 1);  // VX_DCR_CHECKER_BUF_COMMIT
+    sim->grant   = 1;
+    sim->grant_q = 3;
+    sim->eval();
+    EXPECT(sim->blocked == 0 && sim->shadow_wr == 0, "checker write: not refused, not shadowed");
+    cycle(sim, tick);
+    sim->grant = 0;
+    sim->eval();
+    EXPECT(sim->dcr_req_valid == 1 && sim->dcr_req_addr == 0x305, "checker write: must reach the bus");
+    EXPECT(sim->dcr_req_issuer == 3, "checker write: must carry its issuer");
+    cycle(sim, tick);
+    sim->eval();
+    EXPECT(sim->done == 1, "checker write: done");
     cycle(sim, tick);
 
     std::printf("PASSED\n");

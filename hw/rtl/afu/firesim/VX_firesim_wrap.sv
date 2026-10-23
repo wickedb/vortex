@@ -140,6 +140,8 @@ module VX_firesim_wrap import VX_gpu_pkg::*; #(
         .dcr_req_rw     (dcr_req_rw),
         .dcr_req_addr   (dcr_req_addr),
         .dcr_req_data   (dcr_req_data),
+        // FireSim's DCR bridge carries no issuer: every write is queue 0's.
+        .dcr_req_issuer ('0),
 
         .dcr_rsp_valid  (dcr_rsp_valid),
         .dcr_rsp_data   (dcr_rsp_data),

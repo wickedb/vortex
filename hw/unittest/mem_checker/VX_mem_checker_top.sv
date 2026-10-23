@@ -23,6 +23,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      dcr_wr_valid,
     input  wire [11:0]               dcr_wr_addr,
     input  wire [31:0]               dcr_wr_data,
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0] dcr_wr_issuer,   // queue (tenant) of the write
 
     // request in
     input  wire                      req_valid,
@@ -73,7 +74,8 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0] cnt_epoch_bumps,
     output wire [31:0] cnt_rejected,
     output wire [31:0] cnt_aliased,
-    output wire [31:0] cnt_reclaimed
+    output wire [31:0] cnt_reclaimed,
+    output wire [31:0] cnt_foreign
 );
     VX_dcr_bus_if dcr_in_if();
     VX_dcr_bus_if dcr_out_if();
@@ -104,6 +106,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .reset               (reset),
         .dcr_bus_if          (dcr_in_if),
         .dcr_bus_out_if      (dcr_out_if),
+        .dcr_issuer          (dcr_wr_issuer),
         .req_valid           (req_valid),
         .req_rw              (req_rw),
         .req_addr            (req_addr),
@@ -144,7 +147,8 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .cnt_epoch_bumps     (cnt_epoch_bumps),
         .cnt_rejected        (cnt_rejected),
         .cnt_aliased         (cnt_aliased),
-        .cnt_reclaimed       (cnt_reclaimed)
+        .cnt_reclaimed       (cnt_reclaimed),
+        .cnt_foreign         (cnt_foreign)
     );
 
 endmodule

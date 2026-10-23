@@ -29,9 +29,17 @@
 // every CP module and AFU wrapper resolves them during preprocessing.
 // The `ifndef guards allow any value to be overridden via -D flags.
 // ----------------------------------------------------------------------
+// One queue per tenant when the checker is built: the queue a setup command
+// arrives on is the tenant it is attributed to (authorship).
 `ifndef VX_CP_NUM_QUEUES
+`ifdef VX_CFG_CHECKER_ENABLE
+`define VX_CP_NUM_QUEUES `VX_CFG_CHECKER_TENANTS
+`else
 `define VX_CP_NUM_QUEUES 1
 `endif
+`endif
+// Width of a DCR write's issuer: the queue (tenant) it came from.
+`define VX_DCR_ISSUER_BITS `UP(`CLOG2(`VX_CFG_CHECKER_TENANTS))
 `ifndef VX_CP_RING_SIZE_LOG2
 `define VX_CP_RING_SIZE_LOG2 16   // 64 KiB per queue ring
 `endif

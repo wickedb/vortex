@@ -47,35 +47,52 @@ static void expect(bool ok, const char* what) {
 
 static void tick(uint32_t n = 1) { timestamp = sim.step(timestamp, 2 * n); }
 
-// One DCR write. Held for a cycle, like the real bus (fire-and-forget, no ready).
-static void dcr(uint32_t addr, uint32_t data) {
-  sim->dcr_wr_valid = 1;
-  sim->dcr_wr_addr  = addr;
-  sim->dcr_wr_data  = data;
+// One DCR write from `issuer`, the command queue (tenant) it came from. Held
+// for a cycle, like the real bus (fire-and-forget, no ready).
+static void dcr(uint32_t addr, uint32_t data, uint32_t issuer) {
+  sim->dcr_wr_valid  = 1;
+  sim->dcr_wr_addr   = addr;
+  sim->dcr_wr_data   = data;
+  sim->dcr_wr_issuer = issuer;
   tick();
   sim->dcr_wr_valid = 0;
   tick();
 }
 
-// The 7-write staged claim, exactly as the host issues it.
-static void claim(uint64_t base, uint64_t size, uint32_t owner,
-                  uint32_t perms, uint32_t shared, uint32_t epoch) {
-  dcr(VX_DCR_CHECKER_BUF_BASE,   (uint32_t)base);
-  dcr(VX_DCR_CHECKER_BUF_SIZE,   (uint32_t)size);
-  dcr(VX_DCR_CHECKER_BUF_OWNER,  owner);
-  dcr(VX_DCR_CHECKER_BUF_PERMS,  perms);
-  dcr(VX_DCR_CHECKER_BUF_SHARED, shared);
-  dcr(VX_DCR_CHECKER_BUF_EPOCH,  epoch);
-  dcr(VX_DCR_CHECKER_BUF_COMMIT, 1);
+// Stage a claim from `issuer` without committing it.
+static void stage(uint64_t base, uint64_t size, uint32_t owner, uint32_t perms,
+                  uint32_t shared, uint32_t epoch, uint32_t issuer) {
+  dcr(VX_DCR_CHECKER_BUF_BASE,   (uint32_t)base, issuer);
+  dcr(VX_DCR_CHECKER_BUF_SIZE,   (uint32_t)size, issuer);
+  dcr(VX_DCR_CHECKER_BUF_OWNER,  owner,          issuer);
+  dcr(VX_DCR_CHECKER_BUF_PERMS,  perms,          issuer);
+  dcr(VX_DCR_CHECKER_BUF_SHARED, shared,         issuer);
+  dcr(VX_DCR_CHECKER_BUF_EPOCH,  epoch,          issuer);
+}
+
+static void commit(uint32_t issuer) {
+  dcr(VX_DCR_CHECKER_BUF_COMMIT, 1, issuer);
   // The installer walks the granule range over several cycles; let it drain.
   for (int i = 0; i < 64 && sim->req_ready == 0; ++i) tick();
   tick(4);
 }
 
-// The 2-write scoped revoke. No header is touched.
-static void revoke(uint32_t owner, uint32_t new_epoch) {
-  dcr(VX_DCR_CHECKER_REVOKE_OWNER, owner);
-  dcr(VX_DCR_CHECKER_EPOCH,        new_epoch);
+// The 7-write staged claim, exactly as the host issues it, from the owner's
+// own queue unless `issuer` says otherwise.
+static void claim(uint64_t base, uint64_t size, uint32_t owner,
+                  uint32_t perms, uint32_t shared, uint32_t epoch,
+                  int issuer = -1) {
+  const uint32_t iss = (issuer < 0) ? owner : uint32_t(issuer);
+  stage(base, size, owner, perms, shared, epoch, iss);
+  commit(iss);
+}
+
+// The scoped revoke: one EPOCH write from the owner's queue. No header is
+// touched. REVOKE_OWNER is retired; writing it (with any value) is ignored.
+static void revoke(uint32_t owner, uint32_t new_epoch, int issuer = -1) {
+  const uint32_t iss = (issuer < 0) ? owner : uint32_t(issuer);
+  dcr(VX_DCR_CHECKER_REVOKE_OWNER, owner, iss);
+  dcr(VX_DCR_CHECKER_EPOCH,        new_epoch, iss);
   tick(2);
 }
 
@@ -164,11 +181,16 @@ int main(int argc, char** argv) {
   revoke(0, 2);                                     // bump owner 0 again
   expect(!access(B, false, 0), "owner 0's revoke did NOT touch owner 1's grant");
 
-  // ---- 8. a bare EPOCH write with nothing staged is a no-op (fails closed)
-  dcr(VX_DCR_CHECKER_REVOKE_OWNER, VX_CHECKER_OWNER_ANY);
-  dcr(VX_DCR_CHECKER_EPOCH, 99);
-  tick(2);
-  expect(!access(B, false, 0), "unstaged EPOCH write is a no-op, grant intact");
+  // ---- 8. an EPOCH write from a queue that is no owner is a no-op (fails
+  //      closed). REVOKE_OWNER is retired: naming owner 1 there changes nothing.
+  {
+    const uint32_t bumps = sim->cnt_epoch_bumps;
+    dcr(VX_DCR_CHECKER_REVOKE_OWNER, /*owner*/1, /*issuer*/3);
+    dcr(VX_DCR_CHECKER_EPOCH, 99, /*issuer*/3);
+    tick(2);
+    expect(sim->cnt_epoch_bumps == bumps, "EPOCH from a non-owner queue bumps nothing");
+    expect(!access(B, false, 0), "EPOCH from a non-owner queue is a no-op, grant intact");
+  }
 
   // ---- 9. granule exclusivity: a cross-owner claim is refused WHOLE (§10 #4a)
   // This is the invariant the per-sector writer tag depends on: one writer id
@@ -259,14 +281,87 @@ int main(int argc, char** argv) {
   expect(sim->cnt_aliased == 0,
          "no aliased claims at the design point (TAG_W=0, collision impossible)");
 
+  // ---- Authorship (P1_and_taint_specv2.md D1-D3) ----
+  // A tenant claims only for itself, stages into its own registers, and
+  // revokes only its own grants.
+  {
+    const uint32_t RW = VX_CHECKER_PERM_R | VX_CHECKER_PERM_W;
+    const uint64_t E = 32 * GRANULE;   // owner 0's, private
+    const uint64_t F = 36 * GRANULE;   // owner 0's, granted R to non-owners
+    const uint64_t G = 40 * GRANULE;
+    const uint64_t H = 44 * GRANULE;
+    const uint32_t foreign0 = sim->cnt_foreign;
+
+    claim(E, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY);
+    expect(access(E, false, 1), "auth: owner 1 denied owner 0's private buffer");
+
+    // A1. Owner 1 re-claims E *as owner 0*, opening it to non-owners.
+    claim(E, GRANULE, /*owner*/0, RW, VX_CHECKER_PERM_R, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/1);
+    expect(sim->cnt_foreign == foreign0 + 1, "auth: a claim naming another owner is counted foreign");
+    expect(access(E, false, 1), "auth: the foreign re-grant installed nothing");
+    expect(!access(E, false, 0), "auth: owner 0 keeps its access");
+
+    // A2. A claim for OWNER_ANY (everyone) is foreign too.
+    claim(G, GRANULE, VX_CHECKER_OWNER_ANY, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/0);
+    expect(sim->cnt_foreign == foreign0 + 2, "auth: an OWNER_ANY claim is foreign");
+
+    // A3. An issuer that names no core (2-core build: owners 0 and 1) cannot
+    //     claim, even for itself: its id would truncate onto another owner's.
+    claim(G, GRANULE, /*owner*/3, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/3);
+    expect(sim->cnt_foreign == foreign0 + 3, "auth: an issuer with no core cannot claim");
+    expect(!access(G, false, 1), "auth: G stayed unclaimed");
+
+    // A4. Staging is per issuer: owner 1 stages and commits H between owner
+    //     0's staging of G and owner 0's commit.
+    stage(G, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, 0);
+    claim(H, GRANULE, 1, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, 1);
+    commit(0);
+    expect(access(G, false, 1),  "auth: owner 0's interleaved claim landed on G");
+    expect(!access(G, false, 0), "auth: G is owner 0's");
+    expect(access(H, false, 0),  "auth: H is owner 1's");
+    expect(!access(H, false, 1), "auth: owner 1 owns H");
+
+    // A4b. Back-to-back COMMITs from two tenants, two cycles apart, each
+    //      followed at once by a staging write that must not alter the claim
+    //      it already committed. The DCR bus cannot stall, so the second
+    //      COMMIT arrives while the first claim is installing.
+    {
+      const uint64_t I = 48 * GRANULE, J = 52 * GRANULE, K = 56 * GRANULE;
+      stage(I, GRANULE, 1, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, 1);
+      stage(J, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, 0);
+      dcr(VX_DCR_CHECKER_BUF_COMMIT, 1, 1);
+      dcr(VX_DCR_CHECKER_BUF_BASE, (uint32_t)K, 1);   // after its commit: must not move I
+      dcr(VX_DCR_CHECKER_BUF_COMMIT, 1, 0);
+      dcr(VX_DCR_CHECKER_BUF_BASE, (uint32_t)K, 0);   // likewise for J
+      for (int i = 0; i < 256 && sim->req_ready == 0; ++i) tick();
+      tick(4);
+      expect(access(I, false, 0),  "auth: back-to-back COMMIT: I landed as owner 1's");
+      expect(!access(I, false, 1), "auth: back-to-back COMMIT: owner 1 owns I");
+      expect(access(J, false, 1),  "auth: back-to-back COMMIT: J landed as owner 0's");
+      expect(!access(J, false, 0), "auth: back-to-back COMMIT: owner 0 owns J");
+      expect(!access(K, false, 1) && !access(K, false, 0),
+             "auth: a staging write after COMMIT did not retarget the claim");
+    }
+
+    // A5. Owner 1 cannot revoke owner 0's grant: an EPOCH write advances the
+    //     issuer's own epoch, whatever REVOKE_OWNER says.
+    claim(F, GRANULE, 0, RW, VX_CHECKER_PERM_R, /*grant_epoch*/100);
+    expect(!access(F, false, 1), "auth: owner 0's grant to non-owners is live");
+    revoke(/*owner*/0, 200, /*issuer*/1);
+    expect(!access(F, false, 1), "auth: owner 1 could not revoke owner 0's grant");
+    revoke(0, 200);
+    expect(access(F, false, 1),  "auth: owner 0 revokes its own grant");
+  }
+
   std::printf("\ncounters: reqs=%u checked=%u bypassed=%u allow=%u deny=%u\n",
               (unsigned)sim->cnt_reqs, (unsigned)sim->cnt_checked,
               (unsigned)sim->cnt_bypassed, (unsigned)sim->cnt_allows,
               (unsigned)sim->cnt_denies);
-  std::printf("setup   : claims=%u written=%u bumps=%u rejected=%u aliased=%u reclaimed=%u\n",
+  std::printf("setup   : claims=%u written=%u bumps=%u rejected=%u aliased=%u reclaimed=%u foreign=%u\n",
               (unsigned)sim->cnt_claims, (unsigned)sim->cnt_headers_written,
               (unsigned)sim->cnt_epoch_bumps, (unsigned)sim->cnt_rejected,
-              (unsigned)sim->cnt_aliased, (unsigned)sim->cnt_reclaimed);
+              (unsigned)sim->cnt_aliased, (unsigned)sim->cnt_reclaimed,
+              (unsigned)sim->cnt_foreign);
 
   if (errors) {
     std::printf("\n%d/%d checks FAILED\n", errors, checks);

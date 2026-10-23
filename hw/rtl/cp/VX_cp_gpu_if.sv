@@ -26,6 +26,9 @@ interface VX_cp_gpu_if;
   logic                          dcr_req_rw;
   logic [`VX_DCR_ADDR_BITS-1:0] dcr_req_addr;
   logic [`VX_DCR_DATA_BITS-1:0] dcr_req_data;
+  // The queue (tenant) the request is issued for: the command's queue, or
+  // the launching queue during a launch-shadow replay (authorship).
+  logic [`VX_DCR_ISSUER_BITS-1:0] dcr_req_issuer;
   logic                          dcr_req_ready;
 
   // DCR response (Vortex master)
@@ -37,13 +40,13 @@ interface VX_cp_gpu_if;
   logic busy;
 
   modport master (
-    output dcr_req_valid, dcr_req_rw, dcr_req_addr, dcr_req_data,
+    output dcr_req_valid, dcr_req_rw, dcr_req_addr, dcr_req_data, dcr_req_issuer,
     input  dcr_req_ready, dcr_rsp_valid, dcr_rsp_data, busy,
     output start
   );
 
   modport slave (
-    input  dcr_req_valid, dcr_req_rw, dcr_req_addr, dcr_req_data,
+    input  dcr_req_valid, dcr_req_rw, dcr_req_addr, dcr_req_data, dcr_req_issuer,
     output dcr_req_ready, dcr_rsp_valid, dcr_rsp_data, busy,
     input  start
   );

@@ -29,6 +29,20 @@
 // NOP retires without bidding for any resource, so this exercises the
 // regfile → fetch → unpack → engine → completion path without touching
 // the launch or DMA paths.
+//
+// Then authorship across two queues (P1_and_taint_specv2.md D1-D5), each
+// queue with its own ring:
+//   A. Both queues post DCR writes at once. Every write reaches the GPU
+//      exactly once, tagged with its own queue as issuer. (A resource that
+//      granted a second queue while busy used to retire that queue's command
+//      without executing it.)
+//   B. Queue 1 writes a launch register; queue 0 writes the same register and
+//      launches. Queue 1's write never reaches the GPU; queue 0's launch
+//      replays queue 0's value (issuer 0) before start; queue 1's later launch
+//      replays queue 1's value (issuer 1).
+//   C. Queue 1 reads the checker window: refused (no GPU request, response 0,
+//      Q_DCR_BLOCKED = 1). Queue 0 reads a normal DCR: the GPU answers, and
+//      each queue keeps its own Q_LAST_DCR_RSP.
 // ============================================================================
 
 #include "vl_simulator.h"
@@ -38,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifndef TRACE_START_TIME
 #define TRACE_START_TIME 0ull
@@ -153,21 +168,32 @@ struct AxiSlave {
 };
 
 // ============================================================================
-// Synthetic gpu_if model. Pulses dcr_req_ready always; pulses busy for
-// a few cycles after start. dcr_rsp is unused in this NOP test.
+// Synthetic gpu_if model. Always ready; records every DCR request it accepts
+// (and every start, in the same log, as addr 0xFFF); answers a read one cycle
+// later with 0x1000 + addr; pulses busy for a few cycles after start.
 // ============================================================================
 struct GpuModel {
-    int busy_cnt = 0;
+    struct Req { bool rw; uint32_t addr, data, issuer; };
+    std::vector<Req> log;
+    int  busy_cnt  = 0;
+    bool rsp_pend  = false;
+    uint32_t rsp_data = 0;
     template <typename T>
     void comb_drive(T* top) {
         top->gpu_dcr_req_ready = 1;
-        top->gpu_dcr_rsp_valid = 0;
-        top->gpu_dcr_rsp_data  = 0;
+        top->gpu_dcr_rsp_valid = rsp_pend;
+        top->gpu_dcr_rsp_data  = rsp_data;
         top->gpu_busy = (busy_cnt > 0);
     }
     template <typename T>
     void posedge_update(T* top) {
-        if (top->gpu_start) busy_cnt = 4;
+        rsp_pend = false;
+        if (top->gpu_dcr_req_valid && top->gpu_dcr_req_ready) {
+            log.push_back({bool(top->gpu_dcr_req_rw), uint32_t(top->gpu_dcr_req_addr),
+                           uint32_t(top->gpu_dcr_req_data), uint32_t(top->gpu_dcr_req_issuer)});
+            if (!top->gpu_dcr_req_rw) { rsp_pend = true; rsp_data = 0x1000u + top->gpu_dcr_req_addr; }
+        }
+        if (top->gpu_start) { busy_cnt = 4; log.push_back({true, 0xFFF, 0, 0}); }
         else if (busy_cnt > 0) busy_cnt--;
     }
 };
@@ -266,7 +292,7 @@ int main(int argc, char** argv) {
     // Sanity: CP_DEV_CAPS readable.
     {
         uint32_t v = axil_read(sim, slave, gpu, tick, CP_DEV_CAPS);
-        EXPECT((v & 0xff) == 1, "DEV_CAPS NUM_QUEUES");
+        EXPECT((v & 0xff) == 2, "DEV_CAPS NUM_QUEUES");
     }
 
     // ----- Seed memory: a single NOP+F_PROFILE at ring_base -----
@@ -363,7 +389,149 @@ int main(int argc, char** argv) {
         EXPECT((ctrl_after & 1) == 0, "Q_CONTROL.reset did not clear enable");
     }
 
+    // ======================================================================
+    // Authorship across two queues.
+    // ======================================================================
+    constexpr uint64_t RING[2] = {AxiSlave::MEM_BASE + 0x0000, AxiSlave::MEM_BASE + 0x1000};
+    constexpr uint64_t CMPL[2] = {AxiSlave::MEM_BASE + 0x3000, AxiSlave::MEM_BASE + 0x3100};
+    uint64_t tail[2] = {0, 0};
+    auto qreg = [](int q, uint16_t off) { return uint16_t(Q0_BASE + q * 0x40 + off); };
+    for (int q = 0; q < 2; ++q) {
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_RING_BASE_LO), uint32_t(RING[q]));
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_RING_BASE_HI), uint32_t(RING[q] >> 32));
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_CMPL_ADDR_LO), uint32_t(CMPL[q]));
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_CMPL_ADDR_HI), uint32_t(CMPL[q] >> 32));
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_RING_SIZE_LOG2), 12);
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_CONTROL), 1u | (2u << 2));
+    }
+
+    // One ring cache line holding up to four commands; returns how many.
+    struct Cmd { uint8_t op; uint64_t a0, a1; };
+    auto put_cl = [&](int q, std::vector<Cmd> cmds) {
+        uint8_t cl[64];
+        std::memset(cl, 0, sizeof(cl));
+        int off = 0;
+        for (auto& c : cmds) {
+            const int sz = (c.op == 0x06) ? 12 : 20;   // LAUNCH : DCR_WRITE/READ
+            cl[off] = c.op;
+            for (int i = 0; i < 8; ++i) cl[off + 4 + i]  = uint8_t(c.a0 >> (8 * i));
+            if (sz == 20)
+                for (int i = 0; i < 8; ++i) cl[off + 12 + i] = uint8_t(c.a1 >> (8 * i));
+            off += sz;
+        }
+        EXPECT(off <= 64, "test bug: too many commands for one line");
+        slave.mem_write_cl(RING[q] + tail[q], cl);
+        tail[q] += 64;
+    };
+    auto doorbell = [&](int q) {
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_TAIL_LO), uint32_t(tail[q]));
+        axil_write(sim, slave, gpu, tick, qreg(q, Q_TAIL_HI), uint32_t(tail[q] >> 32));
+    };
+    auto wait_seq = [&](int q, uint32_t target) {
+        for (int g = 0; g < 4000; ++g) {
+            if (axil_read(sim, slave, gpu, tick, qreg(q, Q_SEQNUM)) >= target) return;
+            for (int i = 0; i < 4; ++i) cycle(sim, slave, gpu, tick);
+        }
+        EXPECT(false, "queue did not retire its commands");
+    };
+    constexpr uint8_t OP_WR = 0x04, OP_RD = 0x05, OP_LAUNCH = 0x06;
+    constexpr uint32_t ARG0 = 0x014;   // VX_DCR_KMU_STARTUP_ARG0 (a launch register)
+
+    // ----- A. concurrent DCR writes from both queues -----
+    gpu.log.clear();
+    put_cl(0, {{OP_WR, 0x120, 0xA0}, {OP_WR, 0x121, 0xA1}, {OP_WR, 0x122, 0xA2}});
+    put_cl(1, {{OP_WR, 0x130, 0xB0}, {OP_WR, 0x131, 0xB1}, {OP_WR, 0x132, 0xB2}});
+    // Release both queues with one write, so they fetch, decode and bid for
+    // the DCR proxy in the same cycles.
+    axil_write(sim, slave, gpu, tick, CP_CTRL, 0);
+    doorbell(0);
+    doorbell(1);
+    axil_write(sim, slave, gpu, tick, CP_CTRL, 1);
+    wait_seq(0, 3);
+    wait_seq(1, 3);
+    {
+        int seen[2][3] = {{0}};
+        for (auto& r : gpu.log) {
+            EXPECT(r.rw, "A: unexpected read");
+            const int q = (r.addr >= 0x130) ? 1 : 0;
+            const int i = int(r.addr - (q ? 0x130 : 0x120));
+            EXPECT(i >= 0 && i < 3, "A: unexpected address");
+            EXPECT(r.data == uint32_t((q ? 0xB0 : 0xA0) + i), "A: wrong data");
+            EXPECT(r.issuer == uint32_t(q), "A: write tagged with the wrong issuer");
+            ++seen[q][i];
+        }
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 3; ++i)
+                EXPECT(seen[q][i] == 1, "A: a write was lost or duplicated");
+    }
+
+    // ----- B. launch registers are per queue -----
+    gpu.log.clear();
+    put_cl(1, {{OP_WR, ARG0, 0xBAD0BAD0}});
+    doorbell(1);
+    wait_seq(1, 4);
+    put_cl(0, {{OP_WR, ARG0, 0x600D600D}, {OP_LAUNCH, 0, 0}});
+    doorbell(0);
+    wait_seq(0, 5);
+    {
+        int start_at = -1;
+        for (size_t k = 0; k < gpu.log.size(); ++k)
+            if (gpu.log[k].addr == 0xFFF) { start_at = int(k); break; }
+        EXPECT(start_at > 0, "B: queue 0's launch never started");
+        bool replayed = false;
+        for (int k = 0; k < start_at; ++k) {
+            const auto& r = gpu.log[k];
+            EXPECT(r.data != 0xBAD0BAD0, "B: queue 1's launch register reached the GPU");
+            if (r.addr == ARG0) {
+                EXPECT(r.data == 0x600D600D, "B: queue 0's launch ran on another value");
+                EXPECT(r.issuer == 0, "B: replay not tagged with the launching queue");
+                replayed = true;
+            }
+        }
+        EXPECT(replayed, "B: queue 0's launch registers were not replayed before start");
+    }
+    gpu.log.clear();
+    put_cl(1, {{OP_LAUNCH, 0, 0}});
+    doorbell(1);
+    wait_seq(1, 5);
+    {
+        bool replayed = false;
+        for (auto& r : gpu.log) {
+            if (r.addr == 0xFFF) break;
+            if (r.addr == ARG0) {
+                EXPECT(r.data == 0xBAD0BAD0, "B: queue 1's launch did not run on its own value");
+                EXPECT(r.issuer == 1, "B: replay not tagged with queue 1");
+                replayed = true;
+            }
+        }
+        EXPECT(replayed, "B: queue 1's launch registers were not replayed");
+    }
+
+    // ----- C. checker-window reads refused; responses per queue -----
+    gpu.log.clear();
+    put_cl(1, {{OP_RD, 0x306, 0}});            // VX_DCR_CHECKER_EPOCH
+    doorbell(1);
+    wait_seq(1, 6);
+    put_cl(0, {{OP_RD, 0x0A0, 0}});
+    doorbell(0);
+    wait_seq(0, 6);
+    {
+        bool saw_checker = false, saw_a0 = false;
+        for (auto& r : gpu.log) {
+            if (r.addr == 0x306) saw_checker = true;
+            if (r.addr == 0x0A0 && !r.rw) saw_a0 = true;
+        }
+        EXPECT(!saw_checker, "C: the checker-window read reached the GPU");
+        EXPECT(saw_a0, "C: queue 0's read never reached the GPU");
+        EXPECT(axil_read(sim, slave, gpu, tick, qreg(1, 0x34)) == 1, "C: queue 1's Q_DCR_BLOCKED");
+        EXPECT(axil_read(sim, slave, gpu, tick, qreg(0, 0x34)) == 0, "C: queue 0's Q_DCR_BLOCKED");
+        EXPECT(axil_read(sim, slave, gpu, tick, qreg(1, 0x30)) == 0, "C: refused read must answer 0");
+        EXPECT(axil_read(sim, slave, gpu, tick, qreg(0, 0x30)) == 0x10A0, "C: queue 0's response");
+    }
+
     std::printf("PASSED — CP end-to-end: NOP retired, seqnum written to "
-                "cmpl_addr, Q_CONTROL.reset clears the queue\n");
+                "cmpl_addr, Q_CONTROL.reset clears the queue; two queues: "
+                "issuer tagging, no lost commands, per-queue launch registers, "
+                "checker-window reads refused\n");
     return 0;
 }

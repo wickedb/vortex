@@ -135,6 +135,10 @@ module VX_cp_core
   logic cp_error;
 
   wire [`VX_DCR_DATA_BITS-1:0] dcr_last_rsp_data;
+  // Per-queue Q_LAST_DCR_RSP and Q_DCR_BLOCKED: a queue's read result must not
+  // be overwritten by another queue's read before its host collects it.
+  logic [`VX_DCR_DATA_BITS-1:0] q_last_rsp [NUM_QUEUES];
+  logic [31:0]                  q_blocked  [NUM_QUEUES];
 
   // Queue-reset plumbing (used by the regfile port map directly below and by
   // the g_queue_reset block; declared BEFORE first use -- Vivado mints 1-bit
@@ -159,7 +163,8 @@ module VX_cp_core
     .q_head         (q_head_to_reg),
     .q_seqnum       (q_seqnum_to_reg),
     .q_error        (q_error_to_reg),
-    .last_dcr_rsp   (dcr_last_rsp_data),
+    .last_dcr_rsp   (q_last_rsp),
+    .dcr_blocked    (q_blocked),
     .q_state        (q_state),
     .q_reset_pulse  (q_reset_pulse),
     .q_clear_ack    (q_clear),
@@ -228,8 +233,9 @@ module VX_cp_core
         .bid_dcr       (bid_dcr[q]),
         .bid_event     (bid_event[q]),
         // Done pulses are broadcast from the shared resource modules to
-        // every CPE; only the granted CPE is in S_WAIT_DONE when the
-        // matching pulse arrives.
+        // every CPE. A resource's arbiter grants only while the resource is
+        // idle (g_bid_gate), so only the granted CPE is in S_WAIT_DONE when
+        // the matching pulse arrives.
         .kmu_done_i    (launch_done),
         .dma_done_i    (dma_done),
         .dcr_done_i    (dcr_done),
@@ -296,35 +302,65 @@ module VX_cp_core
     end
   endgenerate
 
+  // A resource's arbiter sees bids only while the resource is idle. The
+  // grant is a one-cycle pulse and the resource ignores it unless idle, so
+  // ungated, a second queue granted mid-command would wait on the first's
+  // `done` and retire without ever executing. The launch replays onto the
+  // DCR bus, so it also needs the DCR proxy idle, and the DCR arbiter yields
+  // to a launch grant and to a launch replay.
+  logic launch_idle, dcr_idle, dma_idle, event_idle, launch_replaying;
+  logic kmu_valid_g   [NUM_QUEUES];
+  logic dma_valid_g   [NUM_QUEUES];
+  logic dcr_valid_g   [NUM_QUEUES];
+  logic event_valid_g [NUM_QUEUES];
+  logic any_kmu_bid;
+  always_comb begin
+    any_kmu_bid = 1'b0;
+    for (int i = 0; i < NUM_QUEUES; ++i)
+      any_kmu_bid = any_kmu_bid | kmu_valid_g[i];
+  end
+  generate
+    for (genvar q = 0; q < NUM_QUEUES; ++q) begin : g_bid_gate
+      assign kmu_valid_g[q]   = kmu_valid[q] && launch_idle && dcr_idle;
+      assign dma_valid_g[q]   = dma_valid[q] && dma_idle;
+      assign dcr_valid_g[q]   = dcr_valid[q] && dcr_idle && !launch_replaying && !any_kmu_bid;
+      assign event_valid_g[q] = event_valid[q] && event_idle;
+    end
+  endgenerate
+
   VX_cp_arbiter #(.N(NUM_QUEUES)) u_arb_kmu (
     .clk(clk), .reset(reset),
-    .bid_valid(kmu_valid), .bid_priority(kmu_prio), .bid_grant(kmu_grant)
+    .bid_valid(kmu_valid_g), .bid_priority(kmu_prio), .bid_grant(kmu_grant)
   );
   VX_cp_arbiter #(.N(NUM_QUEUES)) u_arb_dma (
     .clk(clk), .reset(reset),
-    .bid_valid(dma_valid), .bid_priority(dma_prio), .bid_grant(dma_grant)
+    .bid_valid(dma_valid_g), .bid_priority(dma_prio), .bid_grant(dma_grant)
   );
   VX_cp_arbiter #(.N(NUM_QUEUES)) u_arb_dcr (
     .clk(clk), .reset(reset),
-    .bid_valid(dcr_valid), .bid_priority(dcr_prio), .bid_grant(dcr_grant)
+    .bid_valid(dcr_valid_g), .bid_priority(dcr_prio), .bid_grant(dcr_grant)
   );
   VX_cp_arbiter #(.N(NUM_QUEUES)) u_arb_event (
     .clk(clk), .reset(reset),
-    .bid_valid(event_valid), .bid_priority(event_prio), .bid_grant(event_grant)
+    .bid_valid(event_valid_g), .bid_priority(event_prio), .bid_grant(event_grant)
   );
 
   // ----- Pick the granted bid's cmd for each shared resource -----
+  // ...and the granted queue: the issuer of the DCR command, the launching
+  // queue of a launch (authorship).
+  localparam int QW = (NUM_QUEUES > 1) ? $clog2(NUM_QUEUES) : 1;
   logic any_kmu_grant, any_dma_grant, any_dcr_grant, any_event_grant;
   cmd_t granted_kmu_cmd, granted_dma_cmd, granted_dcr_cmd, granted_event_cmd;
+  logic [QW-1:0] granted_kmu_q, granted_dcr_q;
   always_comb begin
-    any_kmu_grant = 1'b0; granted_kmu_cmd = '0;
+    any_kmu_grant = 1'b0; granted_kmu_cmd = '0; granted_kmu_q = '0;
     any_dma_grant = 1'b0; granted_dma_cmd = '0;
-    any_dcr_grant = 1'b0; granted_dcr_cmd = '0;
+    any_dcr_grant = 1'b0; granted_dcr_cmd = '0; granted_dcr_q = '0;
     any_event_grant = 1'b0; granted_event_cmd = '0;
     for (int i = 0; i < NUM_QUEUES; ++i) begin
-      if (kmu_grant[i])   begin any_kmu_grant   = 1'b1; granted_kmu_cmd   = kmu_cmd[i];   end
+      if (kmu_grant[i])   begin any_kmu_grant   = 1'b1; granted_kmu_cmd   = kmu_cmd[i]; granted_kmu_q = QW'(i); end
       if (dma_grant[i])   begin any_dma_grant   = 1'b1; granted_dma_cmd   = dma_cmd[i];   end
-      if (dcr_grant[i])   begin any_dcr_grant   = 1'b1; granted_dcr_cmd   = dcr_cmd[i];   end
+      if (dcr_grant[i])   begin any_dcr_grant   = 1'b1; granted_dcr_cmd   = dcr_cmd[i]; granted_dcr_q = QW'(i); end
       if (event_grant[i]) begin any_event_grant = 1'b1; granted_event_cmd = event_cmd[i]; end
     end
   end
@@ -335,32 +371,101 @@ module VX_cp_core
   // boundary (gpu_if) is instantiated at the bottom of the module.
   VX_cp_gpu_if gpu_if_int();
 
+  // ----- Launch shadow (spec D4) -----
+  // Per queue, the launch registers that queue last wrote: captured by the
+  // DCR proxy instead of reaching the GPU, replayed by the launch.
+  logic [`VX_DCR_DATA_BITS-1:0] shadow_r [NUM_QUEUES][NUM_SHADOW];
+  logic                         px_shadow_wr;
+  logic [SHADOW_IDX_W-1:0]      px_shadow_idx, ln_shadow_idx;
+  logic [`VX_DCR_DATA_BITS-1:0] px_shadow_wr_data;
+  logic [QW-1:0]                ln_q;
+
+  always_ff @(posedge clk) begin
+    if (reset) begin
+      for (int q = 0; q < NUM_QUEUES; ++q)
+        for (int i = 0; i < NUM_SHADOW; ++i)
+          shadow_r[q][i] <= shadow_reset(i);
+    end else if (px_shadow_wr) begin
+      shadow_r[granted_dcr_q][px_shadow_idx] <= px_shadow_wr_data;
+    end
+  end
+
   // ----- Shared KMU launch (consumes the kmu bid grant) -----
-  VX_cp_launch u_launch (
-    .clk      (clk),
-    .reset    (reset),
-    .grant    (any_kmu_grant),
-    .start    (gpu_if_int.start),
-    .gpu_busy (gpu_if_int.busy),
-    .done     (launch_done)
+  logic                         ln_req_valid;
+  logic [`VX_DCR_ADDR_BITS-1:0] ln_req_addr;
+  logic [`VX_DCR_DATA_BITS-1:0] ln_req_data;
+  VX_cp_launch #(.NUM_QUEUES(NUM_QUEUES)) u_launch (
+    .clk            (clk),
+    .reset          (reset),
+    .grant          (any_kmu_grant),
+    .grant_q        (granted_kmu_q),
+    .start          (gpu_if_int.start),
+    .gpu_busy       (gpu_if_int.busy),
+    .done           (launch_done),
+    .idle           (launch_idle),
+    .replaying      (launch_replaying),
+    .shadow_idx     (ln_shadow_idx),
+    .shadow_rd_data (shadow_r[ln_q][ln_shadow_idx]),
+    .launch_q       (ln_q),
+    .dcr_req_valid  (ln_req_valid),
+    .dcr_req_addr   (ln_req_addr),
+    .dcr_req_data   (ln_req_data),
+    .dcr_req_ready  (gpu_if_int.dcr_req_ready)
   );
 
   // ----- Shared DCR proxy -----
-  VX_cp_dcr_proxy u_dcr (
-    .clk           (clk),
-    .reset         (reset),
-    .grant         (any_dcr_grant),
-    .cmd           (granted_dcr_cmd),
-    .done          (dcr_done),
-    .last_rsp_data (dcr_last_rsp_data),
-    .dcr_req_valid (gpu_if_int.dcr_req_valid),
-    .dcr_req_rw    (gpu_if_int.dcr_req_rw),
-    .dcr_req_addr  (gpu_if_int.dcr_req_addr),
-    .dcr_req_data  (gpu_if_int.dcr_req_data),
-    .dcr_rsp_valid (gpu_if_int.dcr_rsp_valid),
-    .dcr_rsp_data  (gpu_if_int.dcr_rsp_data)
+  logic                         px_req_valid, px_req_rw;
+  logic [`VX_DCR_ADDR_BITS-1:0] px_req_addr;
+  logic [`VX_DCR_DATA_BITS-1:0] px_req_data;
+  logic [QW-1:0]                px_req_issuer, px_cur_q;
+  logic                         px_rsp_update, px_blocked;
+  VX_cp_dcr_proxy #(.NUM_QUEUES(NUM_QUEUES)) u_dcr (
+    .clk            (clk),
+    .reset          (reset),
+    .grant          (any_dcr_grant),
+    .grant_q        (granted_dcr_q),
+    .idle           (dcr_idle),
+    .cmd            (granted_dcr_cmd),
+    .done           (dcr_done),
+    .last_rsp_data  (dcr_last_rsp_data),
+    .rsp_update     (px_rsp_update),
+    .cur_q          (px_cur_q),
+    .blocked        (px_blocked),
+    .shadow_wr      (px_shadow_wr),
+    .shadow_idx     (px_shadow_idx),
+    .shadow_wr_data (px_shadow_wr_data),
+    .shadow_rd_data (shadow_r[granted_dcr_q][px_shadow_idx]),
+    .dcr_req_valid  (px_req_valid),
+    .dcr_req_rw     (px_req_rw),
+    .dcr_req_addr   (px_req_addr),
+    .dcr_req_data   (px_req_data),
+    .dcr_req_issuer (px_req_issuer),
+    .dcr_rsp_valid  (gpu_if_int.dcr_rsp_valid),
+    .dcr_rsp_data   (gpu_if_int.dcr_rsp_data)
   );
-  `UNUSED_VAR (gpu_if_int.dcr_req_ready)
+
+  // The GPU's DCR bus: the launch while it replays, the proxy otherwise.
+  // The arbiter gating above keeps the two from ever overlapping.
+  assign gpu_if_int.dcr_req_valid  = launch_replaying ? ln_req_valid : px_req_valid;
+  assign gpu_if_int.dcr_req_rw     = launch_replaying ? 1'b1         : px_req_rw;
+  assign gpu_if_int.dcr_req_addr   = launch_replaying ? ln_req_addr  : px_req_addr;
+  assign gpu_if_int.dcr_req_data   = launch_replaying ? ln_req_data  : px_req_data;
+  assign gpu_if_int.dcr_req_issuer = `VX_DCR_ISSUER_BITS'(launch_replaying ? ln_q : px_req_issuer);
+
+  // Per-queue Q_LAST_DCR_RSP and Q_DCR_BLOCKED (declared above the regfile).
+  always_ff @(posedge clk) begin
+    if (reset) begin
+      for (int q = 0; q < NUM_QUEUES; ++q) begin
+        q_last_rsp[q] <= '0;
+        q_blocked[q]  <= '0;
+      end
+    end else begin
+      if (px_rsp_update)
+        q_last_rsp[px_cur_q] <= dcr_last_rsp_data;
+      if (px_blocked && (q_blocked[granted_dcr_q] != 32'hFFFFFFFF))
+        q_blocked[granted_dcr_q] <= q_blocked[granted_dcr_q] + 32'd1;
+    end
+  end
 
   // ----- DMA (straddles host + dev xbars) -----
   VX_mem_axi_if #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W)) dma_host_axi ();
@@ -374,6 +479,7 @@ module VX_cp_core
     .grant    (any_dma_grant),
     .cmd      (granted_dma_cmd),
     .done     (dma_done),
+    .idle     (dma_idle),
     .axi_host (dma_host_axi),
     .axi_dev  (dma_dev_axi)
   );
@@ -385,6 +491,7 @@ module VX_cp_core
     .grant (any_event_grant),
     .cmd   (granted_event_cmd),
     .done  (event_done),
+    .idle  (event_idle),
     .axi_m (event_axi)
   );
 

@@ -17,7 +17,9 @@
 module VX_cp_core_top
   import VX_cp_pkg::*;
 #(
-  parameter int NUM_QUEUES = 1,
+  // Two queues: the single-queue path runs on queue 0, and the authorship
+  // checks need a second tenant.
+  parameter int NUM_QUEUES = 2,
   parameter int ADDR_W     = 64,
   parameter int DATA_W     = 512,
   parameter int ID_W       = VX_CP_AXI_TID_WIDTH_C,
@@ -112,6 +114,7 @@ module VX_cp_core_top
   output wire                       gpu_dcr_req_rw,
   output wire [`VX_DCR_ADDR_BITS-1:0] gpu_dcr_req_addr,
   output wire [`VX_DCR_DATA_BITS-1:0] gpu_dcr_req_data,
+  output wire [`VX_DCR_ISSUER_BITS-1:0] gpu_dcr_req_issuer,
   input  wire                       gpu_dcr_req_ready,
   input  wire                       gpu_dcr_rsp_valid,
   input  wire [`VX_DCR_DATA_BITS-1:0] gpu_dcr_rsp_data,
@@ -217,6 +220,7 @@ module VX_cp_core_top
   assign gpu_dcr_req_rw    = gpu_if_inst.dcr_req_rw;
   assign gpu_dcr_req_addr  = gpu_if_inst.dcr_req_addr;
   assign gpu_dcr_req_data  = gpu_if_inst.dcr_req_data;
+  assign gpu_dcr_req_issuer = gpu_if_inst.dcr_req_issuer;
   assign gpu_if_inst.dcr_req_ready = gpu_dcr_req_ready;
   assign gpu_if_inst.dcr_rsp_valid = gpu_dcr_rsp_valid;
   assign gpu_if_inst.dcr_rsp_data  = gpu_dcr_rsp_data;

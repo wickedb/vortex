@@ -30,11 +30,19 @@
 
 module VX_cp_dcr_proxy
   import VX_cp_pkg::*;
-(
+#(
+  parameter int NUM_QUEUES = VX_CP_NUM_QUEUES_C,
+  localparam int QW = (NUM_QUEUES > 1) ? $clog2(NUM_QUEUES) : 1
+)(
   input  wire clk,
   input  wire reset,
 
   input  wire  grant,
+  // The queue granted this cycle: the command's issuer (authorship).
+  input  wire [QW-1:0] grant_q,
+  // High while no command is in flight. The core lets the DCR arbiter grant
+  // only then, so exactly one queue waits on each `done`.
+  output logic idle,
   // verilator lint_off UNUSED
   // Only cmd.hdr.opcode, cmd.arg0, and cmd.arg1 are read here. arg2 and
   // profile_slot pass through untouched on the way to the engine; the
@@ -47,12 +55,27 @@ module VX_cp_dcr_proxy
   // after a read; tied to 0 after writes). Engine snapshots this when it
   // observes done for a read command.
   output logic [`VX_DCR_DATA_BITS-1:0] last_rsp_data,
+  // `done` for a command that produced a response, and the queue it is for:
+  // each queue keeps its own Q_LAST_DCR_RSP.
+  output logic                         rsp_update,
+  output logic [QW-1:0]                cur_q,
+  // One-cycle pulse: a read of the checker window was refused (spec D5).
+  output logic                         blocked,
+
+  // Launch shadow (spec D4): a write of a launch register is captured for the
+  // issuing queue instead of reaching the GPU, and a read of one is answered
+  // from that queue's shadow.
+  output logic                         shadow_wr,
+  output logic [SHADOW_IDX_W-1:0]      shadow_idx,
+  output logic [`VX_DCR_DATA_BITS-1:0] shadow_wr_data,
+  input  wire  [`VX_DCR_DATA_BITS-1:0] shadow_rd_data,
 
   // Vortex DCR port (driven through VX_cp_gpu_if by VX_cp_core).
   output logic                         dcr_req_valid,
   output logic                         dcr_req_rw,
   output logic [`VX_DCR_ADDR_BITS-1:0] dcr_req_addr,
   output logic [`VX_DCR_DATA_BITS-1:0] dcr_req_data,
+  output logic [QW-1:0]                dcr_req_issuer,
   input  wire                          dcr_rsp_valid,
   input  wire  [`VX_DCR_DATA_BITS-1:0] dcr_rsp_data
 );
@@ -84,6 +107,13 @@ module VX_cp_dcr_proxy
   wire [`VX_DCR_DATA_BITS-1:0]  cmd_data   = cmd.arg1[`VX_DCR_DATA_BITS-1:0];
   wire [CIDW-1:0]               cmd_ncores = cmd.arg0[CIDW-1:0];
 
+  // Commands the proxy completes without the GPU's DCR bus.
+  wire to_shadow  = !is_read && !is_flush && is_shadow_addr(cmd_addr);
+  wire from_shadow = is_read && is_shadow_addr(cmd_addr);
+  // VX_CFG_CHECKER_DEBUG_READS is always defined (0 by default).
+  wire refuse_read = (`VX_CFG_CHECKER_DEBUG_READS == 0) && is_read && is_checker_addr(cmd_addr);
+  logic [QW-1:0] q_r;
+
   always_ff @(posedge clk) begin
     if (reset) begin
       state            <= S_IDLE;
@@ -94,6 +124,7 @@ module VX_cp_dcr_proxy
       rsp_data_r       <= '0;
       flush_total      <= '0;
       flush_cid        <= '0;
+      q_r              <= '0;
     end else begin
       case (state)
         S_IDLE: begin
@@ -102,7 +133,16 @@ module VX_cp_dcr_proxy
             pending_is_flush <= is_flush;
             pending_addr     <= cmd_addr;
             pending_data     <= cmd_data;
-            if (is_flush) begin
+            q_r              <= grant_q;
+            if (to_shadow) begin
+              state <= S_DONE;              // captured below; nothing to send
+            end else if (from_shadow) begin
+              rsp_data_r <= shadow_rd_data; // this queue's launch register
+              state      <= S_DONE;
+            end else if (refuse_read) begin
+              rsp_data_r <= '0;
+              state      <= S_DONE;
+            end else if (is_flush) begin
               flush_total <= cmd_ncores;
               flush_cid   <= '0;
               // a 0-core flush (degenerate) retires immediately
@@ -153,8 +193,19 @@ module VX_cp_dcr_proxy
       dcr_req_addr = pending_addr;
       dcr_req_data = pending_data;
     end
+    dcr_req_issuer = q_r;
     done          = (state == S_DONE);
     last_rsp_data = rsp_data_r;
+    rsp_update    = (state == S_DONE) && (pending_is_read || pending_is_flush);
+    cur_q         = q_r;
+    idle          = (state == S_IDLE);
   end
+
+  // Shadow port: the write lands, and the read is looked up, in the grant
+  // cycle, for the queue being granted.
+  assign shadow_wr      = (state == S_IDLE) && grant && to_shadow;
+  assign shadow_idx     = shadow_index(cmd_addr);
+  assign shadow_wr_data = cmd_data;
+  assign blocked        = (state == S_IDLE) && grant && refuse_read;
 
 endmodule : VX_cp_dcr_proxy
