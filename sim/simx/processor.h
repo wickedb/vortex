@@ -55,7 +55,8 @@ public:
   // Vortex's RAM.
   void set_mem_telemetry_hook(std::function<void(const struct MemReq&)> hook);
 
-  int dcr_write(uint32_t addr, uint32_t value);
+  // `issuer` is the command-processor queue (tenant) that sent the write.
+  int dcr_write(uint32_t addr, uint32_t value, uint32_t issuer = 0);
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
 

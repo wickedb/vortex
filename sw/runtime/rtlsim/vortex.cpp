@@ -152,8 +152,8 @@ private:
       }
       ram_.write(static_cast<const uint8_t*>(src), addr, bytes);
     };
-    h.vortex_dcr_write = [this](uint32_t addr, uint32_t value) {
-      processor_.dcr_write(addr, value);
+    h.vortex_dcr_write = [this](uint32_t addr, uint32_t value, uint32_t issuer) {
+      processor_.dcr_write(addr, value, issuer);
     };
     h.vortex_dcr_read = [this](uint32_t addr, uint32_t tag) -> uint32_t {
       // Wait for any background processor_.run() to finish so dcr_read

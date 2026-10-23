@@ -32,7 +32,7 @@
 //     0x01C GPU_DEV_CAPS_HI  device-config caps, high 32 bits  (RO)
 //     0x020 GPU_ISA_CAPS_LO  ISA caps, low 32 bits             (RO)
 //     0x024 GPU_ISA_CAPS_HI  ISA caps, high 32 bits            (RO)
-//   Per queue 0 (CP-internal offsets 0x100..0x13F)
+//   Per queue q (CP-internal offsets 0x100 + q*0x40 .. +0x3F; NUM_QUEUES queues)
 //     0x100/04 Q_RING_BASE_LO/HI
 //     0x108/0C Q_HEAD_ADDR_LO/HI   (where the CP publishes head)
 //     0x110/14 Q_CMPL_ADDR_LO/HI   (where the CP publishes seqnum)
@@ -43,9 +43,23 @@
 //     0x128    Q_SEQNUM           (RO mirror)
 //     0x12C    Q_ERROR
 //     0x130    Q_LAST_DCR_RSP     (RO — latest CMD_DCR_READ response)
-//     0x134    Q_DCR_BLOCKED      (RO — DCR writes refused by the
+//     0x134    Q_DCR_BLOCKED      (RO — DCR accesses refused by the
 //                                 privileged-window filter; see
 //                                 DCR_PRIV_BEGIN below)
+//
+// Queues and tenants (P1_and_taint_specv2.md D1-D5). Queue q is tenant q.
+//   - Every DCR write a queue's command causes carries the queue as its
+//     *issuer*, so the checker can attribute claims and revocations to the
+//     tenant that sent them rather than to a value the writer chose.
+//   - The launch registers (KMU 0x010-0x023, and the MMU root under VM) are
+//     captured per queue instead of being written through, and replayed into
+//     the GPU when that queue's launch takes the KMU. Another queue's writes in
+//     between therefore cannot change what a launch runs.
+//   - DCR reads of the checker window are refused unless the build sets
+//     VX_CFG_CHECKER_DEBUG_READS.
+//   Queues run independently; the KMU is the one shared resource, held by one
+//   queue from the shadow replay until its kernel drains, as in the RTL
+//   (VX_cp_launch).
 //
 // CMD_DRAW (OP_DRAW, opcode 0x0C) — device-orchestrated draw.
 //   A single ring command whose arg0 points at a resident *draw descriptor*:
@@ -69,6 +83,8 @@
 #include <functional>
 #include <array>
 #include <vm_types.h>   // SATP_t / PTE_t / vAddr_t (VM page-table walk)
+#include <VX_config.h>  // VX_CFG_CHECKER_TENANTS, VX_CFG_VM_ENABLE
+#include <VX_types.h>   // VX_DCR_KMU_*, VX_DCR_MMU_*
 
 namespace vortex {
 
@@ -83,8 +99,10 @@ public:
         // Used for completion-slot writebacks (8 B seqnum).
         std::function<void(uint64_t addr, const void* src, std::size_t bytes)> dram_write;
 
-        // Issue a single DCR write to Vortex (for CMD_DCR_WRITE).
-        std::function<void(uint32_t addr, uint32_t value)> vortex_dcr_write;
+        // Issue a single DCR write to Vortex (for CMD_DCR_WRITE). `issuer` is
+        // the queue (= tenant) whose command caused it; the checker's setup
+        // path attributes claims and revocations to it.
+        std::function<void(uint32_t addr, uint32_t value, uint32_t issuer)> vortex_dcr_write;
 
         // Issue a single DCR read to Vortex (for CMD_DCR_READ). `tag` is
         // placed on the DCR data bus and addresses things like per-core
@@ -139,6 +157,9 @@ public:
     // that the two definitions agree.
     static constexpr uint32_t DCR_PRIV_BEGIN = 0x300;
     static constexpr uint32_t DCR_PRIV_END   = 0x340;
+
+    // One queue per tenant.
+    static constexpr uint32_t NUM_QUEUES = VX_CFG_CHECKER_TENANTS;
 
     explicit CommandProcessor(const Hooks& hooks);
 
@@ -225,73 +246,110 @@ private:
         uint32_t error       = 0;
     };
 
-    // ----- Globals -----
-    uint32_t cp_ctrl_ = 0;           // bit0=enable_global
-    uint64_t satp_ = 0;              // CP_SATP — page-table root for the CP DMA's MMU
-    uint64_t cycle_counter_ = 0;
-    Queue    q0_;                    // single-queue model
-    Hooks    hooks_;
-    uint32_t last_dcr_rsp_ = 0;     // Q_LAST_DCR_RSP slot (0x130)
-    uint32_t dcr_blocked_ = 0;      // Q_DCR_BLOCKED slot (0x134): DCR writes
-                                    // refused by the privileged-window filter
+    // ----- Launch shadow -----
+    // The KMU launch registers, and the MMU root under VM, captured per queue
+    // and replayed at that queue's launch (D4). Initialised to the KMU's own
+    // reset values (sim/simx/kmu/kmu.cpp): dims, cluster dims and warp steps 1,
+    // everything else 0, so a queue that never writes one launches as the
+    // device would from reset.
+    static constexpr uint32_t SHADOW_KMU_BEGIN = VX_DCR_KMU_STATE_BEGIN;
+    static constexpr uint32_t SHADOW_KMU_END   = VX_DCR_KMU_STATE_END;
+    static constexpr uint32_t NUM_SHADOW_KMU   = SHADOW_KMU_END - SHADOW_KMU_BEGIN;
+#ifdef VX_CFG_VM_ENABLE
+    static constexpr uint32_t NUM_SHADOW = NUM_SHADOW_KMU + 2;  // + SATP_LO/HI
+#else
+    static constexpr uint32_t NUM_SHADOW = NUM_SHADOW_KMU;
+#endif
+    static uint32_t shadow_reset_value_(uint32_t addr);
+    // Index of `addr` in a queue's shadow, or -1 if it is not shadowed.
+    static int shadow_index_(uint32_t addr);
+    static uint32_t shadow_addr_(int index);
 
-    // ----- Engine/launch state machines -----
-    EngState    eng_state_ = EngState::Idle;
-    LaunchState launch_state_ = LaunchState::Idle;
-    Cmd         cur_cmd_{};
-    bool        cur_is_launch_ = false;
-    bool        cur_is_no_resource_ = false;
-
-    // ----- Draw-bundle state (OP_DRAW walk) -----
-    uint64_t    draw_phys_      = 0;   // descriptor base (translated)
-    uint32_t    draw_num_steps_ = 0;
-    uint32_t    draw_step_      = 0;
-    Cmd         draw_cmd_{};           // decoded current step
-
-    // ----- Fetch state -----
+    // ----- Fetch geometry -----
     // The simulator fetches one cache line at a time when head < tail,
     // then walks the CL extracting decoded cmds before fetching the next.
     static constexpr std::size_t CL_BYTES = 64;
     static constexpr int MAX_CMDS_PER_CL = 5;
-    std::array<uint8_t, CL_BYTES> cl_buf_{};
-    int  cl_cmd_count_ = 0;
-    int  cl_cmd_slot_ = 0;
-    bool cl_loaded_   = false;
 
-    // Walk `cl_buf_` and populate `decoded_cmds_` / `cl_cmd_count_`.
-    void unpack_cl();
+    // ----- Per-queue state: programmable registers, fetch, engine, draw -----
+    struct QState {
+        Queue    regs;
+        uint32_t last_dcr_rsp = 0;    // Q_LAST_DCR_RSP slot (0x130)
+        uint32_t dcr_blocked  = 0;    // Q_DCR_BLOCKED slot (0x134): DCR accesses
+                                      // refused by the privileged-window filter
+        // Engine.
+        EngState eng_state = EngState::Idle;
+        Cmd      cur_cmd{};
+        bool     cur_is_launch = false;
+        bool     cur_is_no_resource = false;
+        // Draw-bundle walk (OP_DRAW).
+        uint64_t draw_phys      = 0;  // descriptor base (translated)
+        uint32_t draw_num_steps = 0;
+        uint32_t draw_step      = 0;
+        Cmd      draw_cmd{};          // decoded current step
+        // Fetch.
+        std::array<uint8_t, CL_BYTES> cl_buf{};
+        int      cl_cmd_count = 0;
+        int      cl_cmd_slot  = 0;
+        bool     cl_loaded    = false;
+        // Launch shadow.
+        std::array<uint32_t, NUM_SHADOW> shadow{};
+    };
+
+    // ----- Globals -----
+    uint32_t cp_ctrl_ = 0;           // bit0=enable_global
+    uint64_t satp_ = 0;              // CP_SATP — page-table root for the CP DMA's MMU
+    uint64_t cycle_counter_ = 0;
+    std::array<QState, NUM_QUEUES> qs_;
+    Hooks    hooks_;
+
+    // ----- The KMU: one launch at a time, owned by one queue -----
+    LaunchState launch_state_ = LaunchState::Idle;
+    uint32_t    launch_owner_ = 0;     // queue holding the KMU (valid unless Idle)
+    uint32_t    rr_next_      = 0;     // round-robin start for the next tick
+
+    bool queue_enabled_(uint32_t q) const;
+    // Walk `q.cl_buf` and count the commands it holds.
+    void unpack_cl(QState& q);
     // Decode a single header at byte offset `off` into a Cmd record;
     // returns the size in bytes of the command (so caller can advance).
-    int  decode_cmd(int off, Cmd& out);
+    int  decode_cmd(const QState& q, int off, Cmd& out) const;
     // Decode a cmd record from an arbitrary byte buffer (shared by the ring
     // unpacker and the OP_DRAW step walk).
     static int decode_cmd_bytes(const uint8_t* buf, int len, int off, Cmd& out);
-    // Execute one DCR_WRITE / DCR_READ / CACHE_FLUSH / EVENT_SIG / MEM_* /
-    // LAUNCH_QMD step against `c`. `indirect` is true when `c` was decoded
-    // out of a device-memory command bundle (an OP_DRAW step list) rather
-    // than fetched from the host ring; it gates the privileged DCR window.
-    // Returns true if a kernel launch was kicked (caller must wait for drain).
-    bool exec_inline_cmd_(const Cmd& c, bool indirect);
-    // Apply one {dcr_addr, value} pair that came from device memory. Drops
-    // and counts it if it targets [DCR_PRIV_BEGIN, DCR_PRIV_END); otherwise
-    // forwards to hooks_.vortex_dcr_write. Returns true if it was applied.
-    bool dcr_write_indirect_(uint32_t addr, uint32_t value);
-    // Read the next OP_DRAW step from the descriptor into draw_cmd_.
-    void draw_load_step_();
-    // Inverse of decoded helpers: write seqnum to cmpl_addr.
-    void publish_completion();
-    // CMD_EVENT_WAIT compare helper — reads cur_cmd_.arg0 from DRAM and
-    // compares to cur_cmd_.arg1 under the wait_op encoded in arg2[1:0].
-    bool event_wait_satisfied_();
+    // Execute one DCR_WRITE / DCR_READ / CACHE_FLUSH step of a draw bundle
+    // against `c`, for queue `qi`. Steps are always `indirect`: decoded out of
+    // a device-memory command bundle, so the privileged DCR window is gated.
+    // Returns true if `c` is a launch (the caller must take the KMU and wait
+    // for the drain).
+    bool exec_inline_cmd_(uint32_t qi, const Cmd& c, bool indirect);
+    // Every DCR write a command causes goes through here. A write into the
+    // privileged window from an indirect bundle is dropped and counted; a
+    // launch register is captured in the queue's shadow; anything else goes
+    // to the GPU tagged with the issuing queue. Returns true unless dropped.
+    bool dcr_write_(uint32_t qi, uint32_t addr, uint32_t value, bool indirect);
+    // A DCR read on behalf of queue `qi`. Reads of the privileged window are
+    // refused (counted, answered with 0) unless VX_CFG_CHECKER_DEBUG_READS.
+    uint32_t dcr_read_(uint32_t qi, uint32_t addr, uint32_t tag);
+    // Take the KMU for queue `qi` if it is free: replay the queue's launch
+    // shadow into the GPU, then start. False if another queue holds it.
+    bool try_begin_launch_(uint32_t qi);
+    // Read the next OP_DRAW step from the descriptor into q.draw_cmd.
+    void draw_load_step_(QState& q);
+    // Write the queue's seqnum to its cmpl_addr.
+    void publish_completion(const QState& q);
+    // CMD_EVENT_WAIT compare helper — reads cmd.arg0 from DRAM and compares to
+    // cmd.arg1 under the wait_op encoded in arg2[1:0].
+    bool event_wait_satisfied_(const Cmd& c);
     // CMD_LAUNCH_QMD: read the in-memory KMU descriptor at `qmd_addr` and
-    // replay its {dcr_addr,value} pairs through the DCR-write hook.
-    void apply_qmd_(uint64_t qmd_addr);
-    // Advance the launch FSM one step using cur_cmd_.
+    // apply its {dcr_addr,value} pairs as indirect writes of queue `qi`.
+    void apply_qmd_(uint32_t qi, uint64_t qmd_addr);
+    // Advance the launch FSM one step.
     void tick_launch();
-    // Advance the engine FSM one step.
-    void tick_engine();
-    // Fetch one CL from ring into cl_buf_ if needed.
-    void fetch_if_needed();
+    // Advance queue `qi`'s engine FSM one step.
+    void tick_engine(uint32_t qi);
+    // Fetch one CL from queue `qi`'s ring if needed.
+    void fetch_if_needed(QState& q);
     // VM: translate a device virtual address to physical via a page-table
     // walk. A no-op when VM is disabled, SATP is unset/BARE, or physical.
     uint64_t cp_translate(uint64_t vaddr, bool physical) const;

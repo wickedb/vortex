@@ -230,6 +230,13 @@ public:
 
     // Post one CMD_DCR_WRITE to the ring, commit Q_TAIL, and wait for
     // Q_SEQNUM to reach the post's sequence number. Synchronous semantics.
+    // Hardware queues (tenants). cp_queue_open sets up hardware queue q if it
+    // is not yet, and fails if the CP has fewer queues. cp_bind_thread_queue
+    // makes the calling thread submit on q; a vx_queue's worker binds itself
+    // to its queue's hardware queue (VX_QUEUE_FLAG_HW_QUEUE).
+    vx_result_t cp_queue_open(uint32_t q);
+    static void cp_bind_thread_queue(uint32_t q);
+
     vx_result_t cp_submit_dcr_write(uint32_t addr, uint32_t value);
 
     // Post one CMD_LAUNCH to the ring, commit Q_TAIL, and wait for
@@ -393,6 +400,18 @@ private:
     // the non-batch path, or via cp_batch_begin). No doorbell, no poll.
     vx_result_t cp_ring_append_(const void* cl);
 
+    struct CpQueue;
+    // The hardware queue this thread submits on (0 unless the thread is a
+    // vx_queue worker bound to another one), its ring state, and a per-queue
+    // register offset (queue q's block sits at 0x100 + q*0x40).
+    uint32_t cp_thread_queue_() const;
+    CpQueue& cpq_();
+    uint32_t cp_qoff_(uint32_t off) const;
+    // Allocate hardware queue q's ring / head / completion buffers and
+    // program its registers. Caller holds cp_mu_ (or runs before any
+    // submitter exists, as cp_init does).
+    vx_result_t cp_queue_setup_(uint32_t q);
+
     // Build + submit a CMD_MEM_* descriptor (opcode, dst, src, size).
     // `physical` sets the CMD_MEM header flag so the CP DMA skips VM
     // translation — used for page-table writes / the PT region.
@@ -451,19 +470,28 @@ private:
     // completion buffers are CP-visible host memory (HostMem): the runtime
     // writes commands straight through their host_ptr.
     bool                           cp_enabled_         = false;
-    HostMem                        cp_ring_;
-    HostMem                        cp_head_;
-    HostMem                        cp_cmpl_;
-    uint64_t                       cp_tail_            = 0;
-    uint64_t                       cp_expected_seqnum_ = 0;
+    // One ring per hardware queue in use. Queue q is tenant q: the queue a
+    // command arrives on is what the GPU attributes it to (P1_and_taint_specv2
+    // D1), so a vx_queue bound to hardware queue q submits only on ring q.
+    struct CpQueue {
+        bool     ready           = false;
+        HostMem  ring;
+        HostMem  head;
+        HostMem  cmpl;
+        uint64_t tail            = 0;
+        uint64_t expected_seqnum = 0;
+        // Seqnum the last command appended to the open batch will reach;
+        // cp_batch_end polls for it once. Touched only by the batch owner,
+        // which holds cp_mu_ from cp_batch_begin to cp_batch_end. Whether a
+        // batch is open is per-thread state in device.cpp, not a member: a
+        // shared flag would tell a non-owning submitter to append with no
+        // lock held.
+        uint64_t batch_target    = 0;
+        bool     satp_programmed = false;   // device MMU root sent on this queue
+    };
+    std::vector<CpQueue>           cp_queues_;         // sized by CP_DEV_CAPS.NUM_QUEUES
     uint64_t                       cp_num_cores_       = 0; // cached VX_CAPS_NUM_CORES, used for CMD_CACHE_FLUSH
     std::mutex                     cp_mu_;             // serialize ring writes
-    // Seqnum the last command appended to the open batch will reach;
-    // cp_batch_end polls for it once. Touched only by the batch owner, which
-    // holds cp_mu_ from cp_batch_begin to cp_batch_end. Whether a batch is
-    // open is per-thread state in device.cpp, not a member: a shared flag
-    // would tell a non-owning submitter to append with no lock held.
-    uint64_t                       cp_batch_target_    = 0;
 
     // Bound on the teardown drain poll (cp_quiesce_). Generous, because the
     // in-flight command it waits out may be a whole kernel launch, and cheap,
@@ -478,7 +506,6 @@ private:
     bool                                vm_enabled_ = false;
     // Device MMU SATP is programmed on the command queue before the first
     // launch (the ring is not live during device init).
-    bool                                mmu_satp_programmed_ = false;
     // Device decodes the MMU fault-report DCRs (CP DEV_CAPS bit 27).
     bool                                mmu_fault_report_ = false;
     // CP advertises CMD_DRAW (OP_DRAW) decode (CP DEV_CAPS bit 25). When false,
@@ -754,6 +781,7 @@ private:
 
     Device*                  device_;
     uint32_t                 priority_;
+    uint32_t                 hw_queue_ = 0;   // command-processor queue = tenant
     uint32_t                 flags_;
 
     // Serializes per-command platform calls when multiple queues share

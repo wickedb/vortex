@@ -169,8 +169,8 @@ private:
         h.dram_write = [this](uint64_t addr, const void* src, std::size_t bytes) {
             dev_mem_->write(addr, src, bytes);
         };
-        h.vortex_dcr_write = [this](uint32_t addr, uint32_t value) {
-            proc_->dcr_write(addr, value);
+        h.vortex_dcr_write = [this](uint32_t addr, uint32_t value, uint32_t issuer) {
+            proc_->dcr_write(addr, value, issuer);
         };
         h.vortex_dcr_read = [this](uint32_t addr, uint32_t tag) -> uint32_t {
             uint32_t v = 0;

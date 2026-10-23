@@ -174,8 +174,15 @@ typedef struct {
     size_t              struct_size;
     const void*         next;
     vx_queue_priority_e priority;
-    uint32_t            flags;
+    uint32_t            flags;      // VX_QUEUE_FLAG_* below
 } vx_queue_info_t;
+
+// Command-processor queue a vx_queue submits on, in flags[31:24]. Each
+// hardware queue is one tenant: setup commands (checker claims, grants,
+// revocations) and launches are attributed to the queue they arrive on. 0 is
+// the default queue; one the device does not have fails vx_queue_create.
+#define VX_QUEUE_FLAG_HW_QUEUE(q)  ((uint32_t)((q) & 0xFFu) << 24)
+#define VX_QUEUE_HW_QUEUE(flags)   (((uint32_t)(flags) >> 24) & 0xFFu)
 
 typedef struct {
     size_t       struct_size;

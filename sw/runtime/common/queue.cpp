@@ -22,6 +22,7 @@ namespace vx {
 Queue::Queue(Device* dev, const vx_queue_info_t& info)
     : device_(dev),
       priority_(static_cast<uint32_t>(info.priority)),
+      hw_queue_(VX_QUEUE_HW_QUEUE(info.flags)),
       flags_(info.flags) {
     device_->retain();
     device_->register_queue(this);
@@ -53,6 +54,12 @@ vx_result_t Queue::create(Device* dev, const vx_queue_info_t* info,
     default_info.flags       = 0;
     if (!info) info = &default_info;
     if (info->struct_size < sizeof(vx_queue_info_t)) return VX_ERR_INVALID_INFO;
+    if (dev->cp_enabled()) {
+        auto r = dev->cp_queue_open(VX_QUEUE_HW_QUEUE(info->flags));
+        if (r != VX_SUCCESS) return r;
+    } else if (VX_QUEUE_HW_QUEUE(info->flags) != 0) {
+        return VX_ERR_INVALID_VALUE;
+    }
     *out = new Queue(dev, *info);
     return VX_SUCCESS;
 }
@@ -67,6 +74,8 @@ vx_result_t Queue::create(Device* dev, const vx_queue_info_t* info,
 // ============================================================================
 
 void Queue::worker_loop() {
+    // Everything this worker submits goes on the queue's hardware queue.
+    Device::cp_bind_thread_queue(hw_queue_);
     while (true) {
         Command cmd;
         {

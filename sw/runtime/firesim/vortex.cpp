@@ -141,7 +141,9 @@ private:
       }
       sim_.mem_write(addr, bytes, src);
     };
-    h.vortex_dcr_write = [this](uint32_t addr, uint32_t value) {
+    // The FireSim DCR bridge carries no issuer, so every write arrives as
+    // queue 0's. The checker (and its per-issuer setup) is not built there.
+    h.vortex_dcr_write = [this](uint32_t addr, uint32_t value, uint32_t /*issuer*/) {
       sim_.dcr_write(addr, value);
     };
     h.vortex_dcr_read = [this](uint32_t addr, uint32_t tag) -> uint32_t {

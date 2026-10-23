@@ -52,18 +52,137 @@ uint64_t gpu_isa_caps() {
 }
 } // namespace
 
+static_assert(CommandProcessor::NUM_QUEUES >= 1 && CommandProcessor::NUM_QUEUES <= 64,
+              "queue q's registers live at 0x100 + q*0x40 below the 0x1000 MMIO window");
+
 CommandProcessor::CommandProcessor(const Hooks& hooks)
-    : hooks_(hooks) {}
+    : hooks_(hooks) {
+    for (auto& q : qs_) {
+        for (uint32_t i = 0; i < NUM_SHADOW; ++i)
+            q.shadow[i] = shadow_reset_value_(shadow_addr_(int(i)));
+    }
+}
+
+bool CommandProcessor::queue_enabled_(uint32_t qi) const {
+    return (cp_ctrl_ & 0x1) && (qs_[qi].regs.control & 0x1);
+}
 
 bool CommandProcessor::enabled() const {
-    return (cp_ctrl_ & 0x1) && (q0_.control & 0x1);
+    for (uint32_t qi = 0; qi < NUM_QUEUES; ++qi) {
+        if (queue_enabled_(qi))
+            return true;
+    }
+    return false;
 }
 
 bool CommandProcessor::busy() const {
-    return enabled() && (q0_.head < q0_.tail
-                         || cl_loaded_
-                         || eng_state_ != EngState::Idle
-                         || launch_state_ != LaunchState::Idle);
+    if (launch_state_ != LaunchState::Idle)
+        return true;
+    for (uint32_t qi = 0; qi < NUM_QUEUES; ++qi) {
+        const QState& q = qs_[qi];
+        if (queue_enabled_(qi)
+         && (q.regs.head < q.regs.tail || q.cl_loaded || q.eng_state != EngState::Idle))
+            return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Launch shadow (D4)
+// ============================================================================
+
+int CommandProcessor::shadow_index_(uint32_t addr) {
+    if (addr >= SHADOW_KMU_BEGIN && addr < SHADOW_KMU_END)
+        return int(addr - SHADOW_KMU_BEGIN);
+#ifdef VX_CFG_VM_ENABLE
+    if (addr == VX_DCR_MMU_SATP_LO) return int(NUM_SHADOW_KMU);
+    if (addr == VX_DCR_MMU_SATP_HI) return int(NUM_SHADOW_KMU + 1);
+#endif
+    return -1;
+}
+
+uint32_t CommandProcessor::shadow_addr_(int index) {
+#ifdef VX_CFG_VM_ENABLE
+    if (uint32_t(index) == NUM_SHADOW_KMU)     return VX_DCR_MMU_SATP_LO;
+    if (uint32_t(index) == NUM_SHADOW_KMU + 1) return VX_DCR_MMU_SATP_HI;
+#endif
+    return SHADOW_KMU_BEGIN + uint32_t(index);
+}
+
+uint32_t CommandProcessor::shadow_reset_value_(uint32_t addr) {
+    switch (addr) {
+    case VX_DCR_KMU_BLOCK_DIM_X:   case VX_DCR_KMU_BLOCK_DIM_Y:   case VX_DCR_KMU_BLOCK_DIM_Z:
+    case VX_DCR_KMU_GRID_DIM_X:    case VX_DCR_KMU_GRID_DIM_Y:    case VX_DCR_KMU_GRID_DIM_Z:
+    case VX_DCR_KMU_CLUSTER_DIM_X: case VX_DCR_KMU_CLUSTER_DIM_Y: case VX_DCR_KMU_CLUSTER_DIM_Z:
+    case VX_DCR_KMU_WARP_STEP_X:   case VX_DCR_KMU_WARP_STEP_Y:   case VX_DCR_KMU_WARP_STEP_Z:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// The launch takes the KMU, then the queue's shadow is written through,
+// tagged with the queue, before start. The KMU stays with the queue until its
+// kernel drains, so no other queue's launch registers reach the GPU in between.
+bool CommandProcessor::try_begin_launch_(uint32_t qi) {
+    if (launch_state_ != LaunchState::Idle)
+        return false;
+    launch_owner_ = qi;
+    if (hooks_.vortex_dcr_write) {
+        const QState& q = qs_[qi];
+        for (uint32_t i = 0; i < NUM_SHADOW; ++i)
+            hooks_.vortex_dcr_write(shadow_addr_(int(i)), q.shadow[i], qi);
+    }
+    launch_state_ = LaunchState::PulseStart;
+    return true;
+}
+
+// ============================================================================
+// DCR access on behalf of a queue (D2, D4, D5)
+// ============================================================================
+
+// A device-resident command bundle (QMD, OP_DRAW step list) is tenant-
+// rewritable (see DCR_PRIV_BEGIN in cmd_processor.h), so the checker's
+// configuration window is unreachable from it: a forged {BUF_OWNER, self} /
+// {BUF_COMMIT, 1} pair must not become a privileged claim on a victim's
+// buffer. Dropped silently and counted rather than raising Q_ERROR — a refused
+// write is a policy decision on a per-pair basis, not a malformed command, and
+// stalling the queue would turn the attempt into a denial of service against
+// the legitimate launch that carries the rest of the bundle. Q_DCR_BLOCKED
+// (0x134) makes the attempt observable.
+bool CommandProcessor::dcr_write_(uint32_t qi, uint32_t addr, uint32_t value,
+                                  bool indirect) {
+    QState& q = qs_[qi];
+    if (indirect && addr >= DCR_PRIV_BEGIN && addr < DCR_PRIV_END) {
+        if (q.dcr_blocked != 0xFFFFFFFFu)   // saturate rather than wrap
+            ++q.dcr_blocked;
+        return false;
+    }
+    const int si = shadow_index_(addr);
+    if (si >= 0) {
+        q.shadow[si] = value;
+        return true;
+    }
+    if (hooks_.vortex_dcr_write)
+        hooks_.vortex_dcr_write(addr, value, qi);
+    return true;
+}
+
+uint32_t CommandProcessor::dcr_read_(uint32_t qi, uint32_t addr, uint32_t tag) {
+#if VX_CFG_CHECKER_DEBUG_READS == 0
+    if (addr >= DCR_PRIV_BEGIN && addr < DCR_PRIV_END) {
+        QState& q = qs_[qi];
+        if (q.dcr_blocked != 0xFFFFFFFFu)
+            ++q.dcr_blocked;
+        return 0;
+    }
+#endif
+    // A queue reads back its own launch registers, not whichever queue's
+    // the GPU last saw.
+    const int si = shadow_index_(addr);
+    if (si >= 0)
+        return qs_[qi].shadow[si];
+    return hooks_.vortex_dcr_read ? hooks_.vortex_dcr_read(addr, tag) : 0;
 }
 
 // ============================================================================
@@ -81,21 +200,22 @@ void CommandProcessor::mmio_write(uint32_t off, uint32_t value) {
         case 0x004: case 0x008: case 0x010: case 0x014:
         case 0x018: case 0x01C: case 0x020: case 0x024: return;
     }
-    // Queue 0 (offsets 0x100..0x12F)
-    if (off >= 0x100 && off < 0x140) {
-        switch (off - 0x100) {
-            case 0x00: q0_.ring_base   = (q0_.ring_base & 0xFFFFFFFF00000000ULL) | uint64_t(value);            return;
-            case 0x04: q0_.ring_base   = (q0_.ring_base & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
-            case 0x08: q0_.head_addr   = (q0_.head_addr & 0xFFFFFFFF00000000ULL) | uint64_t(value);           return;
-            case 0x0C: q0_.head_addr   = (q0_.head_addr & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
-            case 0x10: q0_.cmpl_addr   = (q0_.cmpl_addr & 0xFFFFFFFF00000000ULL) | uint64_t(value);           return;
-            case 0x14: q0_.cmpl_addr   = (q0_.cmpl_addr & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
-            case 0x18: q0_.ring_log2   = uint8_t(value & 0xFF);                                                 return;
-            case 0x1C: q0_.control     = value;                                                                 return;
-            case 0x20: q0_.tail_lo_staging = value;                                                             return;
+    // Queue q: offsets 0x100 + q*0x40 .. +0x3F
+    if (off >= 0x100 && off < 0x100 + NUM_QUEUES * 0x40) {
+        Queue& r = qs_[(off - 0x100) / 0x40].regs;
+        switch ((off - 0x100) % 0x40) {
+            case 0x00: r.ring_base   = (r.ring_base & 0xFFFFFFFF00000000ULL) | uint64_t(value);            return;
+            case 0x04: r.ring_base   = (r.ring_base & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
+            case 0x08: r.head_addr   = (r.head_addr & 0xFFFFFFFF00000000ULL) | uint64_t(value);           return;
+            case 0x0C: r.head_addr   = (r.head_addr & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
+            case 0x10: r.cmpl_addr   = (r.cmpl_addr & 0xFFFFFFFF00000000ULL) | uint64_t(value);           return;
+            case 0x14: r.cmpl_addr   = (r.cmpl_addr & 0x00000000FFFFFFFFULL) | (uint64_t(value) << 32);   return;
+            case 0x18: r.ring_log2   = uint8_t(value & 0xFF);                                                 return;
+            case 0x1C: r.control     = value;                                                                 return;
+            case 0x20: r.tail_lo_staging = value;                                                             return;
             case 0x24: {
                 // Atomic tail commit: writing the HI word completes the 64-bit update.
-                q0_.tail = (uint64_t(value) << 32) | uint64_t(q0_.tail_lo_staging);
+                r.tail = (uint64_t(value) << 32) | uint64_t(r.tail_lo_staging);
                 return;
             }
             // SEQNUM / ERROR are RO; ignore.
@@ -112,12 +232,12 @@ uint32_t CommandProcessor::mmio_read(uint32_t off) const {
         case 0x008: {
             // CP_DEV_CAPS: {SUPPORTS_QMD:1 @bit26 | SUPPORTS_DRAW:1 @bit25 |
             // VM_ENABLED:1 @bit24 | AXI_TID_W:8 | RING_LOG2:8 | NUM_QUEUES:8}.
-            // Defaults: TID=6, RING_LOG2=16, NUM_QUEUES=1. VM_ENABLED reflects
-            // the build-config so the config-agnostic libvortex.so can
-            // discover VM at open. SUPPORTS_DRAW / SUPPORTS_QMD = 1: this
-            // (Emulation) CP decodes CMD_DRAW (OP_DRAW) and CMD_LAUNCH_QMD;
-            // the RTL CP advertises 0 until its mirrors are synth-validated,
-            // so the runtime falls back to plain ring commands there.
+            // Defaults: TID=6, RING_LOG2=16. VM_ENABLED reflects the
+            // build-config so the config-agnostic libvortex.so can discover VM
+            // at open. SUPPORTS_DRAW / SUPPORTS_QMD = 1: this (Emulation) CP
+            // decodes CMD_DRAW (OP_DRAW) and CMD_LAUNCH_QMD; the RTL CP
+            // advertises 0 until its mirrors are synth-validated, so the
+            // runtime falls back to plain ring commands there.
             uint32_t vm_enabled = 0;
 #ifdef VX_CFG_VM_ENABLE
             vm_enabled = 1u << 24;
@@ -126,7 +246,7 @@ uint32_t CommandProcessor::mmio_read(uint32_t off) const {
             const uint32_t supports_qmd  = 1u << 26;
             const uint32_t fault_report  = hooks_.mmu_fault_report ? (1u << 27) : 0;
             return supports_qmd | supports_draw | vm_enabled | fault_report
-                 | (uint32_t(6) << 16) | (uint32_t(16) << 8) | uint32_t(1);
+                 | (uint32_t(6) << 16) | (uint32_t(16) << 8) | uint32_t(NUM_QUEUES);
         }
         case 0x010: return uint32_t(cycle_counter_ & 0xFFFFFFFF);
         case 0x014: return uint32_t(cycle_counter_ >> 32);
@@ -137,22 +257,24 @@ uint32_t CommandProcessor::mmio_read(uint32_t off) const {
         case 0x028: return uint32_t(satp_ & 0xFFFFFFFF);
         case 0x02C: return uint32_t(satp_ >> 32);
     }
-    if (off >= 0x100 && off < 0x140) {
-        switch (off - 0x100) {
-            case 0x00: return uint32_t(q0_.ring_base & 0xFFFFFFFF);
-            case 0x04: return uint32_t(q0_.ring_base >> 32);
-            case 0x08: return uint32_t(q0_.head_addr & 0xFFFFFFFF);
-            case 0x0C: return uint32_t(q0_.head_addr >> 32);
-            case 0x10: return uint32_t(q0_.cmpl_addr & 0xFFFFFFFF);
-            case 0x14: return uint32_t(q0_.cmpl_addr >> 32);
-            case 0x18: return uint32_t(q0_.ring_log2);
-            case 0x1C: return q0_.control;
-            case 0x20: return q0_.tail_lo_staging;
-            case 0x24: return uint32_t(q0_.tail >> 32);
-            case 0x28: return uint32_t(q0_.seqnum & 0xFFFFFFFF);
-            case 0x2C: return q0_.error;
-            case 0x30: return last_dcr_rsp_;  // last CMD_DCR_READ response
-            case 0x34: return dcr_blocked_;   // privileged-window refusals
+    if (off >= 0x100 && off < 0x100 + NUM_QUEUES * 0x40) {
+        const QState& q = qs_[(off - 0x100) / 0x40];
+        const Queue& r = q.regs;
+        switch ((off - 0x100) % 0x40) {
+            case 0x00: return uint32_t(r.ring_base & 0xFFFFFFFF);
+            case 0x04: return uint32_t(r.ring_base >> 32);
+            case 0x08: return uint32_t(r.head_addr & 0xFFFFFFFF);
+            case 0x0C: return uint32_t(r.head_addr >> 32);
+            case 0x10: return uint32_t(r.cmpl_addr & 0xFFFFFFFF);
+            case 0x14: return uint32_t(r.cmpl_addr >> 32);
+            case 0x18: return uint32_t(r.ring_log2);
+            case 0x1C: return r.control;
+            case 0x20: return r.tail_lo_staging;
+            case 0x24: return uint32_t(r.tail >> 32);
+            case 0x28: return uint32_t(r.seqnum & 0xFFFFFFFF);
+            case 0x2C: return r.error;
+            case 0x30: return q.last_dcr_rsp;  // last CMD_DCR_READ response
+            case 0x34: return q.dcr_blocked;   // privileged-window refusals
         }
     }
     return 0xDEADBEEF;
@@ -212,20 +334,20 @@ uint64_t CommandProcessor::cp_translate(uint64_t vaddr, bool physical) const {
 // Fetch + unpack
 // ============================================================================
 
-void CommandProcessor::fetch_if_needed() {
-    if (cl_loaded_) return;
-    if (q0_.head >= q0_.tail) return;
-    const uint64_t mask = (uint64_t(1) << q0_.ring_log2) - 1;
-    const uint64_t off  = q0_.head & mask;
+void CommandProcessor::fetch_if_needed(QState& q) {
+    if (q.cl_loaded) return;
+    if (q.regs.head >= q.regs.tail) return;
+    const uint64_t mask = (uint64_t(1) << q.regs.ring_log2) - 1;
+    const uint64_t off  = q.regs.head & mask;
     if (!hooks_.dram_read) return;
-    hooks_.dram_read(q0_.ring_base + off, cl_buf_.data(), CL_BYTES);
-    cl_loaded_   = true;
-    cl_cmd_slot_ = 0;
-    unpack_cl();
+    hooks_.dram_read(q.regs.ring_base + off, q.cl_buf.data(), CL_BYTES);
+    q.cl_loaded   = true;
+    q.cl_cmd_slot = 0;
+    unpack_cl(q);
 }
 
-int CommandProcessor::decode_cmd(int off, Cmd& out) {
-    return decode_cmd_bytes(cl_buf_.data(), int(CL_BYTES), off, out);
+int CommandProcessor::decode_cmd(const QState& q, int off, Cmd& out) const {
+    return decode_cmd_bytes(q.cl_buf.data(), int(CL_BYTES), off, out);
 }
 
 int CommandProcessor::decode_cmd_bytes(const uint8_t* buf, int len,
@@ -264,20 +386,20 @@ int CommandProcessor::decode_cmd_bytes(const uint8_t* buf, int len,
     }
 }
 
-void CommandProcessor::unpack_cl() {
-    cl_cmd_count_ = 0;
-    cl_cmd_slot_  = 0;
+void CommandProcessor::unpack_cl(QState& q) {
+    q.cl_cmd_count = 0;
+    q.cl_cmd_slot  = 0;
     int offset = 0;
     for (int slot = 0; slot < MAX_CMDS_PER_CL; ++slot) {
         if (offset + 4 > int(CL_BYTES)) break;
-        const uint8_t opcode = cl_buf_[offset];
-        const uint8_t flags  = cl_buf_[offset + 1];
+        const uint8_t opcode = q.cl_buf[offset];
+        const uint8_t flags  = q.cl_buf[offset + 1];
         // Zero header = padding sentinel; stop.
         if (opcode == 0 && flags == 0) break;
         Cmd c;
-        const int sz = decode_cmd(offset, c);
+        const int sz = decode_cmd(q, offset, c);
         if (offset + sz > int(CL_BYTES)) break;
-        ++cl_cmd_count_;
+        ++q.cl_cmd_count;
         offset += sz;
     }
 }
@@ -286,19 +408,19 @@ void CommandProcessor::unpack_cl() {
 // Engine FSM
 // ============================================================================
 
-void CommandProcessor::publish_completion() {
-    if (!hooks_.dram_write || q0_.cmpl_addr == 0) return;
-    uint64_t seq = q0_.seqnum;
-    hooks_.dram_write(q0_.cmpl_addr, &seq, sizeof(seq));
+void CommandProcessor::publish_completion(const QState& q) {
+    if (!hooks_.dram_write || q.regs.cmpl_addr == 0) return;
+    uint64_t seq = q.regs.seqnum;
+    hooks_.dram_write(q.regs.cmpl_addr, &seq, sizeof(seq));
 }
 
 // wait_op_e encoded in arg2[1:0].
-bool CommandProcessor::event_wait_satisfied_() {
+bool CommandProcessor::event_wait_satisfied_(const Cmd& c) {
     if (!hooks_.dram_read) return true;   // no DRAM hook -> retire as NOP
     uint64_t cur = 0;
-    hooks_.dram_read(cur_cmd_.arg0, &cur, sizeof(cur));
-    const uint64_t target = cur_cmd_.arg1;
-    const uint32_t op = uint32_t(cur_cmd_.arg2) & 0x3;
+    hooks_.dram_read(c.arg0, &cur, sizeof(cur));
+    const uint64_t target = c.arg1;
+    const uint32_t op = uint32_t(c.arg2) & 0x3;
     switch (op) {
         case 0: return cur == target;   // WAIT_OP_EQ
         case 1: return cur >= target;   // WAIT_OP_GE
@@ -308,34 +430,13 @@ bool CommandProcessor::event_wait_satisfied_() {
     }
 }
 
-// Apply one {dcr_addr, value} pair that was read out of device memory.
-//
-// Device-resident command bundles are tenant-rewritable (see DCR_PRIV_BEGIN in
-// cmd_processor.h), so the checker's configuration window is unreachable from
-// them: a forged {BUF_OWNER, self} / {BUF_COMMIT, 1} pair must not become a
-// privileged claim on a victim's buffer. Dropped silently and counted rather
-// than raising Q_ERROR — a refused write is a policy decision on a per-pair
-// basis, not a malformed command, and stalling the queue would turn the
-// attempt into a denial of service against the legitimate launch that carries
-// the rest of the bundle. Q_DCR_BLOCKED (0x134) makes the attempt observable.
-bool CommandProcessor::dcr_write_indirect_(uint32_t addr, uint32_t value) {
-    if (addr >= DCR_PRIV_BEGIN && addr < DCR_PRIV_END) {
-        if (dcr_blocked_ != 0xFFFFFFFFu)   // saturate rather than wrap
-            ++dcr_blocked_;
-        return false;
-    }
-    if (hooks_.vortex_dcr_write)
-        hooks_.vortex_dcr_write(addr, value);
-    return true;
-}
-
-// CMD_LAUNCH_QMD: read the KMU descriptor from device memory and replay it
-// through the DCR-write hook. The descriptor is a {uint32 count, then count ×
+// CMD_LAUNCH_QMD: read the KMU descriptor from device memory and apply it as
+// the queue's launch registers. The descriptor is a {uint32 count, then count ×
 // (uint32 dcr_addr, uint32 value)} list the host staged before submit (like a
 // kernel-args blob). cp_translate matches the address the host's CMD_MEM_WRITE
 // staged it at (VM walk when active, passthrough otherwise).
-void CommandProcessor::apply_qmd_(uint64_t qmd_addr) {
-    if (!hooks_.dram_read || !hooks_.vortex_dcr_write) return;
+void CommandProcessor::apply_qmd_(uint32_t qi, uint64_t qmd_addr) {
+    if (!hooks_.dram_read) return;
     uint64_t addr = cp_translate(qmd_addr, /*physical=*/false);
     uint32_t count = 0;
     hooks_.dram_read(addr, &count, sizeof(count));
@@ -347,38 +448,27 @@ void CommandProcessor::apply_qmd_(uint64_t qmd_addr) {
         hooks_.dram_read(addr, pair, sizeof(pair));
         addr += sizeof(pair);
         // VX_DCR_ADDR_BITS=12. Filtered: the blob is in tenant-writable memory.
-        dcr_write_indirect_(pair[0] & 0xFFF, pair[1]);
+        dcr_write_(qi, pair[0] & 0xFFF, pair[1], /*indirect=*/true);
     }
 }
 
 // Execute one draw-bundle step. Inline ops (DCR_WRITE/DCR_READ/CACHE_FLUSH)
 // complete immediately and return false; a launch step (LAUNCH/LAUNCH_QMD)
-// kicks the launch sub-FSM and returns true so the caller waits for the drain
-// (the inter-stage barrier). Mirrors the per-opcode logic of the ring Bid path.
-bool CommandProcessor::exec_inline_cmd_(const Cmd& c, bool indirect) {
+// returns true so the caller takes the KMU and waits for the drain (the
+// inter-stage barrier). Mirrors the per-opcode logic of the ring Bid path.
+bool CommandProcessor::exec_inline_cmd_(uint32_t qi, const Cmd& c, bool indirect) {
     switch (c.opcode) {
         case OP_LAUNCH:
         case OP_LAUNCH_QMD:
-            if (c.opcode == OP_LAUNCH_QMD)
-                apply_qmd_(c.arg0);
-            launch_state_ = LaunchState::PulseStart;
             return true;
-        case OP_DCR_WRITE: {
-            const uint32_t addr = uint32_t(c.arg0 & 0xFFF);
-            const uint32_t val  = uint32_t(c.arg1 & 0xFFFFFFFF);
+        case OP_DCR_WRITE:
             // A step decoded out of a device-resident descriptor is subject to
             // the privileged-window filter; a ring command is not.
-            if (indirect) {
-                dcr_write_indirect_(addr, val);
-            } else if (hooks_.vortex_dcr_write) {
-                hooks_.vortex_dcr_write(addr, val);
-            }
+            dcr_write_(qi, uint32_t(c.arg0 & 0xFFF), uint32_t(c.arg1 & 0xFFFFFFFF), indirect);
             return false;
-        }
         case OP_DCR_READ:
-            if (hooks_.vortex_dcr_read)
-                last_dcr_rsp_ = hooks_.vortex_dcr_read(
-                    uint32_t(c.arg0 & 0xFFF), uint32_t(c.arg1 & 0xFFFFFFFF));
+            qs_[qi].last_dcr_rsp = dcr_read_(qi, uint32_t(c.arg0 & 0xFFF),
+                                             uint32_t(c.arg1 & 0xFFFFFFFF));
             return false;
         case OP_CACHE_FLUSH:
             if (hooks_.vortex_dcr_read) {
@@ -393,15 +483,15 @@ bool CommandProcessor::exec_inline_cmd_(const Cmd& c, bool indirect) {
     }
 }
 
-// Read draw_step_'s 28-byte cmd record from the descriptor into draw_cmd_.
-void CommandProcessor::draw_load_step_() {
-    draw_cmd_ = Cmd{};
+// Read q.draw_step's 28-byte cmd record from the descriptor into q.draw_cmd.
+void CommandProcessor::draw_load_step_(QState& q) {
+    q.draw_cmd = Cmd{};
     if (!hooks_.dram_read) return;
     uint8_t buf[DRAW_STEP_BYTES] = {0};
-    const uint64_t at = draw_phys_ + 4
-                      + uint64_t(draw_step_) * DRAW_STEP_BYTES;
+    const uint64_t at = q.draw_phys + 4
+                      + uint64_t(q.draw_step) * DRAW_STEP_BYTES;
     hooks_.dram_read(at, buf, DRAW_STEP_BYTES);
-    decode_cmd_bytes(buf, DRAW_STEP_BYTES, 0, draw_cmd_);
+    decode_cmd_bytes(buf, DRAW_STEP_BYTES, 0, q.draw_cmd);
 }
 
 void CommandProcessor::tick_launch() {
@@ -423,126 +513,125 @@ void CommandProcessor::tick_launch() {
     }
 }
 
-void CommandProcessor::tick_engine() {
+void CommandProcessor::tick_engine(uint32_t qi) {
+    QState& q = qs_[qi];
+
     // Decode a single cmd at the current slot and walk it through the FSM.
-    auto load_next_cmd = [this]() -> bool {
-        if (!cl_loaded_) return false;
-        if (cl_cmd_slot_ >= cl_cmd_count_) {
+    auto load_next_cmd = [this, &q]() -> bool {
+        if (!q.cl_loaded) return false;
+        if (q.cl_cmd_slot >= q.cl_cmd_count) {
             // All commands in this CL consumed (or it was pure padding);
             // advance head and drop the CL.
-            q0_.head   += CL_BYTES;
-            cl_loaded_ = false;
+            q.regs.head += CL_BYTES;
+            q.cl_loaded = false;
             return false;
         }
         int off = 0;
-        for (int s = 0; s < cl_cmd_slot_; ++s) {
+        for (int s = 0; s < q.cl_cmd_slot; ++s) {
             Cmd skip;
-            off += decode_cmd(off, skip);
+            off += decode_cmd(q, off, skip);
         }
-        decode_cmd(off, cur_cmd_);
-        cur_is_launch_ = (cur_cmd_.opcode == OP_LAUNCH ||
-                          cur_cmd_.opcode == OP_LAUNCH_QMD);
-        switch (cur_cmd_.opcode) {
+        decode_cmd(q, off, q.cur_cmd);
+        q.cur_is_launch = (q.cur_cmd.opcode == OP_LAUNCH ||
+                           q.cur_cmd.opcode == OP_LAUNCH_QMD);
+        switch (q.cur_cmd.opcode) {
             case OP_NOP: case OP_FENCE:
                 // No resource bid for these opcodes; retire as NOP.
-                cur_is_no_resource_ = true;
+                q.cur_is_no_resource = true;
                 break;
             default:
                 // LAUNCH, DCR_*, MEM_*, EVENT_SIG, EVENT_WAIT all bid a
                 // resource.
-                cur_is_no_resource_ = false;
+                q.cur_is_no_resource = false;
                 break;
         }
         return true;
     };
 
-    switch (eng_state_) {
+    const Cmd& c = q.cur_cmd;
+    switch (q.eng_state) {
         case EngState::Idle:
-            fetch_if_needed();
+            fetch_if_needed(q);
             if (load_next_cmd())
-                eng_state_ = EngState::Decode;
+                q.eng_state = EngState::Decode;
             return;
 
         case EngState::Decode:
-            if (cur_is_no_resource_) {
-                eng_state_ = EngState::Retire;
-            } else {
-                eng_state_ = EngState::Bid;
-            }
+            q.eng_state = q.cur_is_no_resource ? EngState::Retire : EngState::Bid;
             return;
 
         case EngState::Bid:
-            // Dispatch to the resource. Single-queue means we always win
-            // the arbiter, so transition immediately to WaitDone.
-            if (cur_is_launch_) {
+            // Dispatch to the resource. Only the KMU is contended: DCR, DMA
+            // and event commands complete within the tick, so they never
+            // interleave with another queue's command mid-way.
+            if (q.cur_is_launch) {
                 // QMD launch: the KMU descriptor lives in memory as a
                 // {count, (dcr_addr,value)...} list (NVIDIA QMD model). Apply
-                // it through the DCR-write hook, then pulse start exactly like
+                // it to the queue's launch registers, then launch exactly like
                 // a plain CMD_LAUNCH — collapsing ~18 ring DCR writes to one.
-                if (cur_cmd_.opcode == OP_LAUNCH_QMD)
-                    apply_qmd_(cur_cmd_.arg0);
-                launch_state_ = LaunchState::PulseStart;
-                eng_state_    = EngState::WaitDone;
-            } else if (cur_cmd_.opcode == OP_DRAW) {
+                // Applied only once the KMU is ours, so a retried bid does not
+                // re-read the descriptor.
+                if (launch_state_ != LaunchState::Idle)
+                    return;   // another queue's kernel holds the KMU
+                if (c.opcode == OP_LAUNCH_QMD)
+                    apply_qmd_(qi, c.arg0);
+                (void)try_begin_launch_(qi);
+                q.eng_state = EngState::WaitDone;
+            } else if (c.opcode == OP_DRAW) {
                 // Device-orchestrated draw: arg0 → resident draw descriptor
                 // {uint32 num_steps, steps[28 B]...}. Walk the embedded command
                 // bundle (DrawStep), retiring the one OP_DRAW when drained.
-                draw_phys_ = cp_translate(cur_cmd_.arg0, /*physical=*/false);
-                draw_num_steps_ = 0;
+                q.draw_phys = cp_translate(c.arg0, /*physical=*/false);
+                q.draw_num_steps = 0;
                 if (hooks_.dram_read)
-                    hooks_.dram_read(draw_phys_, &draw_num_steps_,
-                                     sizeof(draw_num_steps_));
-                if (draw_num_steps_ > MAX_DRAW_STEPS)
-                    draw_num_steps_ = MAX_DRAW_STEPS;
-                draw_step_ = 0;
-                eng_state_ = EngState::DrawStep;
-            } else if (cur_cmd_.opcode == OP_DCR_WRITE) {
-                // Issue the DCR write through the hook and retire immediately.
-                if (hooks_.vortex_dcr_write) {
-                    uint32_t addr = uint32_t(cur_cmd_.arg0 & 0xFFF); // VX_DCR_ADDR_BITS=12
-                    uint32_t val  = uint32_t(cur_cmd_.arg1 & 0xFFFFFFFF);
-                    hooks_.vortex_dcr_write(addr, val);
-                }
-                eng_state_ = EngState::Retire;
-            } else if (cur_cmd_.opcode == OP_DCR_READ) {
+                    hooks_.dram_read(q.draw_phys, &q.draw_num_steps,
+                                     sizeof(q.draw_num_steps));
+                if (q.draw_num_steps > MAX_DRAW_STEPS)
+                    q.draw_num_steps = MAX_DRAW_STEPS;
+                q.draw_step = 0;
+                q.eng_state = EngState::DrawStep;
+            } else if (c.opcode == OP_DCR_WRITE) {
+                // A ring command: the privileged window is reachable, and the
+                // write is attributed to this queue.
+                dcr_write_(qi, uint32_t(c.arg0 & 0xFFF), uint32_t(c.arg1 & 0xFFFFFFFF),
+                           /*indirect=*/false);   // VX_DCR_ADDR_BITS=12
+                q.eng_state = EngState::Retire;
+            } else if (c.opcode == OP_DCR_READ) {
                 // Issue the DCR read; latch the response into the regfile
                 // slot so the host can grab it after polling Q_SEQNUM.
-                if (hooks_.vortex_dcr_read) {
-                    uint32_t addr = uint32_t(cur_cmd_.arg0 & 0xFFF);
-                    uint32_t tag  = uint32_t(cur_cmd_.arg1 & 0xFFFFFFFF);
-                    last_dcr_rsp_ = hooks_.vortex_dcr_read(addr, tag);
-                }
-                eng_state_ = EngState::Retire;
-            } else if (cur_cmd_.opcode == OP_CACHE_FLUSH) {
+                q.last_dcr_rsp = dcr_read_(qi, uint32_t(c.arg0 & 0xFFF),
+                                           uint32_t(c.arg1 & 0xFFFFFFFF));
+                q.eng_state = EngState::Retire;
+            } else if (c.opcode == OP_CACHE_FLUSH) {
                 // Sweep a per-core DCR-read of VX_DCR_BASE_CACHE_FLUSH across
                 // [0, num_cores). arg0 carries num_cores; dcr_read routes each
                 // call to flush_caches() (drains dcache/L2/L3 to memsim).
                 if (hooks_.vortex_dcr_read) {
-                    uint32_t n = uint32_t(cur_cmd_.arg0 & 0xFFFFFFFF);
+                    uint32_t n = uint32_t(c.arg0 & 0xFFFFFFFF);
                     for (uint32_t cid = 0; cid < n; ++cid) {
                         (void)hooks_.vortex_dcr_read(VX_DCR_BASE_CACHE_FLUSH, cid);
                     }
                 }
-                eng_state_ = EngState::Retire;
-            } else if (cur_cmd_.opcode == OP_EVENT_SIG) {
+                q.eng_state = EngState::Retire;
+            } else if (c.opcode == OP_EVENT_SIG) {
                 // CMD_EVENT_SIGNAL: write arg1 (8-byte value) to arg0
                 // (device counter slot).
                 if (hooks_.dram_write) {
-                    uint64_t v = cur_cmd_.arg1;
-                    hooks_.dram_write(cur_cmd_.arg0, &v, sizeof(v));
+                    uint64_t v = c.arg1;
+                    hooks_.dram_write(c.arg0, &v, sizeof(v));
                 }
-                eng_state_ = EngState::Retire;
-            } else if (cur_cmd_.opcode == OP_EVENT_WAIT) {
+                q.eng_state = EngState::Retire;
+            } else if (c.opcode == OP_EVENT_WAIT) {
                 // CMD_EVENT_WAIT: poll arg0 until it satisfies the wait_op
                 // (arg2[1:0]) comparison against arg1; retry each tick.
-                if (event_wait_satisfied_()) {
-                    eng_state_ = EngState::Retire;
+                if (event_wait_satisfied_(c)) {
+                    q.eng_state = EngState::Retire;
                 } else {
                     // Spin in Bid (no state change); re-checked each tick.
                 }
-            } else if (cur_cmd_.opcode == OP_MEM_WRITE ||
-                       cur_cmd_.opcode == OP_MEM_READ  ||
-                       cur_cmd_.opcode == OP_MEM_COPY) {
+            } else if (c.opcode == OP_MEM_WRITE ||
+                       c.opcode == OP_MEM_READ  ||
+                       c.opcode == OP_MEM_COPY) {
                 // CMD_MEM_*: copy arg2 bytes from src (arg1) to dst (arg0).
                 // The CP DMA is an MMU-aware copy engine: the device-side
                 // operand is a virtual address, translated here by a
@@ -552,20 +641,20 @@ void CommandProcessor::tick_engine() {
                 // through untranslated. A buffer is one contiguous PA
                 // allocation, so translating the base covers the transfer.
                 if (hooks_.dram_read && hooks_.dram_write
-                 && cur_cmd_.arg2 != 0) {
+                 && c.arg2 != 0) {
                     const bool physical =
-                        (cur_cmd_.flags & MEM_FLAG_PHYSICAL) != 0;
-                    uint64_t dst = cur_cmd_.arg0;
-                    uint64_t src = cur_cmd_.arg1;
-                    if (cur_cmd_.opcode == OP_MEM_WRITE) {
+                        (c.flags & MEM_FLAG_PHYSICAL) != 0;
+                    uint64_t dst = c.arg0;
+                    uint64_t src = c.arg1;
+                    if (c.opcode == OP_MEM_WRITE) {
                         dst = cp_translate(dst, physical);
-                    } else if (cur_cmd_.opcode == OP_MEM_READ) {
+                    } else if (c.opcode == OP_MEM_READ) {
                         src = cp_translate(src, physical);
                     } else { // OP_MEM_COPY — both operands are device
                         dst = cp_translate(dst, physical);
                         src = cp_translate(src, physical);
                     }
-                    const uint64_t total = cur_cmd_.arg2;
+                    const uint64_t total = c.arg2;
                     constexpr uint64_t CHUNK = 64 * 1024;
                     std::vector<uint8_t> buf(
                         std::size_t(total < CHUNK ? total : CHUNK));
@@ -577,33 +666,38 @@ void CommandProcessor::tick_engine() {
                         done += n;
                     }
                 }
-                eng_state_ = EngState::Retire;
+                q.eng_state = EngState::Retire;
             } else {
                 // Unknown opcode — retire as NOP.
-                eng_state_ = EngState::Retire;
+                q.eng_state = EngState::Retire;
             }
             return;
 
         case EngState::WaitDone:
-            // For LAUNCH: wait until the launch FSM is back in Idle.
-            if (cur_is_launch_ && launch_state_ != LaunchState::Idle)
+            // For LAUNCH: wait until this queue's kernel has drained.
+            if (q.cur_is_launch && launch_state_ != LaunchState::Idle)
                 return;
-            eng_state_ = EngState::Retire;
+            q.eng_state = EngState::Retire;
             return;
 
         case EngState::DrawStep:
             // Walk the draw descriptor one step per tick. Inline ops apply now;
-            // a launch step transitions to DrawLaunchWait until its kernel
-            // drains (the inter-stage barrier).
-            if (draw_step_ >= draw_num_steps_) {
-                eng_state_ = EngState::Retire;
+            // a launch step takes the KMU and waits in DrawLaunchWait until its
+            // kernel drains (the inter-stage barrier).
+            if (q.draw_step >= q.draw_num_steps) {
+                q.eng_state = EngState::Retire;
                 return;
             }
-            draw_load_step_();
-            if (exec_inline_cmd_(draw_cmd_, /*indirect=*/true)) {
-                eng_state_ = EngState::DrawLaunchWait;
+            draw_load_step_(q);
+            if (exec_inline_cmd_(qi, q.draw_cmd, /*indirect=*/true)) {
+                if (launch_state_ != LaunchState::Idle)
+                    return;   // KMU busy: re-read and retry this step next tick
+                if (q.draw_cmd.opcode == OP_LAUNCH_QMD)
+                    apply_qmd_(qi, q.draw_cmd.arg0);
+                (void)try_begin_launch_(qi);
+                q.eng_state = EngState::DrawLaunchWait;
             } else {
-                ++draw_step_;
+                ++q.draw_step;
             }
             return;
 
@@ -611,24 +705,35 @@ void CommandProcessor::tick_engine() {
             // tick_launch advances launch_state_; resume the walk on drain.
             if (launch_state_ != LaunchState::Idle)
                 return;
-            ++draw_step_;
-            eng_state_ = EngState::DrawStep;
+            ++q.draw_step;
+            q.eng_state = EngState::DrawStep;
             return;
 
         case EngState::Retire:
-            q0_.seqnum += 1;
-            publish_completion();
-            ++cl_cmd_slot_;
-            eng_state_ = EngState::Idle;
+            q.regs.seqnum += 1;
+            publish_completion(q);
+            ++q.cl_cmd_slot;
+            q.eng_state = EngState::Idle;
             return;
     }
 }
 
 void CommandProcessor::tick() {
     ++cycle_counter_;
-    if (!enabled()) return;
-    tick_engine();
-    tick_launch();
+    // Each enabled queue advances one engine step per tick, starting from a
+    // rotating queue so no queue always wins the KMU when two bid together
+    // (the RTL arbiter is round-robin too).
+    bool any = false;
+    for (uint32_t k = 0; k < NUM_QUEUES; ++k) {
+        const uint32_t qi = (rr_next_ + k) % NUM_QUEUES;
+        if (!queue_enabled_(qi))
+            continue;
+        any = true;
+        tick_engine(qi);
+    }
+    rr_next_ = (rr_next_ + 1) % NUM_QUEUES;
+    if (any || launch_state_ != LaunchState::Idle)
+        tick_launch();
 }
 
 } // namespace vortex

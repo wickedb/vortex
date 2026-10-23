@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ostream>
 #include <algorithm>
+#include <array>
 #include <deque>
 
 using namespace vortex;
@@ -166,15 +167,11 @@ private:
   // the pre-revocation default every owner started at.
   std::vector<uint64_t> epoch_table_;
 
-  // Staged target for the next DCR_CHECKER_EPOCH write (see
-  // DCR_CHECKER_REVOKE_OWNER in mem_checker.h). OWNER_ANY means "nothing
-  // staged" — a bare EPOCH write with no owner staged is a no-op.
-  uint32_t revoke_owner_ = OWNER_ANY;
   uint32_t last_revoked_owner_ = OWNER_ANY;
 
   // Staged DCR claim (Phase 3 step 4). Persists across commits so a re-grant
   // can rewrite one register and commit again.
-  struct {
+  struct Claim {
     uint32_t base = 0;
     uint32_t size = 0;
     uint32_t owner = 0;
@@ -183,7 +180,11 @@ private:
     uint32_t epoch = 0xFFFFFFFFu;
     uint32_t joint = 0;
     uint32_t confined = 0;
-  } claim_;
+  };
+  // One staging set per issuer (spec D3). With shared staging, another queue's
+  // BUF_BASE/SIZE written between a tenant's staging and its COMMIT would
+  // retarget that tenant's claim.
+  std::array<Claim, VX_CFG_CHECKER_TENANTS> claims_;
 
 public:
   Impl(MemChecker* simobject, const Config& config)
@@ -269,27 +270,38 @@ public:
   // The who's-who setup path. Configuration writes take effect immediately:
   // every check reads header_store_ directly, so nothing needs invalidating
   // for a claim to become visible.
-  int dcr_write(uint32_t addr, uint32_t value) {
+  //
+  // `issuer` is the command-processor queue the write came from, i.e. the
+  // tenant (spec D1/D2). Staging is per issuer, claims and leaves are judged
+  // against it, and a revocation advances the issuer's own epoch.
+  int dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
+    if (issuer >= claims_.size()) {
+      ++perf_stats_.claims_foreign;
+      return 0;
+    }
+    Claim& c = claims_[issuer];
     switch (addr) {
-    case DCR_CHECKER_BUF_BASE:   claim_.base  = value; break;
-    case DCR_CHECKER_BUF_SIZE:   claim_.size  = value; break;
-    case DCR_CHECKER_BUF_OWNER:  claim_.owner = value; break;
-    case DCR_CHECKER_BUF_PERMS:  claim_.perms = value; break;
-    case DCR_CHECKER_BUF_EPOCH:  claim_.epoch = value; break;
-    case DCR_CHECKER_BUF_SHARED: claim_.shared = value; break;
-    case DCR_CHECKER_BUF_JOINT:    claim_.joint = value; break;
-    case DCR_CHECKER_BUF_CONFINED: claim_.confined = value; break;
+    case DCR_CHECKER_BUF_BASE:   c.base  = value; break;
+    case DCR_CHECKER_BUF_SIZE:   c.size  = value; break;
+    case DCR_CHECKER_BUF_OWNER:  c.owner = value; break;
+    case DCR_CHECKER_BUF_PERMS:  c.perms = value; break;
+    case DCR_CHECKER_BUF_EPOCH:  c.epoch = value; break;
+    case DCR_CHECKER_BUF_SHARED: c.shared = value; break;
+    case DCR_CHECKER_BUF_JOINT:    c.joint = value; break;
+    case DCR_CHECKER_BUF_CONFINED: c.confined = value; break;
     case DCR_CHECKER_BUF_LEAVE:
-      this->leave(value);
+      this->leave(c, value, issuer);
       break;
     case DCR_CHECKER_BUF_COMMIT:
-      this->install_claim();
+      this->install_claim(c, issuer);
       break;
     case DCR_CHECKER_REVOKE_OWNER:
-      revoke_owner_ = value;
+      // Retired (spec D3): a revocation advances the issuer's own epoch, so
+      // no one can expire another owner's grants. Kept as a no-op address so
+      // an old host image does not fault.
       break;
     case DCR_CHECKER_EPOCH:
-      this->set_epoch(revoke_owner_, value);
+      this->set_epoch(issuer, value);
       break;
     default:
       break;  // reserved registers in the checker range: ignore
@@ -395,6 +407,7 @@ public:
          << ", aliased=" << perf_stats_.claims_aliased
          << ", reclaimed=" << perf_stats_.headers_reclaimed
          << ", unaligned=" << perf_stats_.claims_unaligned
+         << ", foreign=" << perf_stats_.claims_foreign
          << std::endl;
     }
     if (fault_.valid) {
@@ -551,17 +564,25 @@ private:
   // through outward rounding when a size spills past a granule boundary.
   // Cross-owner conflict is the condition that actually matters, so that is
   // the one enforced; misalignment is counted for diagnostics instead.
-  void install_claim() {
-    if (claim_.size == 0)
+  void install_claim(const Claim& c, uint32_t issuer) {
+    if (c.size == 0)
       return;
-    uint64_t first = uint64_t(claim_.base) >> config_.buffer_log2;
-    uint64_t last  = (uint64_t(claim_.base) + claim_.size - 1) >> config_.buffer_log2;
+    // Authorship (spec D2): a tenant claims for itself only. The staged
+    // owner is the issuer's statement of intent, and a claim naming anyone
+    // else -- including OWNER_ANY -- is refused whole. Counted apart from
+    // rejected/aliased: it is an attempt, not a conflict or a capacity limit.
+    if (c.owner != issuer) {
+      ++perf_stats_.claims_foreign;
+      return;
+    }
+    uint64_t first = uint64_t(c.base) >> config_.buffer_log2;
+    uint64_t last  = (uint64_t(c.base) + c.size - 1) >> config_.buffer_log2;
 
     // Diagnostic: does this claim rely on the padding convention the
     // multi-tenant tests follow? Counted, never rejected.
     uint64_t granule_mask = (1ull << config_.buffer_log2) - 1;
-    if ((uint64_t(claim_.base) & granule_mask) != 0
-     || (uint64_t(claim_.size) & granule_mask) != 0)
+    if ((uint64_t(c.base) & granule_mask) != 0
+     || (uint64_t(c.size) & granule_mask) != 0)
       ++perf_stats_.claims_unaligned;
 
     // Pre-pass: reject before mutating anything, so a rejected claim leaves
@@ -585,14 +606,14 @@ private:
       // the default, so that is what a cross-owner conflict is measured
       // against when no header is installed yet.
       const BufferHeader& header = entry.valid ? entry.header : default_header_;
-      if (header.owner_eid != OWNER_ANY && header.owner_eid != claim_.owner) {
+      if (header.owner_eid != OWNER_ANY && header.owner_eid != c.owner) {
         ++perf_stats_.claims_rejected;
         return;
       }
       // A re-claim may add co-owners but never drop one: only a co-owner
       // removes itself (BUF_LEAVE). Otherwise the owner could release joint
       // data to itself by re-claiming without its co-owners.
-      if (entry.valid && (header.joint & ~this->staged_joint()) != 0) {
+      if (entry.valid && (header.joint & ~this->staged_joint(c)) != 0) {
         ++perf_stats_.claims_rejected;
         return;
       }
@@ -605,17 +626,17 @@ private:
       // zero rather than an assumption. Only an installed header can be
       // re-claimed; first claim over an unclaimed granule is not a re-claim,
       // which is why the valid bit is part of the test.
-      if (entry.valid && entry.header.owner_eid == claim_.owner)
+      if (entry.valid && entry.header.owner_eid == c.owner)
         ++perf_stats_.headers_reclaimed;
       entry.valid = true;
       entry.tag = id;
-      entry.header.owner_eid = claim_.owner;
-      entry.header.perms = claim_.perms;
-      entry.header.shared_perms = claim_.shared;
-      entry.header.grant_epoch = (claim_.epoch == 0xFFFFFFFFu) ? UINT64_MAX
-                                                               : uint64_t(claim_.epoch);
-      entry.header.joint    = this->staged_joint();
-      entry.header.confined = (claim_.confined != 0);
+      entry.header.owner_eid = c.owner;
+      entry.header.perms = c.perms;
+      entry.header.shared_perms = c.shared;
+      entry.header.grant_epoch = (c.epoch == 0xFFFFFFFFu) ? UINT64_MAX
+                                                               : uint64_t(c.epoch);
+      entry.header.joint    = this->staged_joint(c);
+      entry.header.confined = (c.confined != 0);
       ++perf_stats_.headers_written;
     }
     ++perf_stats_.dcr_claims;
@@ -623,25 +644,26 @@ private:
 
   // The staged co-owner mask, minus the owner itself; empty for an OWNER_ANY
   // claim, which has no owners to add to.
-  uint32_t staged_joint() const {
-    if (claim_.owner == OWNER_ANY)
+  uint32_t staged_joint(const Claim& c) const {
+    if (c.owner == OWNER_ANY)
       return 0;
-    return claim_.joint & ~eid_bit(claim_.owner);
+    return c.joint & ~eid_bit(c.owner);
   }
 
-  // Release (S2): owner `eid` leaves every granule of the staged range. All
-  // or nothing, like a claim: refused if any granule is unclaimed, does not
-  // list `eid` as an owner, or would be left with no owner. When the leaving
-  // owner is owner_eid, the lowest remaining co-owner takes its place, so the
-  // owner set is exactly the old one minus `eid`.
-  void leave(uint32_t eid) {
+  // Release (S2): owner `eid` leaves every granule of the issuer's staged
+  // range. All or nothing, like a claim: refused if any granule is unclaimed,
+  // does not list `eid` as an owner, or would be left with no owner. When the
+  // leaving owner is owner_eid, the lowest remaining co-owner takes its place,
+  // so the owner set is exactly the old one minus `eid`. Only an owner removes
+  // itself: `eid` must be the issuer (spec D2).
+  void leave(const Claim& c, uint32_t eid, uint32_t issuer) {
     const uint32_t me = eid_bit(eid);
-    if (claim_.size == 0 || me == 0) {
+    if (c.size == 0 || me == 0 || eid != issuer) {
       ++perf_stats_.leaves_refused;
       return;
     }
-    uint64_t first = uint64_t(claim_.base) >> config_.buffer_log2;
-    uint64_t last  = (uint64_t(claim_.base) + claim_.size - 1) >> config_.buffer_log2;
+    uint64_t first = uint64_t(c.base) >> config_.buffer_log2;
+    uint64_t last  = (uint64_t(c.base) + c.size - 1) >> config_.buffer_log2;
     for (uint64_t id = first; id <= last; ++id) {
       const StoreEntry& entry = header_store_[id & header_mask_];
       if (!entry.valid || entry.tag != id || entry.header.owner_eid == OWNER_ANY) {
@@ -772,8 +794,8 @@ void MemChecker::set_epoch(uint32_t owner_eid, uint64_t epoch) {
   impl_->set_epoch(owner_eid, epoch);
 }
 
-int MemChecker::dcr_write(uint32_t addr, uint32_t value) {
-  return impl_->dcr_write(addr, value);
+int MemChecker::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
+  return impl_->dcr_write(addr, value, issuer);
 }
 
 const MemChecker::PerfStats& MemChecker::perf_stats() const {

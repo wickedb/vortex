@@ -62,30 +62,25 @@ constexpr uint32_t OWNER_ANY = 0xFFFFFFFFu;
 constexpr uint32_t DCR_CHECKER_BASE       = 0x300;
 constexpr uint32_t DCR_CHECKER_BUF_BASE   = 0x300;  // buffer base address
 constexpr uint32_t DCR_CHECKER_BUF_SIZE   = 0x301;  // buffer size in bytes
-constexpr uint32_t DCR_CHECKER_BUF_OWNER  = 0x302;  // owner eid (OWNER_ANY = shared)
+constexpr uint32_t DCR_CHECKER_BUF_OWNER  = 0x302;  // owner eid; must equal the issuer
 constexpr uint32_t DCR_CHECKER_BUF_PERMS  = 0x303;  // PERM_R | PERM_W
 constexpr uint32_t DCR_CHECKER_BUF_EPOCH  = 0x304;  // grant epoch (0xFFFFFFFF = no expiry)
 constexpr uint32_t DCR_CHECKER_BUF_COMMIT = 0x305;  // write installs the staged claim
-// Sets owner_eid's entry in the per-owner epoch table (Phase 4 revocation).
-// Scoped by DCR_CHECKER_REVOKE_OWNER, which must be written first — mirrors
-// the staged-claim pattern above (stage the target, then commit). A write
-// with no owner staged (still OWNER_ANY) is a no-op: the checker fails closed
-// rather than falling back to a device-wide revocation. Monotonic: a value
-// that does not strictly increase the owner's current epoch is ignored, so
+// Sets the issuer's entry in the per-owner epoch table (Phase 4 revocation):
+// a tenant revokes its own grants, and only its own. Monotonic: a value that
+// does not strictly increase the owner's current epoch is ignored, so
 // revocation cannot be reversed by writing an earlier value back.
 constexpr uint32_t DCR_CHECKER_EPOCH      = 0x306;
 constexpr uint32_t DCR_CHECKER_BUF_SHARED = 0x307;  // staged non-owner perms (grant to others)
-// Stages which owner's epoch-table entry the next DCR_CHECKER_EPOCH write
-// updates. Persists across writes like `claim_`, so re-revoking the same
-// owner needs no re-stage. Only owner_eid's *own* grants are affected —
-// revoking owner A never touches owner C's unrelated grant to D.
+// Retired by authorship (spec D3). It staged which owner the next EPOCH write
+// advanced, which let any writer expire any owner's grants. EPOCH now
+// advances the issuer's own epoch; writes here are ignored.
 constexpr uint32_t DCR_CHECKER_REVOKE_OWNER = 0x308;
 // Confinement by taint (kernel_identity_oct16.md, SimX proof of concept;
 // active only with VX_CHECKER_TAINT=1). BUF_JOINT stages the co-owner mask
 // and BUF_CONFINED the confined bit for the next BUF_COMMIT. BUF_LEAVE
 // removes one owner (the value) from every granule of the staged range:
-// the release. Until authorship lands, who may write these is unchecked,
-// exactly as BUF_OWNER is today.
+// the release; the leaving owner must be the issuer.
 constexpr uint32_t DCR_CHECKER_BUF_JOINT    = 0x309;
 constexpr uint32_t DCR_CHECKER_BUF_CONFINED = 0x30A;
 constexpr uint32_t DCR_CHECKER_BUF_LEAVE    = 0x30B;
@@ -188,6 +183,9 @@ public:
     // counted here. Non-zero means the store is too small for the granularity
     // in use — a capacity result worth reporting, not a bug to route around.
     uint64_t claims_aliased = 0;
+    // Claims refused because the staged owner was not the issuer: a tenant
+    // tried to claim (or re-claim, or re-grant) for someone else (spec D2).
+    uint64_t claims_foreign = 0;
     // Labeled lines. Requests the port passed because a labeled cache issued
     // them (fills judged at delivery, writebacks authorized on entry), and
     // the denies the caches made at delivery.
@@ -235,8 +233,11 @@ public:
   // Phase 3 step 4: the who's-who setup path. Handles DCR_CHECKER_BASE..END;
   // returns 0. Setup writes are configuration, not data-plane traffic — they
   // take effect immediately and cost no modelled cycles (the attested channel
-  // is pre-launch setup, not on the measured path).
-  int dcr_write(uint32_t addr, uint32_t value);
+  // is pre-launch setup, not on the measured path). `issuer` is the
+  // command-processor queue (tenant) the write arrived on: staging is per
+  // issuer, a claim or leave must name the issuer, and EPOCH advances the
+  // issuer's own epoch.
+  int dcr_write(uint32_t addr, uint32_t value, uint32_t issuer);
 
   // Phase 4 revocation, scoped to one owner: bumping owner_eid's epoch-table
   // entry invalidates only *that owner's* grants whose grant_epoch has

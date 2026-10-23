@@ -448,7 +448,7 @@ bool ProcessorImpl::cycle() {
   return this->any_running();
 }
 
-int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
+int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
   // KMU DCRs route to the KMU and are not broadcast to cores.
   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
   if (is_kmu_dcr) {
@@ -481,7 +481,7 @@ int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value) {
   // inert, so an app that programs its policy runs unchanged on a baseline.
   if (addr >= DCR_CHECKER_BASE && addr < DCR_CHECKER_END) {
     if (mem_checker_)
-      return mem_checker_->dcr_write(addr, value);
+      return mem_checker_->dcr_write(addr, value, issuer);
     return 0;
   }
   for (auto& cluster : clusters_) {
@@ -611,8 +611,8 @@ void Processor::set_mem_telemetry_hook(std::function<void(const MemReq&)> hook) 
   impl_->set_mem_telemetry_hook(std::move(hook));
 }
 
-int Processor::dcr_write(uint32_t addr, uint32_t value) {
-  return impl_->dcr_write(addr, value);
+int Processor::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
+  return impl_->dcr_write(addr, value, issuer);
 }
 
 int Processor::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
