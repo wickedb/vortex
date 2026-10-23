@@ -110,6 +110,14 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         wr_word.tag   = tag_of(wr_buf_id);
     end
 
+    // OUT_REG(0) makes VX_dp_ram an async read (`read` is ignored), so the
+    // check port is addressed with the registered id: the bus moves on to the
+    // next request while S1 is still resolving this one.
+    reg [CHK_BUF_ID_W-1:0] rd_id_r;
+    always @(posedge clk) begin
+        if (rd_en) rd_id_r <= rd_buf_id;
+    end
+
     // Two read ports (check path + installer probe) over one write port. Kept
     // as two VX_dp_ram instances with a mirrored write rather than a true
     // 1W2R macro so the RAM inference stays portable across the Xilinx and
@@ -161,14 +169,6 @@ module VX_checker_store import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .raddr (idx_of(probe_buf_id)),
         .rdata (probe_rdata)
     );
-
-    // OUT_REG(0) makes VX_dp_ram an async read (`read` is ignored), so the
-    // check port is addressed with the registered id: the bus moves on to the
-    // next request while S1 is still resolving this one.
-    reg [CHK_BUF_ID_W-1:0] rd_id_r;
-    always @(posedge clk) begin
-        if (rd_en) rd_id_r <= rd_buf_id;
-    end
 
     // The tag comparison is the whole aliasing fix. Each port compares against
     // the id it actually read: the registered id on the check port, the live

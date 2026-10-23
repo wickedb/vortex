@@ -231,6 +231,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
     // A blocked request retires without downstream acceptance: a dropped write
     // goes nowhere, and a poisoned read is satisfied by the fault queue.
+    wire retiring, blocked;  // driven with the decision (S1), below
     wire s1_retire = (out_valid && out_ready) || (retiring && blocked);
     wire s1_ready = ~s1_valid || s1_retire;
 
@@ -312,8 +313,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // just denial timing (PROJECT.md §8.5). Without ENFORCE the deny is counted
     // and the request still goes through, so a default run stays comparable to
     // baseline.
-    wire blocked  = denied && (ENFORCE != 0);
-    wire retiring = s1_valid && ~lat_busy;
+    assign blocked  = denied && (ENFORCE != 0);
+    assign retiring = s1_valid && ~lat_busy;
 
     assign out_valid = retiring && ~blocked;
     assign out_rw    = s1_rw;
