@@ -223,6 +223,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         wire [L3_MEM_TAG_WIDTH-1:0] chk_out_tag;
         wire [LABEL_EPOCHS_W-1:0] chk_epochs;
         `UNUSED_VAR ({chk_out_deny, chk_out_fault})
+        // The checker passes the full byte address; the port takes the sector address.
+        `UNUSED_VAR (chk_out_addr[`VX_CFG_MEM_ADDR_WIDTH-VX_MEM_ADDR_WIDTH-1:0])
         // Every instance sees the same DCR stream, so every epoch table is the
         // same; the caches take port 0's.
         if (i == 0) begin : g_epochs
