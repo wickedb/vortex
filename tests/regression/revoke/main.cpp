@@ -8,7 +8,8 @@
 //
 //   claim:    shared buffer → owner eid 0 (R|W), shared_perms R, grant_epoch 0
 //   launch 1: both cores read real data (grant active)
-//   revoke:   vx_enqueue_dcr_write(REVOKE_OWNER, 0);
+//   revoke:   vx_enqueue_dcr_write(EPOCH, 1) on owner 0's queue (an owner
+//             revokes only its own grants)
 //             vx_enqueue_dcr_write(EPOCH, 1)          ← the entire revocation
 //   launch 2: core 0 reads real data and writes; core 1 reads poison
 //
@@ -155,7 +156,6 @@ int main(int argc, char** argv) {
     // Revocation, scoped to owner 0 (the buffer's owner): stage the target
     // owner, then commit the new epoch. Two register writes, still no header
     // touched — see common.h.
-    CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_REVOKE_OWNER, 0, 0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_EPOCH, 1, 0, nullptr, nullptr));
     CHECK(vx_enqueue_launch(q, &li2, 0, nullptr, &ev2));
 

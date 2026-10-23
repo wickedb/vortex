@@ -109,11 +109,12 @@ void enqueue_claim(vx_queue_h q, uint64_t base, uint64_t bytes, uint32_t owner,
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_COMMIT, 1,               0, nullptr, nullptr));
 }
 
-// The 2-write scoped revoke. Stage whose epoch moves, then move it. No header
-// is touched, which is the whole reason this is cheap.
+// The scoped revoke: one write that advances the issuing queue's own epoch,
+// so `q` must be `owner`'s queue. No header is touched, which is the whole
+// reason this is cheap.
 void enqueue_revoke(vx_queue_h q, uint32_t owner, uint32_t new_epoch) {
-    CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_REVOKE_OWNER, owner,     0, nullptr, nullptr));
-    CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_EPOCH,        new_epoch, 0, nullptr, nullptr));
+    (void)owner;   // implied by q: an owner revokes only its own grants
+    CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_EPOCH, new_epoch, 0, nullptr, nullptr));
 }
 
 } // namespace

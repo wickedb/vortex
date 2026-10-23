@@ -11,7 +11,7 @@
 // Launch 1 (both grants active): core 1 reads bufA (via the grant), core 0
 // reads bufB (via the grant) — both see real data.
 //
-// The host then revokes ONLY owner 0: REVOKE_OWNER = 0, EPOCH = 1. This must
+// The host then revokes ONLY owner 0: EPOCH = 1 on owner 0's queue. This must
 // advance owner 0's epoch-table entry alone.
 //
 // Launch 2: core 1's read of bufA comes back poison (owner 0's grant

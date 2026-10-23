@@ -118,6 +118,13 @@ int main(int argc, char** argv) {
     vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
     vx_queue_h q = nullptr;
     CHECK(vx_queue_create(dev, &qi, &q));
+    // Each tenant's setup goes through its own command queue: H (tenant 0) on
+    // q, M (tenant 1) on qm. The checker attributes a claim or a leave to the
+    // queue it arrives on and refuses one naming anyone else (authorship).
+    vx_queue_info_t qim = qi;
+    qim.flags |= VX_QUEUE_FLAG_HW_QUEUE(TENANT_M);
+    vx_queue_h qm = nullptr;
+    CHECK(vx_queue_create(dev, &qim, &qm));
 
     Padded images = make_padded(dev, words, granule);
     Padded mown   = make_padded(dev, NUM_PHASES * words, granule);
@@ -142,17 +149,18 @@ int main(int argc, char** argv) {
     const uint32_t RW = CHECKER_PERM_R | CHECKER_PERM_W;
     const uint32_t H_BIT = 1u << TENANT_H;
     enqueue_claim(q, images.base, words, TENANT_H, 0, RW, CHECKER_PERM_R, 1);
-    enqueue_claim(q, mown.base, NUM_PHASES * words, TENANT_M, 0, RW, 0, 0);
-    enqueue_claim(q, out.base, words, TENANT_M, H_BIT, RW, 0, 0);
-    enqueue_claim(q, origin.base, NUM_PHASES * words, TENANT_M, H_BIT, RW, 0, 0);
+    enqueue_claim(qm, mown.base, NUM_PHASES * words, TENANT_M, 0, RW, 0, 0);
+    enqueue_claim(qm, out.base, words, TENANT_M, H_BIT, RW, 0, 0);
+    enqueue_claim(qm, origin.base, NUM_PHASES * words, TENANT_M, H_BIT, RW, 0, 0);
     if (claim_stack) {
         // The stacks sit at a fixed address below VX_MEM_STACK_BASE_ADDR
         // (0xFFFF0000 at XLEN=32). A kernel that has read confined data can
         // only spill to memory H co-owns, so the stack granule is joint too.
         const uint64_t stack_top = 0xFFFF0000ull;
         const uint64_t stack_granule = (stack_top - 1) & ~(granule - 1);
-        enqueue_claim(q, stack_granule, granule, TENANT_M, H_BIT, RW, 0, 0);
+        enqueue_claim(qm, stack_granule, granule, TENANT_M, H_BIT, RW, 0, 0);
     }
+    CHECK(vx_queue_finish(qm, VX_TIMEOUT_INFINITE));
 
     uint32_t grid[1], block[1];
     CHECK(vx_device_max_occupancy_grid(dev, 1, &n, grid, block));
@@ -245,6 +253,7 @@ int main(int argc, char** argv) {
     for (auto* p : {&images, &mown, &pub, &out, &origin}) vx_buffer_release(p->buf);
     vx_kernel_release(kern);
     vx_module_release(mod);
+    vx_queue_release(qm);
     vx_queue_release(q);
     vx_device_dump_perf(dev, stdout);
     vx_device_release(dev);

@@ -85,6 +85,14 @@ int main(int argc, char** argv) {
     vx_queue_h q = nullptr;
     CHECK(vx_queue_create(dev, &qi, &q));
 
+    // Tenant 1's setup goes through tenant 1's own command queue: the checker
+    // attributes a claim to the queue it arrives on and refuses one naming
+    // anyone else (authorship).
+    vx_queue_info_t qi1 = qi;
+    qi1.flags |= VX_QUEUE_FLAG_HW_QUEUE(1);
+    vx_queue_h q1 = nullptr;
+    CHECK(vx_queue_create(dev, &qi1, &q1));
+
     // Protected buffers padded so a granule-aligned claim stays inside them.
     vx_buffer_h secret_buf=nullptr, t1_buf=nullptr, probe_buf=nullptr, origin_buf=nullptr;
     CHECK(vx_buffer_create(dev, used_size + 2*granule, VX_MEM_READ_WRITE, &secret_buf));
@@ -125,7 +133,8 @@ int main(int argc, char** argv) {
     // The who's-who: secret → tenant 0, t1own → tenant 1. Result buffers,
     // kernel code, stacks and args stay unclaimed (shared).
     enqueue_claim(q, secret_base, used_size, 0, CHECKER_PERM_R | CHECKER_PERM_W, GRANT_NO_EXPIRY);
-    enqueue_claim(q, t1_base,     used_size, 1, CHECKER_PERM_R | CHECKER_PERM_W, GRANT_NO_EXPIRY);
+    enqueue_claim(q1, t1_base,    used_size, 1, CHECKER_PERM_R | CHECKER_PERM_W, GRANT_NO_EXPIRY);
+    CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
 
     uint32_t grid[1], block[1];
     CHECK(vx_device_max_occupancy_grid(dev, 1, &num_points, grid, block));
@@ -196,6 +205,7 @@ int main(int argc, char** argv) {
     vx_buffer_release(secret_buf);
     vx_kernel_release(kern);
     vx_module_release(mod);
+    vx_queue_release(q1);
     vx_queue_release(q);
     vx_device_dump_perf(dev, stdout);
     vx_device_release(dev);

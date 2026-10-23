@@ -1,7 +1,7 @@
 // revoke_scope — regression for the global-epoch revocation bug.
 //
 // The property this demonstrates: two owners each grant READ access to a
-// buffer. Revoking ONE owner's grant (REVOKE_OWNER = 0, then EPOCH = 1)
+// buffer. Revoking ONE owner's grant (EPOCH = 1 on owner 0's queue)
 // must not affect the OTHER owner's unrelated grant. Before the per-owner
 // epoch table, a single global epoch counter meant any revocation expired
 // every outstanding grant at once — this test fails under that bug and
@@ -10,8 +10,8 @@
 //   claim A: bufA → owner eid 0 (R|W), shared_perms R, grant_epoch 0
 //   claim B: bufB → owner eid 1 (R|W), shared_perms R, grant_epoch 0
 //   launch 1: core 1 reads bufA (real, via grant A); core 0 reads bufB (real, via grant B)
-//   revoke:   vx_enqueue_dcr_write(REVOKE_OWNER, 0);
-//             vx_enqueue_dcr_write(EPOCH, 1)      ← scoped to owner 0 only
+//   revoke:   vx_enqueue_dcr_write(EPOCH, 1) on owner 0's queue
+//             ← scoped to owner 0, the issuer, only
 //   launch 2: core 1 reads bufA → poison (grant A revoked)
 //             core 0 reads bufB → still real data (grant B untouched)
 //
@@ -91,6 +91,14 @@ int main(int argc, char** argv) {
     vx_queue_h q = nullptr;
     CHECK(vx_queue_create(dev, &qi, &q));
 
+    // Tenant 1's setup goes through tenant 1's own command queue: the checker
+    // attributes a claim to the queue it arrives on and refuses one naming
+    // anyone else (authorship).
+    vx_queue_info_t qi1 = qi;
+    qi1.flags |= VX_QUEUE_FLAG_HW_QUEUE(1);
+    vx_queue_h q1 = nullptr;
+    CHECK(vx_queue_create(dev, &qi1, &q1));
+
     // Both protected buffers padded so a granule-aligned claim stays inside
     // them (same pattern as twotenant), so neither claim can spill onto a
     // neighboring allocation regardless of VX_CHECKER_BUF_LOG2.
@@ -131,7 +139,8 @@ int main(int argc, char** argv) {
 
     // Two independent owners, each granting READ to the other at epoch 0.
     enqueue_claim(q, bufA_base, used_size, 0, CHECKER_PERM_R | CHECKER_PERM_W, CHECKER_PERM_R, 0);
-    enqueue_claim(q, bufB_base, used_size, 1, CHECKER_PERM_R | CHECKER_PERM_W, CHECKER_PERM_R, 0);
+    enqueue_claim(q1, bufB_base, used_size, 1, CHECKER_PERM_R | CHECKER_PERM_W, CHECKER_PERM_R, 0);
+    CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
 
     uint32_t grid[1], block[1];
     CHECK(vx_device_max_occupancy_grid(dev, 1, &num_points, grid, block));
@@ -166,7 +175,6 @@ int main(int argc, char** argv) {
     vx_launch_info_t li1 = make_li(&arg1), li2 = make_li(&arg2);
     vx_event_h ev2=nullptr, read_ev=nullptr;
     CHECK(vx_enqueue_launch(q, &li1, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_REVOKE_OWNER, 0, 0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_EPOCH, 1, 0, nullptr, nullptr));
     CHECK(vx_enqueue_launch(q, &li2, 0, nullptr, &ev2));
 
@@ -233,6 +241,7 @@ int main(int argc, char** argv) {
     vx_buffer_release(bufA_buf);
     vx_kernel_release(kern);
     vx_module_release(mod);
+    vx_queue_release(q1);
     vx_queue_release(q);
     vx_device_dump_perf(dev, stdout);
     vx_device_release(dev);

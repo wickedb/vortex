@@ -6,7 +6,7 @@
 //
 //   claim:    shared buffer -> owner eid 0 (R|W), shared_perms R, grant_epoch 0
 //   launch 1: grantee warms the working set, then times `iters` reads of it
-//   revoke:   REVOKE_OWNER = 0, EPOCH = 1  (the only revocation the API can
+//   revoke:   EPOCH = 1 on owner 0's queue  (the only revocation the API can
 //             express — the ring engine's WaitDone blocks until the launch FSM
 //             idles, so it necessarily lands at a launch boundary)
 //   launch 2: the identical loop, now after the grant expired
@@ -218,7 +218,6 @@ int main(int argc, char** argv) {
         // The revocation. Two register writes, no header touched. The queue is
         // FIFO and each launch drains before the next command, which is not a
         // choice this program makes — it is the only ordering the API offers.
-        CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_REVOKE_OWNER, 0, 0, nullptr, nullptr));
         CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_EPOCH, 1, 0, nullptr, nullptr));
         CHECK(vx_enqueue_launch(q, &li2, 0, nullptr, &ev2));
     }

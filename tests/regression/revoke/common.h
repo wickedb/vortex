@@ -3,9 +3,8 @@
 
 // Epoch revocation demo (Phase 4). Tenant 0 (core 0) owns a buffer and grants
 // tenant 1 (core 1) READ access for epoch 0. Launch 1 runs under the grant:
-// both cores read real data. The host then revokes with two DCR writes —
-// REVOKE_OWNER = 0 (stage which owner's grants are being expired), EPOCH = 1
-// (commit) — touching no header. Revocation is scoped to owner 0: it cannot
+// both cores read real data. The host then revokes with one DCR write on
+// owner 0's queue, EPOCH = 1, touching no header. Revocation is scoped to owner 0: it cannot
 // affect a different owner's unrelated grants (see revoke_scope for that
 // property tested directly). Launch 2: the owner still reads and writes its
 // buffer; tenant 1's reads come back poison.
