@@ -10,6 +10,10 @@ PROJECT := mem_checker
 # NUM_CORES=2.
 CONFIGS += -DVX_CFG_NUM_CORES=2
 
+# A non-zero lookup latency, so case 13 holds a request in S1 while the bus
+# moves on. The design point is 0; the checks are latency-independent.
+CONFIGS += -DVX_CFG_CHECKER_LOOKUP_LATENCY=4
+
 RTL_DIR := $(VORTEX_HOME)/hw/rtl
 DPI_DIR := $(VORTEX_HOME)/hw/dpi
 

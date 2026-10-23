@@ -24,24 +24,22 @@
 //     likeliest source of a bring-up hang, so it is deliberately not smuggled
 //     in here.
 //
-//   * Latency is injected as stall cycles. Whether HIT_LATENCY = 0 is
-//     achievable at all is a TIMING question, not a behavioural one, and only
-//     synthesis answers it (R5). It is load-bearing: at a ~99.99% hit rate,
-//     zero-versus-one cycle is +0.000% against +0.339% in SimX (§7.3), which
-//     is 340x the entire miss path.
+//   * Latency is injected as stall cycles. The header store is on chip and
+//     every check reads it; R5 closed that read at 300 MHz with slack, so
+//     LOOKUP_LATENCY = 0 is the design point. There is no header cache: one
+//     held only granule ids to choose a modelled hit or miss stall, never a
+//     label or a verdict, and fronted a store that is already on chip.
 //
-// Throughput: one request in flight. With a header-cache hit and HIT_LATENCY=0
-// it accepts one request per cycle; a miss stalls for MISS_LATENCY. That is
-// enough for R4's deny-count parity and for R5's area and timing, and the
-// pipelined/multi-outstanding version belongs with R3's arbiter work rather
-// than ahead of the first testbench.
+// Throughput: one request in flight. With LOOKUP_LATENCY=0 it accepts one
+// request per cycle. That is enough for R4's deny-count parity and for R5's
+// area and timing, and the pipelined/multi-outstanding version belongs with
+// R3's arbiter work rather than ahead of the first testbench.
 
 `include "VX_define.vh"
 
 module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
-    parameter HIT_LATENCY  = `VX_CFG_CHECKER_HIT_LATENCY,
-    parameter MISS_LATENCY = `VX_CFG_CHECKER_MISS_LATENCY,
+    parameter LOOKUP_LATENCY = `VX_CFG_CHECKER_LOOKUP_LATENCY,
     parameter ENFORCE      = `VX_CFG_CHECKER_ENFORCE,
     parameter DATA_SIZE    = 64,
     parameter TAG_WIDTH    = 1,
@@ -127,8 +125,6 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // landed anyway" -- two completely different bugs.
     output wire [31:0] cnt_faulted_reads,
     output wire [31:0] cnt_dropped_writes,
-    output wire [31:0] cnt_hc_hits,
-    output wire [31:0] cnt_hc_misses,
     output wire [31:0] cnt_claims,
     output wire [31:0] cnt_headers_written,
     output wire [31:0] cnt_epoch_bumps,
@@ -142,8 +138,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 `ifdef VX_CFG_CHECKER_ENABLE
     `STATIC_ASSERT(CHK_LABEL_W == MEM_RSP_ATTR_WIDTH, ("the bus response attr must be exactly one policy label"))
 `endif
-    localparam LAT_W      = `CLOG2(((HIT_LATENCY > MISS_LATENCY)
-                                  ? HIT_LATENCY : MISS_LATENCY) + 2);
+    localparam LAT_W      = `CLOG2(LOOKUP_LATENCY + 2);
 
     // ---------------------------------------------------------------------
     // Control surface
@@ -247,17 +242,6 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     assign req_ready = s1_ready && ~lat_busy && ~install_busy;
 
     wire lookup_en = s0_fire && ~req_is_io;
-    wire hc_hit;
-
-    VX_checker_hcache hcache (
-        .clk        (clk),
-        .reset      (reset),
-        .lookup_en  (lookup_en),
-        .buf_id     (req_buf_id),
-        .hit        (hc_hit),
-        .cnt_hits   (cnt_hc_hits),
-        .cnt_misses (cnt_hc_misses)
-    );
 
     chk_header_t rd_header;
     wire         rd_claimed;
@@ -283,14 +267,14 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     );
     `UNUSED_VAR (rd_claimed)
 
-    // Latency injection: a hit costs HIT_LATENCY, a miss MISS_LATENCY. Held as
-    // a stall rather than a pipeline depth so the knob can be swept without
+    // Latency injection: every lookup costs LOOKUP_LATENCY. Held as a stall
+    // rather than a pipeline depth so the knob can be swept without
     // re-elaborating the datapath.
     always @(posedge clk) begin
         if (reset) begin
             lat_cnt <= '0;
         end else if (lookup_en) begin
-            lat_cnt <= hc_hit ? LAT_W'(HIT_LATENCY) : LAT_W'(MISS_LATENCY);
+            lat_cnt <= LAT_W'(LOOKUP_LATENCY);
         end else if (lat_busy) begin
             lat_cnt <= lat_cnt - 1;
         end
@@ -481,8 +465,6 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                       INSTANCE_ID, cnt_reqs, cnt_checked, cnt_bypassed, cnt_allows, cnt_denies);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: enforce: faulted_reads=%0d, dropped_writes=%0d",
                       INSTANCE_ID, cnt_faulted_reads, cnt_dropped_writes);
-            $fdisplay(32'h8000_0002, "CHECKER[%s]: hcache: hits=%0d, misses=%0d",
-                      INSTANCE_ID, cnt_hc_hits, cnt_hc_misses);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: setup: dcr_claims=%0d, headers_written=%0d, epoch_bumps=%0d",
                       INSTANCE_ID, cnt_claims, cnt_headers_written, cnt_epoch_bumps);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d",

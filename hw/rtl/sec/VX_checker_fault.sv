@@ -38,7 +38,7 @@
 // Hence: denied reads in flight <= (banks sharing this port) * MSHR_SIZE, and a
 // queue of that depth cannot fill. Sizing it this way keeps the request path
 // free of a stall that would otherwise land on exactly the wire R5 measures for
-// the hit_latency=0 question.
+// the LOOKUP_LATENCY=0 question.
 //
 // The comment above is an argument, not a proof, so `fault_overflow` latches if
 // the invariant is ever violated and the testbench checks it. An invariant that

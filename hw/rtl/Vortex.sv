@@ -279,9 +279,9 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             `UNUSED_PIN (fault_overflow),
             `UNUSED_PIN (cnt_reqs),    `UNUSED_PIN (cnt_checked),
             `UNUSED_PIN (cnt_bypassed),`UNUSED_PIN (cnt_allows),
-            `UNUSED_PIN (cnt_denies),  `UNUSED_PIN (cnt_hc_hits),
+            `UNUSED_PIN (cnt_denies),
             `UNUSED_PIN (cnt_faulted_reads), `UNUSED_PIN (cnt_dropped_writes),
-            `UNUSED_PIN (cnt_hc_misses),`UNUSED_PIN (cnt_claims),
+            `UNUSED_PIN (cnt_claims),
             `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
             `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
             `UNUSED_PIN (cnt_reclaimed)

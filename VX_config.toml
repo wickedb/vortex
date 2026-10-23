@@ -292,22 +292,12 @@ VX_CFG_CHECKER_BUF_LOG2 = 20
 # refused rather than aliased.
 VX_CFG_CHECKER_HEADER_ENTRIES = 0
 
-# Header cache: presence tags only, no policy data, so it cannot go stale —
-# which is why revocation needs no header-cache invalidation (ledger #7).
-VX_CFG_CHECKER_HCACHE_ENTRIES = 16
-VX_CFG_CHECKER_HCACHE_ASSOC = 4
-
-# Cycles added on a header-cache hit. 0 is the design point and it is
-# LOAD-BEARING: at a ~99.99% hit rate, zero-versus-one cycle is +0.000% against
-# +0.339% (PROJECT.md §7.3) — 340x the entire miss path. Whether 0 survives
-# synthesis is the question the RTL track exists to answer (R5).
-VX_CFG_CHECKER_HIT_LATENCY = 0
-
-# Cycles added on a miss (isolated-store fetch). 4 is Vortex's own array
-# latency for an on-chip SRAM of the size the 1 MB design point implies; both
-# DCACHE_LATENCY's and L2_LATENCY's scaling rules give 4 there. Nothing is
-# imported from a paper, so nothing needs defending from one (§8.3).
-VX_CFG_CHECKER_MISS_LATENCY = 4
+# Cycles every header-store lookup adds. 0 is the design point: the store is
+# on chip, and R5 closed its read at 300 MHz with slack, so the lookup overlaps
+# the DRAM access it gates. There is no header cache in front of the store; it
+# held only granule ids and chose a modelled stall. A store pushed off chip by
+# a fine-granularity sweep is modelled by raising this.
+VX_CFG_CHECKER_LOOKUP_LATENCY = 0
 
 # Per-owner epoch counter width. SimX uses 64 bits, which is meaningless in
 # hardware: the monotonicity guard means the width only bounds how many scoped

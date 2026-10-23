@@ -8,8 +8,7 @@
 `include "VX_define.vh"
 
 module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
-    parameter HIT_LATENCY  = `VX_CFG_CHECKER_HIT_LATENCY,
-    parameter MISS_LATENCY = `VX_CFG_CHECKER_MISS_LATENCY,
+    parameter LOOKUP_LATENCY = `VX_CFG_CHECKER_LOOKUP_LATENCY,
     // Labeled lines. The directed TB runs with 0, where the checker judges
     // every request. R5 synthesizes with 1 so the label table is in the numbers.
     // The index width follows the build's cache configuration, as in the GPU,
@@ -69,8 +68,6 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0] cnt_denies,
     output wire [31:0] cnt_faulted_reads,
     output wire [31:0] cnt_dropped_writes,
-    output wire [31:0] cnt_hc_hits,
-    output wire [31:0] cnt_hc_misses,
     output wire [31:0] cnt_claims,
     output wire [31:0] cnt_headers_written,
     output wire [31:0] cnt_epoch_bumps,
@@ -95,8 +92,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
     VX_mem_checker #(
         .INSTANCE_ID  ("checker"),
-        .HIT_LATENCY  (HIT_LATENCY),
-        .MISS_LATENCY (MISS_LATENCY),
+        .LOOKUP_LATENCY (LOOKUP_LATENCY),
         .ENFORCE      (1),          // the TB exercises enforcement explicitly
         .DATA_SIZE    (64),
         .TAG_WIDTH    (16),
@@ -143,8 +139,6 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .cnt_denies          (cnt_denies),
         .cnt_faulted_reads   (cnt_faulted_reads),
         .cnt_dropped_writes  (cnt_dropped_writes),
-        .cnt_hc_hits         (cnt_hc_hits),
-        .cnt_hc_misses       (cnt_hc_misses),
         .cnt_claims          (cnt_claims),
         .cnt_headers_written (cnt_headers_written),
         .cnt_epoch_bumps     (cnt_epoch_bumps),

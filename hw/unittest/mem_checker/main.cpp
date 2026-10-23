@@ -221,18 +221,16 @@ int main(int argc, char** argv) {
   // does not: its request queue moves on while S1 is held. These change the
   // bus address mid-resolution, toward the opposite verdict each time.
 
-  // 13. held by miss latency: a fresh granule forces a header-cache miss, and
+  // 13. held by lookup latency (the Makefile builds this TB with 4 cycles):
   // meanwhile the bus shows B, where owner 1 IS allowed.
   const uint64_t D = 24 * GRANULE;
   claim(D, GRANULE, /*owner*/0, VX_CHECKER_PERM_R | VX_CHECKER_PERM_W, 0,
         VX_CHECKER_GRANT_NO_EXPIRY);
   sim->out_ready = 1;
-  uint32_t miss_before = sim->cnt_hc_misses;
   accept(D, false, 1);
   sim->req_valid = 0;
   sim->req_addr  = (uint32_t)B;
-  expect(sim->cnt_hc_misses == miss_before + 1, "case 13 takes the miss-latency path");
-  expect(verdict(), "verdict held across miss latency: D denied while bus shows B");
+  expect(verdict(), "verdict held across lookup latency: D denied while bus shows B");
 
   // 14. held by back-pressure: an allowed request waits in S1 while the next
   // request, to a granule owner 1 may NOT read, waits on the bus behind it.
@@ -265,8 +263,6 @@ int main(int argc, char** argv) {
               (unsigned)sim->cnt_reqs, (unsigned)sim->cnt_checked,
               (unsigned)sim->cnt_bypassed, (unsigned)sim->cnt_allows,
               (unsigned)sim->cnt_denies);
-  std::printf("hcache  : hits=%u misses=%u\n",
-              (unsigned)sim->cnt_hc_hits, (unsigned)sim->cnt_hc_misses);
   std::printf("setup   : claims=%u written=%u bumps=%u rejected=%u aliased=%u reclaimed=%u\n",
               (unsigned)sim->cnt_claims, (unsigned)sim->cnt_headers_written,
               (unsigned)sim->cnt_epoch_bumps, (unsigned)sim->cnt_rejected,
