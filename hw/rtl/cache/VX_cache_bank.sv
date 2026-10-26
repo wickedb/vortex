@@ -228,6 +228,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[1 + MEM_CORE_WIDTH +: MEM_OWNER_WIDTH];
 `else
     wire                           replay_fetch = 1'b0;
+    wire                           replay_core  = 1'b0;
     wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid;
 `endif
 
@@ -1297,10 +1298,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         assign fwd_rsp_attr = fbuf_label_r;
     `endif
     end else begin : g_no_fwd_label
-        `UNUSED_VAR ({replay_owner, replay_fetch})
-    `ifdef VX_CFG_CHECKER_ENABLE
-        `UNUSED_VAR (replay_core)
-    `endif
+        `UNUSED_VAR ({replay_owner, replay_fetch, replay_core})
         assign fwd_label_deny = 1'b0;
         assign fwd_rsp_attr   = fbuf_label_r;
     end
