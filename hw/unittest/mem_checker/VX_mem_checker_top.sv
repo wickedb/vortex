@@ -117,6 +117,8 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .req_owner           (req_owner),
         .req_fetch           (req_fetch),
         .req_core            (req_core),
+        .req_export          (1'b0),
+        .req_copy            (1'b0),
         .req_ready           (req_ready),
         .out_valid           (out_valid),
         .out_rw              (out_rw),

@@ -281,6 +281,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .req_owner      (mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
             .req_fetch      (mem_bus_if[i].req_data.attr[MEM_ATTR_FETCH_OFFS]),
             .req_core       (32'(mem_bus_if[i].req_data.attr[MEM_ATTR_CORE_OFFS +: MEM_CORE_WIDTH])),
+            .req_export     (1'b0),
+            .req_copy       (1'b0),
             .req_tag        (mem_bus_if[i].req_data.tag),
             .req_data       (mem_bus_if[i].req_data.data),
             .req_byteen     (mem_bus_if[i].req_data.byteen),

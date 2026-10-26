@@ -372,12 +372,21 @@ module VX_cp_core
   // grant. A unit retires a command only after its last device beat has
   // answered (R data, or B), so no beat outlives the queue it was issued for.
   logic [QW-1:0] dma_q_r, event_q_r;
+  // And what the DMA's device beats are for (S6): a download's reads leave
+  // for the host (export); a copy's reads and writes are one chunk at a time.
+  logic dma_export_r, dma_copy_r;
   always_ff @(posedge clk) begin
     if (reset) begin
-      dma_q_r   <= '0;
-      event_q_r <= '0;
+      dma_q_r      <= '0;
+      event_q_r    <= '0;
+      dma_export_r <= 1'b0;
+      dma_copy_r   <= 1'b0;
     end else begin
-      if (any_dma_grant)   dma_q_r   <= granted_dma_q;
+      if (any_dma_grant) begin
+        dma_q_r      <= granted_dma_q;
+        dma_export_r <= (granted_dma_cmd.hdr.opcode == CMD_MEM_READ);
+        dma_copy_r   <= (granted_dma_cmd.hdr.opcode == CMD_MEM_COPY);
+      end
       if (any_event_grant) event_q_r <= granted_event_q;
     end
   end
@@ -595,8 +604,13 @@ module VX_cp_core
   // the CP's device path reads the issuer off each request's tag -- the same
   // queue = tenant identity the DCR path carries on dcr_req_issuer. DMA and
   // event units keep running concurrently: nothing is shared but the stamp.
-  `STATIC_ASSERT(QW + $clog2(N_SRC_DEV) <= ID_W, ("CP device AXI ID too narrow for the queue index and the xbar source"))
-  `CP_AXI_LINK_ID(xbar_dev_src[SLOT_DMA_DEV], dma_dev_axi, ID_W'(dma_q_r),   ID_W'(dma_q_r));
+  //
+  // Above the queue, two DMA flags for the S6 rules: bit QW = export (a
+  // download's read, whose data leaves for the host), bit QW+1 = copy. The
+  // event unit's beats carry neither.
+  `STATIC_ASSERT(QW + 2 + $clog2(N_SRC_DEV) <= ID_W, ("CP device AXI ID too narrow for the queue index, the S6 flags and the xbar source"))
+  wire [ID_W-1:0] dma_dev_id = ID_W'({dma_copy_r, dma_export_r, dma_q_r});
+  `CP_AXI_LINK_ID(xbar_dev_src[SLOT_DMA_DEV], dma_dev_axi, dma_dev_id, dma_dev_id);
   `CP_AXI_LINK_ID(xbar_dev_src[SLOT_EVENT],   event_axi,   ID_W'(event_q_r), ID_W'(event_q_r));
   `UNUSED_VAR (dma_dev_axi.awid)
   `UNUSED_VAR (dma_dev_axi.arid)

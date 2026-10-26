@@ -59,7 +59,12 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter LABEL_IDX_W  = TAG_WIDTH - UUID_WIDTH,
     // The requester is a command-processor queue, not a core (D7): it owns
     // no stack slice, so every stack access is denied (T12).
-    parameter STACK_DENY_ALL = 0
+    parameter STACK_DENY_ALL = 0,
+    // The S6 rules on the CP's device path, with confinement by taint: a
+    // download's read (req_export) is refused if its line would contribute
+    // to a taint, and a copy's write (req_copy) must be covered by what the
+    // copy's current chunk read. One DMA command runs at a time.
+    parameter S6_ENABLE = 0
 ) (
     input  wire clk,
     input  wire reset,
@@ -79,6 +84,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire [31:0]               req_core,
     // An instruction fetch: judged against X rather than R (header v2, T9).
     input  wire                      req_fetch,
+    // S6 (CP path only; see S6_ENABLE).
+    input  wire                      req_export,
+    input  wire                      req_copy,
     // Payload the checker does not inspect but MUST carry: it pipelines the
     // request through S1, so emitting these straight from the bus input would
     // pair one request's address with the next request's data. That corrupts
@@ -249,6 +257,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] s1_addr;
     reg [CHK_OWNER_W-1:0]    s1_owner;
     reg [31:0]               s1_core;
+    reg                      s1_export, s1_copy;
     reg                      s1_fetch;
     reg [TAG_WIDTH-1:0]      s1_tag;
     reg [DATA_SIZE*8-1:0]    s1_data;
@@ -315,6 +324,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             s1_addr   <= req_addr;
             s1_owner  <= req_owner;
             s1_core   <= req_core;
+            s1_export <= req_export;
+            s1_copy   <= req_copy;
             s1_fetch  <= req_fetch;
             s1_bypass <= req_is_io;
             s1_tag    <= req_tag;
@@ -335,7 +346,38 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire s1_stack = chk_in_stack(64'(s1_addr));
     wire authorized = s1_stack ? ((STACK_DENY_ALL == 0) && chk_stack_allow(64'(s1_addr), s1_core, s1_fetch))
                                : chk_authorize(rd_header, s1_owner, s1_rw, s1_fetch, owner_epoch);
-    wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
+    // S6 (CP path, with taint): exports and copies keep confined data on the
+    // device. A copy's taint is the OR of what the current chunk's reads
+    // contribute; a read after a write starts the next chunk.
+    wire s6_refuse;
+    if (S6_ENABLE != 0) begin : g_s6
+        chk_label_t s1_lbl;
+        assign s1_lbl = chk_label_of(rd_header);
+        wire [CHK_TENANTS-1:0] s1_contrib = chk_contrib(s1_lbl, s1_owner);
+        reg [CHK_TENANTS-1:0] copy_taint_r;
+        reg                   copy_wr_last_r;
+        wire export_refuse = ~s1_rw && s1_export && (s1_contrib != '0);
+        wire copy_refuse   =  s1_rw && s1_copy   && ~chk_covers(s1_lbl, copy_taint_r);
+        assign s6_refuse = ~s1_stack && (export_refuse || copy_refuse);
+        always @(posedge clk) begin
+            if (reset) begin
+                copy_taint_r   <= '0;
+                copy_wr_last_r <= 1'b1;
+            end else if (s1_valid && s1_retire && s1_copy && ~s1_bypass) begin
+                if (s1_rw) begin
+                    copy_wr_last_r <= 1'b1;
+                end else begin
+                    copy_taint_r   <= (copy_wr_last_r ? '0 : copy_taint_r)
+                                    | ((authorized && ~s1_stack) ? s1_contrib : '0);
+                    copy_wr_last_r <= 1'b0;
+                end
+            end
+        end
+    end else begin : g_no_s6
+        assign s6_refuse = 1'b0;
+        `UNUSED_VAR ({s1_export, s1_copy})
+    end
+    wire denied     = s1_valid && ~s1_bypass && (~authorized || s6_refuse) && (LABEL_MODE == 0);
 
     // Under enforcement a denied request is NOT forwarded to DRAM: a read is
     // answered with poison instead (fast-fail, no DRAM round trip) and a write

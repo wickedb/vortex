@@ -888,7 +888,10 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
         // claimed nothing owns nothing.
         localparam CP_CHK_ASHIFT = `CLOG2(FAB_DATA_SIZE);
         wire [VX_DCR_ISSUER_WIDTH-1:0] cp_req_issuer = cp_mem_req_tag[VX_DCR_ISSUER_WIDTH-1:0];
-        `STATIC_ASSERT(VX_DCR_ISSUER_WIDTH < `VX_CP_AXI_TID_WIDTH, ("CP device AXI ID cannot carry the issuing queue"))
+        `STATIC_ASSERT(VX_DCR_ISSUER_WIDTH + 2 < `VX_CP_AXI_TID_WIDTH, ("CP device AXI ID cannot carry the issuing queue and the S6 flags"))
+        // VX_cp_core puts the S6 flags just above the queue: export, copy.
+        wire cp_req_export = cp_mem_req_tag[VX_DCR_ISSUER_WIDTH];
+        wire cp_req_copy   = cp_mem_req_tag[VX_DCR_ISSUER_WIDTH + 1];
 
         VX_dcr_bus_if cp_chk_dcr_if();
         VX_dcr_bus_if cp_chk_dcr_out_if();
@@ -919,7 +922,12 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .LABEL_MODE  (0),
             .LABEL_IDX_W (1),
             // No queue reaches a core's stack slice (T12).
-            .STACK_DENY_ALL (1)
+            .STACK_DENY_ALL (1),
+        `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+            .S6_ENABLE      (1)
+        `else
+            .S6_ENABLE      (0)
+        `endif
         ) cp_checker (
             .clk            (clk),
             .reset          (subsys_reset),
@@ -932,6 +940,8 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .req_owner      (MEM_OWNER_WIDTH'(cp_req_issuer)),
             .req_fetch      (1'b0),
             .req_core       ('0),   // no core: every stack access is denied
+            .req_export     (cp_req_export),
+            .req_copy       (cp_req_copy),
             .req_tag        (cp_mem_req_tag),
             .req_data       (cp_mem_req_data),
             .req_byteen     (cp_mem_req_byteen),
