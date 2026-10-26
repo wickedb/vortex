@@ -218,6 +218,8 @@ public:
     // Stack-slice rule (T12): accesses to a core's stack slice by anyone but
     // that core, and fetches from it.
     uint64_t stack_denies = 0;
+    // Clean boundaries (T8): launches that cleared the taint.
+    uint64_t clean_boundaries = 0;
     // The command processor's device path (D7): lines its DMA and event
     // commands moved, judged for the queue that issued them. Kept apart from
     // the port counters above, which the kernel's thread owns.
@@ -285,6 +287,9 @@ public:
 
   // The issuer of a KMU launch-register write (spec T3; see tenant_of).
   void note_launch_issuer(uint32_t issuer);
+
+  // A launch replayed VX_DCR_KMU_CLEAN = 1: a clean boundary (spec T8).
+  void note_clean_boundary();
 
   const PerfStats& perf_stats() const;
   const FaultStatus& fault_status() const;

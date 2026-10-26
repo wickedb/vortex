@@ -1497,6 +1497,18 @@ extern "C" vx_result_t vx_enqueue_dcr_write(vx_queue_h q,
     VX_C_ENTRY_CATCH
 }
 
+// A clean boundary (spec T8) is one launch register, VX_DCR_KMU_CLEAN, which
+// the command processor shadows per queue and clears once that queue's next
+// launch has replayed it.
+extern "C" vx_result_t vx_enqueue_clean_boundary(vx_queue_h q,
+                                                 uint32_t nw, const vx_event_h* w,
+                                                 vx_event_h* out) {
+    VX_C_ENTRY_TRY
+    if (!q) return VX_ERR_INVALID_HANDLE;
+    return to_queue(q)->enqueue_dcr_write(VX_DCR_KMU_CLEAN, 1, nw, w, out);
+    VX_C_ENTRY_CATCH
+}
+
 extern "C" vx_result_t vx_enqueue_dcr_read(vx_queue_h q,
                                            uint32_t addr, uint32_t* host_dst,
                                            uint32_t nw, const vx_event_h* w,

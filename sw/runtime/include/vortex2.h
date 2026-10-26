@@ -500,6 +500,17 @@ vx_result_t vx_enqueue_dcr_write (vx_queue_h q,
                                   const vx_event_h* wait_events,
                                   vx_event_h*       out_event);
 
+// Ask for a clean boundary before this queue's next launch (data-plane
+// checker, spec T8): that launch runs the full scrub on every core it uses
+// (registers, local memory, stack slice, private caches) and starts with an
+// empty taint. Without it a tenant's next kernel inherits the taint of its
+// previous ones, which can only restrict it. The request is the queue's own,
+// so it affects only this tenant's kernels; it applies to one launch.
+vx_result_t vx_enqueue_clean_boundary(vx_queue_h q,
+                                  uint32_t          n_wait_events,
+                                  const vx_event_h* wait_events,
+                                  vx_event_h*       out_event);
+
 vx_result_t vx_enqueue_dcr_read  (vx_queue_h q,
                                   uint32_t addr, uint32_t* host_dst,
                                   uint32_t          n_wait_events,

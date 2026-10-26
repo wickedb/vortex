@@ -317,10 +317,12 @@ public:
       q.clear();
     }
     fault_ = FaultStatus{};
-    // A launch starts every core on a new kernel with an empty taint. The
-    // residue scrub (registers, local memory) that makes this sound is not
-    // modelled yet; see the proposal's SimX section.
-    std::fill(taint_.begin(), taint_.end(), 0u);
+    // The taint is NOT cleared here (T8, option 3): the next kernel of the
+    // same tenant inherits it. It clears at a clean boundary
+    // (note_clean_boundary) the tenant requests. The taint is kept per
+    // tenant, not per core, so a tenant also keeps it across another
+    // tenant's kernels, where the RTL's scrub at the tenant change would
+    // clear it: SimX can only over-restrict there.
   }
 
   void tick() {
@@ -386,6 +388,7 @@ public:
       os << "CHECKER: stack: denies=" << perf_stats_.stack_denies << std::endl;
     }
     if (config_.taint) {
+      os << "CHECKER: taint: clean_boundaries=" << perf_stats_.clean_boundaries << std::endl;
       os << "CHECKER: taint: raises=" << perf_stats_.taint_raises
          << ", write_denies=" << perf_stats_.taint_denies
          << ", leaves=" << perf_stats_.leaves
@@ -623,6 +626,14 @@ public:
   // queue, so the latest one before the launch starts names its tenant.
   void note_launch_issuer(uint32_t issuer) {
     launch_tenant_.store(issuer);
+  }
+
+  // A clean boundary (T8): the launch runs the full scrub on every core it
+  // uses and starts with an empty taint. A SimX launch resets the cores
+  // anyway, so only the taint needs clearing here.
+  void note_clean_boundary() {
+    std::fill(taint_.begin(), taint_.end(), 0u);
+    ++perf_stats_.clean_boundaries;
   }
 
   std::shared_ptr<mem_block_t> poison() const { return poison_; }
@@ -869,6 +880,10 @@ int MemChecker::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
 
 void MemChecker::note_launch_issuer(uint32_t issuer) {
   impl_->note_launch_issuer(issuer);
+}
+
+void MemChecker::note_clean_boundary() {
+  impl_->note_clean_boundary();
 }
 
 bool MemChecker::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,

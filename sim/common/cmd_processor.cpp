@@ -133,6 +133,9 @@ bool CommandProcessor::try_begin_launch_(uint32_t qi) {
         for (uint32_t i = 0; i < NUM_SHADOW; ++i)
             hooks_.vortex_dcr_write(shadow_addr_(int(i)), q.shadow[i], qi);
     }
+    // A clean-boundary request (T8) is one-shot: it applies to this launch
+    // only, so the shadow drops it once replayed.
+    qs_[qi].shadow[shadow_index_(VX_DCR_KMU_CLEAN)] = 0;
     launch_state_ = LaunchState::PulseStart;
     return true;
 }
