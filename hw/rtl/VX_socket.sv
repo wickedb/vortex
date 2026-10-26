@@ -771,9 +771,19 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     //      old stack can land after them, and they pass the slice rule because
     //      the slice is this core's. Writes draw no response.
     // Then the beat goes through; the socket's taint clears and the tenant
-    // loads on it (above). The previous kernel has drained (one kernel at a
-    // time), so nothing competes. The core's first kernel is not a boundary:
-    // its state then is reset's, and runs that never ask stay cycle-identical.
+    // loads on it (below). The previous kernel has drained (one kernel at a
+    // time), so nothing competes.
+    //
+    // A tenant change is any beat whose tenant differs from the core's, not
+    // only a beat of a new ctx_id: ctx_id is 8 bits and counts every launch,
+    // so after 256 launches that skip this socket a different tenant's kernel
+    // can arrive with the ctx_id it last saw. Only the clean request is keyed
+    // on a new ctx_id; a wrap that hides one keeps the same tenant's taint,
+    // which can only over-restrict that tenant.
+    //
+    // Reset scrubs too, by itself, before any beat is accepted: GPRs and
+    // local memory are not cleared by reset in synthesis, and the host may
+    // reset the device between two tenants' kernels.
     ///////////////////////////////////////////////////////////////////////////
 `ifdef VX_CFG_CHECKER_ENABLE
     // A refusal at elaboration (STATIC_ASSERT fires only in simulation).
@@ -794,19 +804,24 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     kmu_req_t scrub_kmu_req;
     assign scrub_kmu_req = kmu_req_t'(kmu_bus_if[0].data);
     `UNUSED_VAR (scrub_kmu_req)   // only ctx_id, tenant and clean are read
-    reg [7:0]                 scrub_ctx_r, scrubbed_ctx_r;
-    reg                       scrub_ctx_valid_r, scrubbed_valid_r;
+    reg [7:0]                 scrub_ctx_r;
+    reg                       scrub_ctx_valid_r;
     reg [MEM_OWNER_WIDTH-1:0] scrub_tenant_r;
+    // The core was scrubbed for the beat now waiting (or by reset): let it
+    // through. Cleared when a beat is accepted.
+    reg                       scrubbed_r;
+    reg                       init_pending_r;   // the reset scrub
     wire new_kernel = kmu_bus_if[0].valid
                    && (!scrub_ctx_valid_r || (scrub_kmu_req.ctx_id != scrub_ctx_r));
 `ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
-    wire new_tenant = scrub_ctx_valid_r && (scrub_kmu_req.tenant != scrub_tenant_r);
+    wire new_tenant = kmu_bus_if[0].valid && scrub_ctx_valid_r
+                   && (scrub_kmu_req.tenant != scrub_tenant_r);
 `else
     wire new_tenant = 1'b0;   // test mode: the tenant is the core
     `UNUSED_VAR (scrub_tenant_r)
 `endif
-    wire needs_scrub = new_kernel && (new_tenant || scrub_kmu_req.clean)
-                    && !(scrubbed_valid_r && (scrubbed_ctx_r == scrub_kmu_req.ctx_id));
+    wire needs_scrub = !scrubbed_r && (new_tenant || (new_kernel && scrub_kmu_req.clean));
+    wire start_scrub = init_pending_r || needs_scrub;
 
     typedef enum logic [1:0] { SC_IDLE, SC_CORE, SC_STACK } sc_state_e;
     sc_state_e sc_state;
@@ -822,20 +837,22 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             scrub_ctx_r       <= '0;
             scrub_ctx_valid_r <= 1'b0;
             scrub_tenant_r    <= '0;
-            scrubbed_ctx_r    <= '0;
-            scrubbed_valid_r  <= 1'b0;
+            scrubbed_r        <= 1'b0;
+            init_pending_r    <= 1'b1;
         end else begin
             case (sc_state)
-                SC_IDLE:  if (needs_scrub) sc_state <= SC_CORE;
+                SC_IDLE:  if (start_scrub) begin
+                              sc_state       <= SC_CORE;
+                              init_pending_r <= 1'b0;
+                          end
                 SC_CORE:  if (core_scrub_done) begin
                               sc_state  <= SC_STACK;
                               stack_cnt <= '0;
                           end
                 SC_STACK: if (stack_wr_ready) begin
                               if (stack_last) begin
-                                  sc_state         <= SC_IDLE;
-                                  scrubbed_ctx_r   <= scrub_kmu_req.ctx_id;
-                                  scrubbed_valid_r <= 1'b1;
+                                  sc_state   <= SC_IDLE;
+                                  scrubbed_r <= 1'b1;
                               end else begin
                                   stack_cnt <= stack_cnt + 1;
                               end
@@ -846,6 +863,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
                 scrub_ctx_r       <= scrub_kmu_req.ctx_id;
                 scrub_ctx_valid_r <= 1'b1;
                 scrub_tenant_r    <= scrub_kmu_req.tenant;
+                scrubbed_r        <= 1'b0;
             end
         end
     end
@@ -859,10 +877,10 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             sc_cycles <= '0;
         end else begin
             sc_cycles <= sc_cycles + 1;
-            if (sc_state == SC_IDLE && needs_scrub) begin
+            if (sc_state == SC_IDLE && start_scrub) begin
                 sc_start <= sc_cycles;
-                $display("SCRUB[%s]: start ctx=%0d clean=%0d new_tenant=%0d",
-                         INSTANCE_ID, scrub_kmu_req.ctx_id, scrub_kmu_req.clean, new_tenant);
+                $display("SCRUB[%s]: start reset=%0d ctx=%0d clean=%0d new_tenant=%0d",
+                         INSTANCE_ID, init_pending_r, scrub_kmu_req.ctx_id, scrub_kmu_req.clean, new_tenant);
             end
             if (sc_state == SC_STACK && stack_wr_ready && stack_last)
                 $display("SCRUB[%s]: done ctx=%0d in %0d cycles (%0d stack lines)",
@@ -898,7 +916,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     `UNUSED_VAR (stack_wr_byte)
 
     // The dispatch beat waits while a scrub is needed or running.
-    wire scrub_hold = needs_scrub || (sc_state != SC_IDLE);
+    wire scrub_hold = start_scrub || (sc_state != SC_IDLE);
     assign kmu_gate_if[0].valid = kmu_bus_if[0].valid && ~scrub_hold;
     assign kmu_gate_if[0].kind  = kmu_bus_if[0].kind;
     assign kmu_gate_if[0].eop   = kmu_bus_if[0].eop;
@@ -1029,15 +1047,18 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     end
 
 `ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
+    // Loaded from every accepted beat, not only at a new ctx_id, so a ctx_id
+    // that wrapped cannot keep the previous tenant (see the scrub above).
     reg [MEM_OWNER_WIDTH-1:0] tenant_r;
+    wire beat_fire = kmu_bus_if[0].valid && kmu_bus_if[0].ready;
     always @(posedge clk) begin
         if (reset) begin
             tenant_r <= '0;
-        end else if (kernel_change) begin
+        end else if (beat_fire) begin
             tenant_r <= stamp_kmu_req.tenant;
         end
     end
-    wire tenant_change = (stamp_kmu_req.tenant != tenant_r);
+    wire tenant_change = beat_fire && (stamp_kmu_req.tenant != tenant_r);
 `else
     // Test mode: the tenant is the core, which never changes.
     wire tenant_change = 1'b0;
@@ -1045,8 +1066,8 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // A scrub boundary (T8): the core is handed to another tenant, or its
     // tenant asked for a clean boundary. The first kernel is one too: the
     // core's state then is whatever reset left.
-    wire scrub_boundary = kernel_change
-                       && (!stamp_ctx_valid_r || tenant_change || stamp_kmu_req.clean);
+    wire scrub_boundary = tenant_change
+                       || (kernel_change && (!stamp_ctx_valid_r || stamp_kmu_req.clean));
     `UNUSED_VAR (scrub_boundary)
 
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
