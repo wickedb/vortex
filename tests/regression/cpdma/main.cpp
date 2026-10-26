@@ -10,12 +10,13 @@
 //   copy S -> T          -> T holds poison
 //   copy T -> S          -> dropped
 //   copy S -> U          -> U holds poison
-//   download G           -> the grant holds: real data
+//   download G           -> the grant (to tenant 1) holds: real data
 //   upload into G        -> dropped (the grant is read-only)
 //   download G after tenant 0 revokes -> poison
 //
-// and a queue whose index names no core (queue 2 in a 2-core build, whose
-// index would truncate onto owner 0) downloads S -> poison, U -> real data.
+// and tenant 2, which has no core in a 2-core build and has claimed nothing
+// (its index must not truncate onto owner 0's), downloads S -> poison and
+// U -> real data.
 // Tenant 0 reads S and G back through its own queue each time: intact.
 //
 // Protected buffers are over-allocated by two checker granules and the
@@ -70,6 +71,7 @@ void claim(vx_queue_h q, uint64_t base, uint64_t bytes, uint32_t owner,
     dcr(q, DCR_CHECKER_BUF_OWNER,  owner);
     dcr(q, DCR_CHECKER_BUF_PERMS,  perms);
     dcr(q, DCR_CHECKER_BUF_SHARED, shared);
+    dcr(q, DCR_CHECKER_BUF_GRANTEE, owner ^ 1u);
     dcr(q, DCR_CHECKER_BUF_EPOCH,  epoch);
     dcr(q, DCR_CHECKER_BUF_COMMIT, 1);
 }
@@ -140,7 +142,7 @@ int main(int argc, char** argv) {
     CHECK(vx_device_open(0, &dev));
     vx_queue_h q0 = open_queue(dev, 0);
     vx_queue_h q1 = open_queue(dev, 1);
-    vx_queue_h q2 = open_queue(dev, 2);   // names no core in a 2-core build
+    vx_queue_h q2 = open_queue(dev, 2);   // tenant 2: no core in a 2-core build
 
     Padded S = make_padded(dev, bytes, granule);
     Padded G = make_padded(dev, bytes, granule);
@@ -200,12 +202,15 @@ int main(int argc, char** argv) {
     finish(q1);
     expect_read(q0, G, bytes, "tenant 1's upload into G dropped", granted);
 
-    // A queue that names no core owns nothing: its index must not truncate
-    // onto owner 0's.
+    // Tenant 2 has claimed nothing and is granted nothing, so it owns
+    // nothing; its index must not truncate onto owner 0's.
     CHECK(vx_enqueue_write(q0, U.buf, U.off, h_zero.data(), bytes, 0, nullptr, nullptr));
     finish(q0);
-    expect_read(q2, S, bytes, "queue 2 (no core) downloads S (poison)", poison);
-    expect_read(q2, U, bytes, "queue 2 (no core) downloads U", zero);
+    expect_read(q2, S, bytes, "tenant 2 (no core) downloads S (poison)", poison);
+    expect_read(q2, U, bytes, "tenant 2 (no core) downloads U", zero);
+    // Header v2: the grant on G names tenant 1, so it is not a grant to
+    // every non-owner.
+    expect_read(q2, G, bytes, "tenant 2 downloads G, granted to 1 (poison)", poison);
 
     dcr(q0, DCR_CHECKER_EPOCH, 1);
     finish(q0);

@@ -75,6 +75,7 @@ void enqueue_claim(vx_queue_h q, uint64_t base, uint64_t bytes, uint32_t owner,
     dcr(q, DCR_CHECKER_BUF_OWNER,    owner);
     dcr(q, DCR_CHECKER_BUF_PERMS,    perms);
     dcr(q, DCR_CHECKER_BUF_SHARED,   shared);
+    dcr(q, DCR_CHECKER_BUF_GRANTEE,  owner ^ 1u);   // H grants M, M grants H
     dcr(q, DCR_CHECKER_BUF_EPOCH,    GRANT_NO_EXPIRY);
     dcr(q, DCR_CHECKER_BUF_JOINT,    joint);
     dcr(q, DCR_CHECKER_BUF_CONFINED, confined);

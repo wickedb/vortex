@@ -32,6 +32,9 @@
 #define DCR_CHECKER_BUF_COMMIT   0x305
 #define DCR_CHECKER_EPOCH        0x306
 #define DCR_CHECKER_BUF_SHARED   0x307
+// Header v2: a grant names the one tenant it is for; in these two-tenant
+// tests that is always the other tenant.
+#define DCR_CHECKER_BUF_GRANTEE 0x30C
 #define DCR_CHECKER_REVOKE_OWNER 0x308
 
 #define CHECKER_PERM_R 0x1

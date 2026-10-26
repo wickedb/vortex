@@ -105,6 +105,7 @@ void enqueue_claim(vx_queue_h q, uint64_t base, uint64_t bytes, uint32_t owner,
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_OWNER,  owner,           0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_PERMS,  perms,           0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_SHARED, shared,          0, nullptr, nullptr));
+    CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_GRANTEE, owner ^ 1u,     0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_EPOCH,  epoch,           0, nullptr, nullptr));
     CHECK(vx_enqueue_dcr_write(q, VX_DCR_CHECKER_BUF_COMMIT, 1,               0, nullptr, nullptr));
 }

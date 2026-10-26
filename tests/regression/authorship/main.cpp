@@ -60,6 +60,7 @@ void stage_claim(vx_queue_h q, uint64_t base, uint64_t bytes, uint32_t owner,
     dcr(q, DCR_CHECKER_BUF_OWNER,  owner);
     dcr(q, DCR_CHECKER_BUF_PERMS,  perms);
     dcr(q, DCR_CHECKER_BUF_SHARED, shared);
+    dcr(q, DCR_CHECKER_BUF_GRANTEE, owner ^ 1u);
     dcr(q, DCR_CHECKER_BUF_EPOCH,  epoch);
 }
 

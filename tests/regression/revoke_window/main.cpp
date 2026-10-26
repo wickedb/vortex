@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_OWNER, 0,                     0,nullptr,nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_PERMS, CHECKER_PERM_R | CHECKER_PERM_W, 0,nullptr,nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_SHARED, CHECKER_PERM_R,       0,nullptr,nullptr));
+    CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_GRANTEE, 1,                   0,nullptr,nullptr));   // tenant 1
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_EPOCH, 0,                     0,nullptr,nullptr));
     CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_BUF_COMMIT, 1,                    0,nullptr,nullptr));
 

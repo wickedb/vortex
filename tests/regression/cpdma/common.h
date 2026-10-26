@@ -8,7 +8,7 @@
 // check is by value.
 //
 // Run with: VX_CHECKER=1 VX_CHECKER_ENFORCE=1 (SimX) or --checker-enforce
-// (xrtsim), and --cores=2. Queue 2 names no core in a 2-core build.
+// (xrtsim), and --cores=2. Tenant 2 (queue 2) has no core in a 2-core build.
 
 // Checker DCR registers: mirror of sim/simx/sec/mem_checker.h.
 #define DCR_CHECKER_BUF_BASE   0x300
@@ -19,6 +19,9 @@
 #define DCR_CHECKER_BUF_COMMIT 0x305
 #define DCR_CHECKER_EPOCH      0x306
 #define DCR_CHECKER_BUF_SHARED 0x307
+// Header v2: a grant names the one tenant it is for; in these two-tenant
+// tests that is always the other tenant.
+#define DCR_CHECKER_BUF_GRANTEE 0x30C
 
 #define CHECKER_PERM_R 0x1
 #define CHECKER_PERM_W 0x2
