@@ -220,6 +220,9 @@ public:
     uint64_t stack_denies = 0;
     // Clean boundaries (T8): launches that cleared the taint.
     uint64_t clean_boundaries = 0;
+    // Launches that crossed a scrub boundary (T8): local memory and the
+    // stack window were zeroed before they started.
+    uint64_t scrubs = 0;
     // The command processor's device path (D7): lines its DMA and event
     // commands moved, judged for the queue that issued them. Kept apart from
     // the port counters above, which the kernel's thread owns.
@@ -290,6 +293,10 @@ public:
 
   // A launch replayed VX_DCR_KMU_CLEAN = 1: a clean boundary (spec T8).
   void note_clean_boundary();
+
+  // As a launch starts: true when it crosses a scrub boundary (spec T8), a
+  // clean boundary or a change of launching tenant, after the first kernel.
+  bool take_scrub_boundary();
 
   const PerfStats& perf_stats() const;
   const FaultStatus& fault_status() const;

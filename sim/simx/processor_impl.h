@@ -104,6 +104,9 @@ public:
   // each level's evictions reach the next before that level itself flushes.
   void flush_caches();
 
+  // At a launch: the kernel-change scrub if it crosses a scrub boundary (T8).
+  void scrub_boundary();
+
 private:
 
   // A grid-less launch is a delegated draw launch: the KMU walks no CTAs and

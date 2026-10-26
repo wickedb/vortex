@@ -14,6 +14,7 @@
 #include "processor.h"
 #include "processor_impl.h"
 #include "core.h"
+#include "local_mem.h"
 #include "scheduler.h"
 #include <VX_types.h>
 #ifdef VX_CFG_EXT_RTU_ENABLE
@@ -364,6 +365,7 @@ void ProcessorImpl::flush_caches() {
 
 int ProcessorImpl::run() {
   this->reset();
+  this->scrub_boundary();
   kmu_->start();
   this->forward_delegated_launch();
 
@@ -420,6 +422,30 @@ void ProcessorImpl::forward_delegated_launch() {
 #endif
 }
 
+// The kernel-change scrub (spec T8), functionally: at a scrub boundary the
+// next kernel starts with every core's local memory and the stack window
+// zeroed. A launch has already reset the caches, so after the previous
+// kernel's write-back the stacks live in DRAM alone. Registers are not
+// modelled as surviving a launch. The RTL does the same work per socket, in
+// cycles (VX_socket.sv); here it is free.
+void ProcessorImpl::scrub_boundary() {
+  if (!mem_checker_ || !mem_checker_->take_scrub_boundary())
+    return;
+  for (auto& cluster : clusters_) {
+    for (uint32_t c = 0; c < VX_CFG_NUM_CORES; ++c) {
+      auto& lmem = cluster->get_core(c)->local_mem();
+      if (lmem)
+        lmem->scrub();
+    }
+  }
+  constexpr uint64_t harts = uint64_t(VX_CFG_NUM_CLUSTERS) * VX_CFG_NUM_CORES
+                           * VX_CFG_NUM_WARPS * VX_CFG_NUM_THREADS;
+  constexpr uint64_t span  = harts << VX_MEM_STACK_LOG2_SIZE;
+  std::vector<uint8_t> zeros(uint64_t(1) << VX_MEM_STACK_LOG2_SIZE, 0);
+  for (uint64_t a = VX_MEM_STACK_BASE_ADDR - span; a < VX_MEM_STACK_BASE_ADDR; a += zeros.size())
+    ram_->write(zeros.data(), a, zeros.size());
+}
+
 void ProcessorImpl::reset() {
   SimPlatform::instance().reset();
   perf_mem_reads_ = 0;
@@ -436,6 +462,7 @@ bool ProcessorImpl::cycle() {
   // kernel launch re-dispatches.
   if (!is_cycle_initialized_) {
     this->reset();
+    this->scrub_boundary();
     kmu_->start();
     this->forward_delegated_launch();
     is_cycle_initialized_ = true;

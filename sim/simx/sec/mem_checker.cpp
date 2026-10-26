@@ -121,13 +121,18 @@ private:
   // and read when a write is *judged*. Both are no earlier than the RTL
   // design's points (stamp when a request leaves the L1, snoop when a
   // response enters it), so the model can only over-restrict, never leak.
-  // Cleared on reset(), which every launch performs: one kernel at a time on
-  // the device, so a launch boundary is every core's kernel change.
+  // Kept across launches; cleared at a clean boundary (note_clean_boundary).
   mutable std::vector<uint32_t> taint_;
 
   // The launching tenant (tenant_from_launch). Written on the CP's thread
   // between launches, read on the kernel's.
   std::atomic<uint32_t> launch_tenant_{0};
+
+  // Scrub boundaries (take_scrub_boundary): a clean boundary requested since
+  // the last launch, whether any kernel has run, and the last one's tenant.
+  std::atomic<bool> clean_pending_{false};
+  bool     ran_ = false;
+  uint32_t last_tenant_ = 0;
 
   // One shared poison block backs every fault response. The cache does
   // copy-on-write on shared fill data, so handing out the same block is safe.
@@ -387,6 +392,9 @@ public:
     if (perf_stats_.stack_denies != 0) {
       os << "CHECKER: stack: denies=" << perf_stats_.stack_denies << std::endl;
     }
+    if (perf_stats_.scrubs != 0) {
+      os << "CHECKER: scrubs=" << perf_stats_.scrubs << std::endl;
+    }
     if (config_.taint) {
       os << "CHECKER: taint: clean_boundaries=" << perf_stats_.clean_boundaries << std::endl;
       os << "CHECKER: taint: raises=" << perf_stats_.taint_raises
@@ -629,11 +637,26 @@ public:
   }
 
   // A clean boundary (T8): the launch runs the full scrub on every core it
-  // uses and starts with an empty taint. A SimX launch resets the cores
-  // anyway, so only the taint needs clearing here.
+  // uses (take_scrub_boundary) and starts with an empty taint.
   void note_clean_boundary() {
     std::fill(taint_.begin(), taint_.end(), 0u);
+    clean_pending_.store(true);
     ++perf_stats_.clean_boundaries;
+  }
+
+  // Called as a launch starts: does it cross a scrub boundary (T8)? Yes at a
+  // clean boundary or a change of launching tenant; the first kernel is not
+  // one (nothing ran before it), as in the RTL socket. One kernel runs at a
+  // time, so a launch is every core's kernel change.
+  bool take_scrub_boundary() {
+    const uint32_t tenant = config_.tenant_from_launch ? launch_tenant_.load() : 0u;
+    const bool scrub = ran_ && (clean_pending_.load() || tenant != last_tenant_);
+    ran_ = true;
+    last_tenant_ = tenant;
+    clean_pending_.store(false);
+    if (scrub)
+      ++perf_stats_.scrubs;
+    return scrub;
   }
 
   std::shared_ptr<mem_block_t> poison() const { return poison_; }
@@ -884,6 +907,10 @@ void MemChecker::note_launch_issuer(uint32_t issuer) {
 
 void MemChecker::note_clean_boundary() {
   impl_->note_clean_boundary();
+}
+
+bool MemChecker::take_scrub_boundary() {
+  return impl_->take_scrub_boundary();
 }
 
 bool MemChecker::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,

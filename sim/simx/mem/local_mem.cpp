@@ -98,6 +98,12 @@ public:
 
 	virtual ~Impl() {}
 
+	// The kernel-change scrub (spec T8): every word to zero.
+	void scrub() {
+		std::vector<uint8_t> zeros(config_.capacity, 0);
+		ram_.write(zeros.data(), 0, zeros.size());
+	}
+
 	void reset() {
 		perf_stats_ = PerfStats();
 #if VX_CFG_EXT_A_ENABLED
@@ -351,6 +357,10 @@ void LocalMem::on_reset() {
 
 void LocalMem::on_tick() {
   impl_->tick();
+}
+
+void LocalMem::scrub() {
+  impl_->scrub();
 }
 
 const LocalMem::PerfStats& LocalMem::perf_stats() const {

@@ -59,6 +59,9 @@ public:
 
   const PerfStats& perf_stats() const;
 
+  // The kernel-change scrub (spec T8): zero the whole memory.
+  void scrub();
+
 protected:
 
   void on_reset();
