@@ -18,8 +18,10 @@
 // laundering writes and the early export are refused, the late export lands.
 // Expected without it (the control): the laundering lands and the test fails.
 //
-// Host copies are functional and not judged by the checker (review issue 2),
-// so the host reads everything back directly to verify.
+// Host copies are judged by the checker on the CP's device path (D7) for the
+// queue that issues them, so each tenant moves its own buffers: M's on qm,
+// H's and the unclaimed ones on q. A download never carries joint data off
+// the device, so H leaves origin (as it left out) before M reads it back.
 
 #include <vortex2.h>
 #include "common.h"
@@ -141,10 +143,10 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < n; ++i)
         h_images[i] = SECRET(i);
     CHECK(vx_enqueue_write(q, images.buf, images.off, h_images.data(), words, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_write(q, mown.buf,   mown.off,   h_zero.data(), NUM_PHASES * words, 0, nullptr, nullptr));
     CHECK(vx_enqueue_write(q, pub.buf,    pub.off,    h_zero.data(), words, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_write(q, out.buf,    out.off,    h_zero.data(), words, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_write(q, origin.buf, origin.off, h_zero.data(), NUM_PHASES * words, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_write(qm, mown.buf,   mown.off,   h_zero.data(), NUM_PHASES * words, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_write(qm, out.buf,    out.off,    h_zero.data(), words, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_write(qm, origin.buf, origin.off, h_zero.data(), NUM_PHASES * words, 0, nullptr, nullptr));
 
     const uint32_t RW = CHECKER_PERM_R | CHECKER_PERM_W;
     const uint32_t H_BIT = 1u << TENANT_H;
@@ -196,13 +198,20 @@ int main(int argc, char** argv) {
                                 &launch_ev[phase]));
     }
 
+    // H releases the bookkeeping too, so it is M's alone and M may take it
+    // off the device. Then each buffer comes back through its owner's queue.
+    dcr(q, DCR_CHECKER_BUF_BASE,  (uint32_t)origin.base);
+    dcr(q, DCR_CHECKER_BUF_SIZE,  (uint32_t)(NUM_PHASES * words));
+    dcr(q, DCR_CHECKER_BUF_LEAVE, TENANT_H);
     std::vector<uint32_t> r_mown(NUM_PHASES * n), r_pub(n), r_out(n), r_origin(NUM_PHASES * n);
     vx_event_h last = launch_ev[NUM_PHASES - 1], read_ev = nullptr;
-    CHECK(vx_enqueue_read(q, r_mown.data(),   mown.buf,   mown.off,   NUM_PHASES * words, 1, &last, nullptr));
-    CHECK(vx_enqueue_read(q, r_pub.data(),    pub.buf,    pub.off,    words, 1, &last, nullptr));
-    CHECK(vx_enqueue_read(q, r_out.data(),    out.buf,    out.off,    words, 1, &last, nullptr));
-    CHECK(vx_enqueue_read(q, r_origin.data(), origin.buf, origin.off, NUM_PHASES * words, 1, &last, &read_ev));
+    CHECK(vx_enqueue_read(q, r_pub.data(), pub.buf, pub.off, words, 1, &last, &read_ev));
     CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+    CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+    CHECK(vx_enqueue_read(qm, r_mown.data(),   mown.buf,   mown.off,   NUM_PHASES * words, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_read(qm, r_out.data(),    out.buf,    out.off,    words, 0, nullptr, nullptr));
+    CHECK(vx_enqueue_read(qm, r_origin.data(), origin.buf, origin.off, NUM_PHASES * words, 0, nullptr, nullptr));
+    CHECK(vx_queue_finish(qm, VX_TIMEOUT_INFINITE));
 
     // ----- verification, per core-1 (M) task, per phase -----
     int errors = 0;

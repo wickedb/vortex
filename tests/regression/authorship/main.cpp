@@ -153,10 +153,13 @@ int main(int argc, char** argv) {
     }
     CHECK(vx_enqueue_write(q0, secret.buf, secret.off, h_secret.data(),  bytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_write(q0, grant.buf,  grant.off,  h_granted.data(), bytes, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_write(q0, t1own.buf,  t1own.off,  h_zero.data(),    bytes, 0, nullptr, nullptr));
     for (vx_buffer_h b : {probe, probe2, origin, countA, countB})
         CHECK(vx_enqueue_write(q0, b, 0, h_zero.data(), bytes, 0, nullptr, nullptr));
     finish(q0);
+    // Tenant 1's buffer is moved by tenant 1's queue: the CP's device path is
+    // checked for the queue that issues each transfer (D7).
+    CHECK(vx_enqueue_write(q1, t1own.buf, t1own.off, h_zero.data(), bytes, 0, nullptr, nullptr));
+    finish(q1);
 
     vx_module_h mod = nullptr;
     vx_kernel_h kern = nullptr;
@@ -226,10 +229,11 @@ int main(int argc, char** argv) {
     CHECK(vx_enqueue_read(q0, r_probe.data(),  probe,  0, bytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_read(q0, r_probe2.data(), probe2, 0, bytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_read(q0, r_origin.data(), origin, 0, bytes, 0, nullptr, nullptr));
-    CHECK(vx_enqueue_read(q0, r_t1.data(),     t1own.buf, t1own.off, bytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_read(q0, r_countA.data(), countA, 0, bytes, 0, nullptr, nullptr));
     CHECK(vx_enqueue_read(q0, r_countB.data(), countB, 0, bytes, 0, nullptr, nullptr));
     finish(q0);
+    CHECK(vx_enqueue_read(q1, r_t1.data(), t1own.buf, t1own.off, bytes, 0, nullptr, nullptr));
+    finish(q1);
 
     // ----- verification, keyed on the core each task ran on -----
     int errors = 0;

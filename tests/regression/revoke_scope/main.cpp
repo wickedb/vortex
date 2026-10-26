@@ -131,7 +131,10 @@ int main(int argc, char** argv) {
     }
 
     CHECK(vx_enqueue_write(q, bufA_buf, bufA_off, h_a.data(), used_size, 0,nullptr,nullptr));
-    CHECK(vx_enqueue_write(q, bufB_buf, bufB_off, h_b.data(), used_size, 0,nullptr,nullptr));
+    // Owner 1's buffer through owner 1's queue: the CP's device path is
+    // checked for the queue that issues each transfer (D7), and q1's claim
+    // below may land before q's commands run.
+    CHECK(vx_enqueue_write(q1, bufB_buf, bufB_off, h_b.data(), used_size, 0,nullptr,nullptr));
     CHECK(vx_enqueue_write(q, probe1_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
     CHECK(vx_enqueue_write(q, origin1_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
     CHECK(vx_enqueue_write(q, probe2_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));

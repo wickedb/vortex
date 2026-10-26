@@ -124,9 +124,11 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i < num_points; ++i)
         h_secret[i] = SECRET(i);
 
-    // Uploads (host copies are functional and not subject to the checker).
+    // Uploads. Each tenant moves its own data through its own queue: the
+    // checker on the CP's device path judges every line for the queue that
+    // issued it (D7).
     CHECK(vx_enqueue_write(q, secret_buf, secret_off, h_secret.data(), used_size, 0,nullptr,nullptr));
-    CHECK(vx_enqueue_write(q, t1_buf, t1_off, h_zero.data(), used_size, 0,nullptr,nullptr));
+    CHECK(vx_enqueue_write(q1, t1_buf, t1_off, h_zero.data(), used_size, 0,nullptr,nullptr));
     CHECK(vx_enqueue_write(q, probe_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
     CHECK(vx_enqueue_write(q, origin_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
 
@@ -155,9 +157,11 @@ int main(int argc, char** argv) {
     CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
     CHECK(vx_enqueue_read(q, h_probe.data(), probe_buf, 0, used_size, 1, &launch_ev, nullptr));
     CHECK(vx_enqueue_read(q, h_origin.data(), origin_buf, 0, used_size, 1, &launch_ev, nullptr));
-    CHECK(vx_enqueue_read(q, h_secret_rb.data(), secret_buf, secret_off, used_size, 1, &launch_ev, nullptr));
-    CHECK(vx_enqueue_read(q, h_t1_rb.data(), t1_buf, t1_off, used_size, 1, &launch_ev, &read_ev));
+    CHECK(vx_enqueue_read(q, h_secret_rb.data(), secret_buf, secret_off, used_size, 1, &launch_ev, &read_ev));
     CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
+    // Tenant 1 reads back its own buffer, after the kernel, on its own queue.
+    CHECK(vx_enqueue_read(q1, h_t1_rb.data(), t1_buf, t1_off, used_size, 0, nullptr, nullptr));
+    CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
 
     // ----- verification: expectations keyed on where each task actually ran -----
     uint32_t on_core0 = 0, on_core1 = 0;
