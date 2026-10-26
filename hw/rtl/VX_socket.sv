@@ -68,6 +68,10 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
 `endif
 
     VX_kmu_bus_if per_core_kmu_bus_if[`VX_CFG_SOCKET_SIZE]();
+`ifdef VX_CFG_CHECKER_ENABLE
+    VX_kmu_bus_if kmu_gate_if[1]();
+`endif
+    wire core_scrub_req, core_scrub_done;
 
     VX_kmu_bus_arb #(
         .NUM_INPUTS (1),
@@ -77,7 +81,11 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     ) kmu_arb (
         .clk        (clk),
         .reset      (reset),
+    `ifdef VX_CFG_CHECKER_ENABLE
+        .bus_in_if  (kmu_gate_if),   // held at a scrub boundary (below)
+    `else
         .bus_in_if  (kmu_bus_if),
+    `endif
         .bus_out_if (per_core_kmu_bus_if)
     );
 
@@ -750,6 +758,158 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         .TAG_WIDTH (SOCKET_MEM_ARB_TAG_WIDTH)
     ) l1_out_bus_if[L1_MEM_PORTS]();
 
+    ///////////////////////////////////////////////////////////////////////////
+    // The kernel-change scrub (P1_and_taint_specv2.md T8, option 3).
+    //
+    // At a scrub boundary -- a kernel of a different tenant arriving (with the
+    // tenant from the launching queue), or a launch whose tenant asked for a
+    // clean boundary -- the dispatch beat is held while the core is scrubbed:
+    //   1. the core flushes its private caches and zeroes its register banks
+    //      and local memory (VX_core scrub_req / scrub_done);
+    //   2. this socket zeroes the core's stack slice (spec T12) with full-line
+    //      writes on L1 port 0. They follow the flush, so no writeback of the
+    //      old stack can land after them, and they pass the slice rule because
+    //      the slice is this core's. Writes draw no response.
+    // Then the beat goes through; the socket's taint clears and the tenant
+    // loads on it (above). The previous kernel has drained (one kernel at a
+    // time), so nothing competes. The core's first kernel is not a boundary:
+    // its state then is reset's, and runs that never ask stay cycle-identical.
+    ///////////////////////////////////////////////////////////////////////////
+`ifdef VX_CFG_CHECKER_ENABLE
+    // A refusal at elaboration (STATIC_ASSERT fires only in simulation).
+    // SOCKET_ID is global across clusters, so with one core per socket it is
+    // the core's index, which is what the stack layout counts by.
+    if (`VX_CFG_SOCKET_SIZE != 1) begin : g_scrub_one_core
+        $fatal(1, "the scrub is per core: the checker needs one core per socket");
+    end
+    localparam SCRUB_CORE_ID   = SOCKET_ID;
+    localparam STACK_HPC       = `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS;   // harts per core
+    localparam STACK_SLICE_B   = STACK_HPC * (1 << `VX_MEM_STACK_LOG2_SIZE);
+    localparam LINE_BITS       = `CLOG2(`VX_CFG_L1_LINE_SIZE);
+    localparam STACK_LINES     = STACK_SLICE_B >> LINE_BITS;
+    localparam STACK_CNT_W     = `CLOG2(STACK_LINES + 1);
+    localparam logic [63:0] STACK_LO = 64'(`VX_MEM_STACK_BASE_ADDR)
+                                     - 64'(SCRUB_CORE_ID + 1) * 64'(STACK_SLICE_B);
+
+    kmu_req_t scrub_kmu_req;
+    assign scrub_kmu_req = kmu_req_t'(kmu_bus_if[0].data);
+    `UNUSED_VAR (scrub_kmu_req)   // only ctx_id, tenant and clean are read
+    reg [7:0]                 scrub_ctx_r, scrubbed_ctx_r;
+    reg                       scrub_ctx_valid_r, scrubbed_valid_r;
+    reg [MEM_OWNER_WIDTH-1:0] scrub_tenant_r;
+    wire new_kernel = kmu_bus_if[0].valid
+                   && (!scrub_ctx_valid_r || (scrub_kmu_req.ctx_id != scrub_ctx_r));
+`ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
+    wire new_tenant = scrub_ctx_valid_r && (scrub_kmu_req.tenant != scrub_tenant_r);
+`else
+    wire new_tenant = 1'b0;   // test mode: the tenant is the core
+    `UNUSED_VAR (scrub_tenant_r)
+`endif
+    wire needs_scrub = new_kernel && (new_tenant || scrub_kmu_req.clean)
+                    && !(scrubbed_valid_r && (scrubbed_ctx_r == scrub_kmu_req.ctx_id));
+
+    typedef enum logic [1:0] { SC_IDLE, SC_CORE, SC_STACK } sc_state_e;
+    sc_state_e sc_state;
+    reg [STACK_CNT_W-1:0] stack_cnt;
+    wire stack_wr_valid = (sc_state == SC_STACK);
+    wire stack_wr_ready;
+    wire stack_last = (stack_cnt == STACK_CNT_W'(STACK_LINES - 1));
+
+    always @(posedge clk) begin
+        if (reset) begin
+            sc_state          <= SC_IDLE;
+            stack_cnt         <= '0;
+            scrub_ctx_r       <= '0;
+            scrub_ctx_valid_r <= 1'b0;
+            scrub_tenant_r    <= '0;
+            scrubbed_ctx_r    <= '0;
+            scrubbed_valid_r  <= 1'b0;
+        end else begin
+            case (sc_state)
+                SC_IDLE:  if (needs_scrub) sc_state <= SC_CORE;
+                SC_CORE:  if (core_scrub_done) begin
+                              sc_state  <= SC_STACK;
+                              stack_cnt <= '0;
+                          end
+                SC_STACK: if (stack_wr_ready) begin
+                              if (stack_last) begin
+                                  sc_state         <= SC_IDLE;
+                                  scrubbed_ctx_r   <= scrub_kmu_req.ctx_id;
+                                  scrubbed_valid_r <= 1'b1;
+                              end else begin
+                                  stack_cnt <= stack_cnt + 1;
+                              end
+                          end
+                default:  sc_state <= SC_IDLE;
+            endcase
+            if (kmu_bus_if[0].valid && kmu_bus_if[0].ready) begin
+                scrub_ctx_r       <= scrub_kmu_req.ctx_id;
+                scrub_ctx_valid_r <= 1'b1;
+                scrub_tenant_r    <= scrub_kmu_req.tenant;
+            end
+        end
+    end
+    assign core_scrub_req = (sc_state == SC_CORE);
+
+`ifdef SIMULATION
+    // One line per scrub, so a run shows that it happened and what it cost.
+    reg [63:0] sc_cycles, sc_start;
+    always @(posedge clk) begin
+        if (reset) begin
+            sc_cycles <= '0;
+        end else begin
+            sc_cycles <= sc_cycles + 1;
+            if (sc_state == SC_IDLE && needs_scrub) begin
+                sc_start <= sc_cycles;
+                $display("SCRUB[%s]: start ctx=%0d clean=%0d new_tenant=%0d",
+                         INSTANCE_ID, scrub_kmu_req.ctx_id, scrub_kmu_req.clean, new_tenant);
+            end
+            if (sc_state == SC_STACK && stack_wr_ready && stack_last)
+                $display("SCRUB[%s]: done ctx=%0d in %0d cycles (%0d stack lines)",
+                         INSTANCE_ID, scrub_kmu_req.ctx_id, sc_cycles - sc_start + 1, STACK_LINES);
+        end
+    end
+`endif
+
+    // The stack-zeroing write: one 64 B line of zeros, attributed to this core.
+    mem_bus_attr_t stack_wr_attr;
+    always @(*) begin
+        stack_wr_attr       = '0;
+        stack_wr_attr.owner = MEM_OWNER_WIDTH'(SCRUB_CORE_ID);
+        stack_wr_attr.core  = MEM_CORE_WIDTH'(SCRUB_CORE_ID);
+    end
+    wire [63:0] stack_wr_byte = STACK_LO + (64'(stack_cnt) << LINE_BITS);
+    typedef struct packed {
+        logic                                         rw;
+        logic [`VX_CFG_MEM_ADDR_WIDTH-LINE_BITS-1:0]  addr;
+        logic [`VX_CFG_L1_LINE_SIZE*8-1:0]            data;
+        logic [`VX_CFG_L1_LINE_SIZE-1:0]              byteen;
+        logic [MEM_ATTR_WIDTH-1:0]                    attr;
+        logic [SOCKET_MEM_ARB_TAG_WIDTH-1:0]          tag;
+    } stack_req_t;
+    stack_req_t stack_wr_data;
+    always @(*) begin
+        stack_wr_data        = '0;
+        stack_wr_data.rw     = 1'b1;
+        stack_wr_data.addr   = stack_wr_byte[`VX_CFG_MEM_ADDR_WIDTH-1:LINE_BITS];
+        stack_wr_data.byteen = '1;
+        stack_wr_data.attr   = stack_wr_attr;
+    end
+    `UNUSED_VAR (stack_wr_byte)
+
+    // The dispatch beat waits while a scrub is needed or running.
+    wire scrub_hold = needs_scrub || (sc_state != SC_IDLE);
+    assign kmu_gate_if[0].valid = kmu_bus_if[0].valid && ~scrub_hold;
+    assign kmu_gate_if[0].kind  = kmu_bus_if[0].kind;
+    assign kmu_gate_if[0].eop   = kmu_bus_if[0].eop;
+    assign kmu_gate_if[0].dest  = kmu_bus_if[0].dest;
+    assign kmu_gate_if[0].data  = kmu_bus_if[0].data;
+    assign kmu_bus_if[0].ready  = kmu_gate_if[0].ready && ~scrub_hold;
+`else
+    assign core_scrub_req = 1'b0;
+    `UNUSED_VAR (core_scrub_done)
+`endif
+
     for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_mem_bus_if
         if (i == 0) begin : g_i0
             VX_mem_bus_if #(
@@ -790,7 +950,19 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
                 .bus_out_if (socket_arb_out_if)
             );
 
+        `ifdef VX_CFG_CHECKER_ENABLE
+            // The scrub's stack-zeroing writes (below) take port 0 while the
+            // core is idle; responses always pass, and writes draw none.
+            assign l1_out_bus_if[0].req_valid = stack_wr_valid || socket_arb_out_if[0].req_valid;
+            assign l1_out_bus_if[0].req_data  = stack_wr_valid ? stack_wr_data : socket_arb_out_if[0].req_data;
+            assign socket_arb_out_if[0].req_ready = l1_out_bus_if[0].req_ready && ~stack_wr_valid;
+            assign stack_wr_ready = l1_out_bus_if[0].req_ready;
+            assign socket_arb_out_if[0].rsp_valid = l1_out_bus_if[0].rsp_valid;
+            assign socket_arb_out_if[0].rsp_data  = l1_out_bus_if[0].rsp_data;
+            assign l1_out_bus_if[0].rsp_ready     = socket_arb_out_if[0].rsp_ready;
+        `else
             `ASSIGN_VX_MEM_BUS_IF (l1_out_bus_if[0], socket_arb_out_if[0]);
+        `endif
         end else begin : g_i
             VX_mem_bus_if #(
                 .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
@@ -1027,6 +1199,9 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         `endif
 
             .kmu_bus_if     (per_core_kmu_bus_if[core_id]),
+
+            .scrub_req      (core_scrub_req),
+            .scrub_done     (core_scrub_done),
 
             .gbar_bus_if    (per_core_gbar_bus_if[core_id]),
 

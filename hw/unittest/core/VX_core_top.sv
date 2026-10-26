@@ -243,6 +243,8 @@ module VX_core_top import VX_gpu_pkg::*;
     `endif
 
         .kmu_bus_if     (kmu_bus_if),
+        .scrub_req      (1'b0),
+        `UNUSED_PIN     (scrub_done),
         .busy           (busy)
     );
 

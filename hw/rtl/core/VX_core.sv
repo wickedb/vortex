@@ -74,10 +74,18 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // Global barrier
     VX_gbar_bus_if.master   gbar_bus_if,
 
+    // The kernel-change scrub (spec T8), requested by the socket at a scrub
+    // boundary while the core is idle: flush the private caches, then zero
+    // the register banks and local memory. `scrub_done` rises when all of it
+    // is complete and holds until `scrub_req` drops.
+    input  wire             scrub_req,
+    output wire             scrub_done,
+
     // Status
     output wire             busy
 );
     VX_schedule_if      schedule_if();
+    wire scrub_zero, gpr_scrub_done, lmem_scrub_done;
     VX_fetch_if         fetch_if();
     VX_decode_if        decode_if();
     VX_sched_csr_if     sched_csr_if();
@@ -173,6 +181,12 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
     // stale lines from the previous launch.
     VX_dcr_flush_if dcr_flush_if();
     VX_dcr_flush_if dcr_flush_dcache_if();
+    // The DCR-triggered flush and the scrub's share the one flush path; they
+    // never overlap (a scrub runs before a kernel, a flush command after).
+    VX_dcr_flush_if dcr_flush_src_if();
+    wire scrub_flush;
+    assign dcr_flush_if.req      = dcr_flush_src_if.req || scrub_flush;
+    assign dcr_flush_src_if.done = dcr_flush_if.done;
     VX_dcr_flush_if dcr_flush_icache_if();
 
     // High when the in-core global-store path is empty (no store still in
@@ -212,7 +226,7 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .reset      (reset),
         .dcr_bus_if (dcr_bus_if),
         .dcr_csr_if (dcr_csr_if),
-        .dcr_flush_if(dcr_flush_if)
+        .dcr_flush_if(dcr_flush_src_if)
     );
 
     `SCOPE_IO_SWITCH (3);
@@ -304,7 +318,9 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .decode_if      (decode_if),
         .writeback_if   (writeback_if),
         .dispatch_if    (dispatch_if),
-        .issue_sched_if (issue_sched_if)
+        .issue_sched_if (issue_sched_if),
+        .scrub          (scrub_zero),
+        .scrub_done     (gpr_scrub_done)
     );
 
     VX_execute #(
@@ -449,8 +465,34 @@ module VX_core import VX_gpu_pkg::*, VX_tlb_pkg::*; #(
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
         .dcr_flush_if  (dcr_flush_dcache_if),
-        .dcache_bus_if (mmu_dcache_if)
+        .dcache_bus_if (mmu_dcache_if),
+        .lmem_scrub    (scrub_zero),
+        .lmem_scrub_done (lmem_scrub_done)
     );
+
+    // ---------------------------------------------------------------------
+    // The kernel-change scrub (T8): FLUSH (write back and invalidate the
+    // L1s, through the flush path above), then ZERO (register banks and
+    // local memory, swept in parallel), then DONE until the request drops.
+    // ---------------------------------------------------------------------
+    typedef enum logic [1:0] { SCRUB_IDLE, SCRUB_FLUSH, SCRUB_ZERO, SCRUB_DONE } scrub_state_e;
+    scrub_state_e scrub_state;
+    always @(posedge clk) begin
+        if (reset) begin
+            scrub_state <= SCRUB_IDLE;
+        end else begin
+            case (scrub_state)
+                SCRUB_IDLE:  if (scrub_req)                          scrub_state <= SCRUB_FLUSH;
+                SCRUB_FLUSH: if (dcr_flush_if.done)                  scrub_state <= SCRUB_ZERO;
+                SCRUB_ZERO:  if (gpr_scrub_done && lmem_scrub_done)  scrub_state <= SCRUB_DONE;
+                SCRUB_DONE:  if (~scrub_req)                         scrub_state <= SCRUB_IDLE;
+                default:                                             scrub_state <= SCRUB_IDLE;
+            endcase
+        end
+    end
+    assign scrub_flush = (scrub_state == SCRUB_FLUSH);
+    assign scrub_zero  = (scrub_state == SCRUB_ZERO);
+    assign scrub_done  = (scrub_state == SCRUB_DONE);
 
     // Address translation is relocated to the socket (one MMU per L1 cache).
     // The core's dcache/icache buses carry the addresses the mem_unit and fetch

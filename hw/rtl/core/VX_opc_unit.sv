@@ -36,7 +36,14 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
 
     VX_writeback_if.slave   writeback_if,
     VX_scoreboard_if.slave  scoreboard_if,
-    VX_operands_if.master   operands_if
+    VX_operands_if.master   operands_if,
+
+    // The kernel-change scrub (spec T8): while `scrub` is held the banks are
+    // swept with zeros through their write ports, one address per cycle in
+    // every bank at once; `scrub_done` rises when the sweep is complete and
+    // holds until `scrub` drops. The core is idle while it runs.
+    input  wire             scrub,
+    output wire             scrub_done
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -259,6 +266,18 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
         assign gpr_wr_byteen[i*XLENB+:XLENB] = writeback_if.data.byteen[i];
     end
 
+    // The scrub sweep (see the port comment).
+    reg [BANK_ADDR_WIDTH:0] scrub_cnt;
+    wire scrub_busy = scrub && (scrub_cnt != (BANK_ADDR_WIDTH+1)'(BANK_SIZE));
+    always @(posedge clk) begin
+        if (reset || ~scrub) begin
+            scrub_cnt <= '0;
+        end else if (scrub_busy) begin
+            scrub_cnt <= scrub_cnt + 1;
+        end
+    end
+    assign scrub_done = scrub && ~scrub_busy;
+
     // GPR banks
     for (genvar b = 0; b < NUM_BANKS; ++b) begin : g_gpr_rams
         wire gpr_wr_enabled;
@@ -294,10 +313,10 @@ module VX_opc_unit import VX_gpu_pkg::*; #(
             .clk   (clk),
             .reset (reset),
             .read  (pipe_fire_st1 && gpr_rd_valid_st1[b]),
-            .wren  (gpr_wr_byteen),
-            .write (gpr_wr_enabled),
-            .waddr (gpr_wr_addr),
-            .wdata (writeback_if.data.data),
+            .wren  (scrub_busy ? {BANK_DATA_SIZE{1'b1}} : gpr_wr_byteen),
+            .write (gpr_wr_enabled || scrub_busy),
+            .waddr (scrub_busy ? scrub_cnt[BANK_ADDR_WIDTH-1:0] : gpr_wr_addr),
+            .wdata (scrub_busy ? '0 : writeback_if.data.data),
             .raddr (gpr_rd_addr),
             .rdata (gpr_rd_data_st2[b])
         );

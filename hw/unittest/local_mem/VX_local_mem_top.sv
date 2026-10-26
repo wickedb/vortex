@@ -109,7 +109,9 @@ module VX_local_mem_top import VX_gpu_pkg::*; #(
         .clk        (clk),
         .reset      (reset),
         .lsu_bus_if (lsu_bus_if),
-        .dma_bus_if (dma_bus_if)
+        .dma_bus_if (dma_bus_if),
+        .scrub      (1'b0),
+        `UNUSED_PIN (scrub_done)
     );
 
 endmodule

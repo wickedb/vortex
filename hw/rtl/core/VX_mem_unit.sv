@@ -38,7 +38,11 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
 
     VX_lsu_mem_if.slave     lsu_mem_if [`VX_CFG_NUM_LSU_BLOCKS],
     VX_dcr_flush_if.slave   dcr_flush_if,
-    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS]
+    VX_mem_bus_if.master    dcache_bus_if [DCACHE_NUM_REQS],
+
+    // The kernel-change scrub (spec T8): sweep local memory with zeros.
+    input  wire             lmem_scrub,
+    output wire             lmem_scrub_done
 );
     // Per-block empty: high when the global-store path holds no in-flight
     // write. Folded into core `busy` so the end-of-kernel cache flush is
@@ -245,10 +249,14 @@ module VX_mem_unit import VX_gpu_pkg::*; #(
         .lmem_perf   (lmem_perf),
     `endif
         .dma_bus_if  (lmem_dma_if),
-        .lsu_bus_if  (lmem_adapt_if)
+        .lsu_bus_if  (lmem_adapt_if),
+        .scrub       (lmem_scrub),
+        .scrub_done  (lmem_scrub_done)
     );
 
 `else
+    // No local memory: nothing to scrub.
+    assign lmem_scrub_done = lmem_scrub;
 
     for (genvar i = 0; i < `VX_CFG_NUM_LSU_BLOCKS; ++i) begin : g_lsu_dcache_if
         `ASSIGN_VX_MEM_BUS_IF (lsu_dcache_if[i], lsu_mem_if[i]);

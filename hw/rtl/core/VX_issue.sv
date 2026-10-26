@@ -28,7 +28,10 @@ module VX_issue import VX_gpu_pkg::*; #(
     VX_decode_if.slave      decode_if,
     VX_writeback_if.slave   writeback_if [`VX_CFG_ISSUE_WIDTH],
     VX_dispatch_if.master   dispatch_if [NUM_EX_UNITS * `VX_CFG_ISSUE_WIDTH],
-    VX_issue_sched_if.master issue_sched_if [`VX_CFG_ISSUE_WIDTH]
+    VX_issue_sched_if.master issue_sched_if [`VX_CFG_ISSUE_WIDTH],
+    // The kernel-change scrub (T8): every slice's register banks.
+    input  wire             scrub,
+    output wire             scrub_done
 );
     `STATIC_ASSERT ((`VX_CFG_ISSUE_WIDTH <= `VX_CFG_NUM_WARPS), ("invalid parameter"))
 
@@ -62,6 +65,9 @@ module VX_issue import VX_gpu_pkg::*; #(
         assign slice_decode_if.data  = decode_if.data;
         assign decode_ready_in[issue_id] = slice_decode_if.ready;
 
+    wire [`VX_CFG_ISSUE_WIDTH-1:0] per_issue_scrub_done;
+    assign scrub_done = &per_issue_scrub_done;
+
         for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_ibuf_pop
             assign decode_if.ibuf_pop[wis_to_wid(ISSUE_WIS_W'(w), ISSUE_ISW_W'(issue_id))] = slice_decode_if.ibuf_pop[w];
         end
@@ -80,7 +86,9 @@ module VX_issue import VX_gpu_pkg::*; #(
             .writeback_if (writeback_if[issue_id]),
             .dispatch_if  (per_issue_dispatch_if),
             .warp_issued  (issued_warps[issue_id]),
-            .warp_issued_wis(issued_warp_wis[issue_id])
+            .warp_issued_wis(issued_warp_wis[issue_id]),
+            .scrub        (scrub),
+            .scrub_done   (per_issue_scrub_done[issue_id])
         );
 
         // Assign transposed dispatch_if

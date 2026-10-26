@@ -54,8 +54,25 @@ module VX_local_mem import VX_gpu_pkg::*; #(
     VX_mem_bus_if.slave lsu_bus_if [NUM_REQS],
 
     // DMA read/write port
-    VX_mem_bus_if.slave dma_bus_if
+    VX_mem_bus_if.slave dma_bus_if,
+
+    // The kernel-change scrub (spec T8): while `scrub` is held every bank is
+    // swept with zeros, one word per bank per cycle; `scrub_done` rises when
+    // the sweep is complete and holds until `scrub` drops. The core is idle
+    // while it runs, so no request competes for the banks.
+    input  wire scrub,
+    output wire scrub_done
 );
+    reg [BANK_ADDR_WIDTH:0] scrub_cnt;
+    wire scrub_busy = scrub && (scrub_cnt != (BANK_ADDR_WIDTH+1)'(WORDS_PER_BANK));
+    always @(posedge clk) begin
+        if (reset || ~scrub) begin
+            scrub_cnt <= '0;
+        end else if (scrub_busy) begin
+            scrub_cnt <= scrub_cnt + 1;
+        end
+    end
+    assign scrub_done = scrub && ~scrub_busy;
     `UNUSED_SPARAM (INSTANCE_ID)
 
     localparam REQ_SEL_BITS    = `CLOG2(NUM_REQS);
@@ -565,10 +582,10 @@ module VX_local_mem import VX_gpu_pkg::*; #(
             .clk   (clk),
             .reset (reset),
             .read  (dma_rd_b || (lsu_active && ~per_bank_req_rw[i])),
-            .write (dma_wr_b || amo_wb_store || (lsu_active && per_bank_req_rw[i])),
-            .wren  (bank_sram_wren),
-            .addr  (bank_sram_addr),
-            .wdata (bank_sram_wdata),
+            .write (scrub_busy || dma_wr_b || amo_wb_store || (lsu_active && per_bank_req_rw[i])),
+            .wren  (scrub_busy ? {WORD_SIZE{1'b1}} : bank_sram_wren),
+            .addr  (scrub_busy ? scrub_cnt[BANK_ADDR_WIDTH-1:0] : bank_sram_addr),
+            .wdata (scrub_busy ? '0 : bank_sram_wdata),
             .rdata (per_bank_rsp_data[i])
         );
 

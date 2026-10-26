@@ -130,7 +130,9 @@ module VX_mem_unit_top import VX_gpu_pkg::*; #(
         .empty         (mem_unit_empty),
         .lsu_mem_if    (lsu_mem_if),
         .dcr_flush_if  (dcr_flush_if),
-        .dcache_bus_if (mem_bus_if)
+        .dcache_bus_if (mem_bus_if),
+        .lmem_scrub    (1'b0),
+        `UNUSED_PIN    (lmem_scrub_done)
     );
 
 endmodule

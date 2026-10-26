@@ -26,7 +26,11 @@ module VX_operands import VX_gpu_pkg::*; #(
 
     VX_writeback_if.slave   writeback_if,
     VX_scoreboard_if.slave  scoreboard_if,
-    VX_operands_if.master   operands_if
+    VX_operands_if.master   operands_if,
+
+    // The kernel-change scrub (T8): every collector's register banks.
+    input  wire             scrub,
+    output wire             scrub_done
 );
     `UNUSED_SPARAM (ISSUE_ID)
 
@@ -54,6 +58,7 @@ module VX_operands import VX_gpu_pkg::*; #(
     wire [`VX_CFG_NUM_OPCS-1:0] scoreboard_ready_in;
     assign scoreboard_if.ready = scoreboard_ready_in[sb_opc];
 
+    wire [`VX_CFG_NUM_OPCS-1:0] per_opc_scrub_done;
     for (genvar i = 0; i < `VX_CFG_NUM_OPCS; i++) begin : g_collectors
         // select scoreboard interface
         VX_scoreboard_if opc_scoreboard_if();
@@ -78,9 +83,12 @@ module VX_operands import VX_gpu_pkg::*; #(
         `endif
             .writeback_if (opc_writeback_if),
             .scoreboard_if(opc_scoreboard_if),
-            .operands_if  (per_opc_operands_if[i])
+            .operands_if  (per_opc_operands_if[i]),
+            .scrub        (scrub),
+            .scrub_done   (per_opc_scrub_done[i])
         );
     end
+    assign scrub_done = &per_opc_scrub_done;
 
     `ITF_TO_AOS (per_opc_operands, per_opc_operands_if, `VX_CFG_NUM_OPCS, OUT_DATAW)
 

@@ -160,7 +160,9 @@ module VX_issue_top import VX_gpu_pkg::*; #(
         .decode_if      (decode_if),
         .writeback_if   (writeback_if),
         .dispatch_if    (dispatch_if),
-        .issue_sched_if (issue_sched_if)
+        .issue_sched_if (issue_sched_if),
+        .scrub          (1'b0),
+        `UNUSED_PIN     (scrub_done)
     );
 
 endmodule

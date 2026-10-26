@@ -30,7 +30,10 @@ module VX_issue_slice import VX_gpu_pkg::*; #(
     VX_writeback_if.slave   writeback_if,
     VX_dispatch_if.master   dispatch_if [NUM_EX_UNITS],
     output wire             warp_issued,
-    output wire [ISSUE_WIS_W-1:0] warp_issued_wis
+    output wire [ISSUE_WIS_W-1:0] warp_issued_wis,
+    // The kernel-change scrub (T8): this slice's register banks.
+    input  wire             scrub,
+    output wire             scrub_done
 );
     VX_ibuffer_if ibuffer_if [PER_ISSUE_WARPS]();
     VX_scoreboard_if scoreboard_if();
@@ -77,7 +80,9 @@ module VX_issue_slice import VX_gpu_pkg::*; #(
      `endif
         .writeback_if   (writeback_if),
         .scoreboard_if  (scoreboard_if),
-        .operands_if    (operands_if)
+        .operands_if    (operands_if),
+        .scrub          (scrub),
+        .scrub_done     (scrub_done)
     );
 
     VX_dispatcher #(
