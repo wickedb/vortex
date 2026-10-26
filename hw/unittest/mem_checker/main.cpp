@@ -96,12 +96,16 @@ static void revoke(uint32_t owner, uint32_t new_epoch, int issuer = -1) {
   tick(2);
 }
 
+// A requester that is no owner: a CP queue whose index names no core (D7).
+static constexpr uint32_t ANON = 0xffffffffu;
+
 // Present one request and hold it until the checker accepts it.
 static void accept(uint64_t addr, bool is_write, uint32_t owner) {
   sim->req_valid = 1;
   sim->req_rw    = is_write ? 1 : 0;
   sim->req_addr  = (uint32_t)addr;
-  sim->req_owner = owner;
+  sim->req_owner = (owner == ANON) ? 0 : owner;
+  sim->req_owner_valid = (owner == ANON) ? 0 : 1;
   int guard = 0;
   while (!sim->req_ready && guard++ < 128) tick();
   tick();
@@ -134,6 +138,8 @@ int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
   timestamp = sim.reset(0);
   sim->out_ready = 1;
+  // Drain the poison responses: the fault queue holds FAULT_DEPTH of them.
+  sim->rsp_ready = 1;
   tick(4);
 
   const uint64_t A = 4 * GRANULE;    // owner 0's buffer
@@ -351,6 +357,26 @@ int main(int argc, char** argv) {
     expect(!access(F, false, 1), "auth: owner 1 could not revoke owner 0's grant");
     revoke(0, 200);
     expect(access(F, false, 1),  "auth: owner 0 revokes its own grant");
+  }
+
+  // ---- D7: a requester that is no owner (a CP queue naming no core) ----
+  // It reaches the checker as req_owner_valid=0. With owner 0's index on
+  // req_owner it must still be nobody: no owner perms, only OWNER_ANY or the
+  // grant.
+  {
+    const uint32_t RW = VX_CHECKER_PERM_R | VX_CHECKER_PERM_W;
+    const uint64_t L = 60 * GRANULE;   // owner 0's, private
+    const uint64_t M = 64 * GRANULE;   // owner 0's, granted R
+    const uint64_t N = 68 * GRANULE;   // unclaimed (boot default OWNER_ANY)
+    claim(L, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY);
+    claim(M, GRANULE, 0, RW, VX_CHECKER_PERM_R, VX_CHECKER_GRANT_NO_EXPIRY);
+    expect(!access(L, false, 0),   "anon: owner 0 reads its own L (control)");
+    expect(access(L, false, ANON), "anon: no-owner requester DENIED owner 0's L read");
+    expect(access(L, true,  ANON), "anon: no-owner requester DENIED owner 0's L write");
+    expect(!access(M, false, ANON), "anon: no-owner requester holds the grant on M (read)");
+    expect(access(M, true,  ANON), "anon: the grant is read-only for it too");
+    expect(!access(N, false, ANON) && !access(N, true, ANON),
+           "anon: unclaimed memory follows the boot default");
   }
 
   std::printf("\ncounters: reqs=%u checked=%u bypassed=%u allow=%u deny=%u\n",

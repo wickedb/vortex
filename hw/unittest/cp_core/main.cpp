@@ -168,6 +168,40 @@ struct AxiSlave {
 };
 
 // ============================================================================
+// Synthetic device-memory slave (d_*): accepts single-beat writes, answers B
+// with the request's ID, and records every AW ID it accepts. Reads are not
+// modelled (no scenario issues one).
+// ============================================================================
+struct DevSlave {
+    std::vector<uint32_t> aw_ids;
+    bool    aw_taken  = false;
+    uint8_t aw_id     = 0;
+    bool    b_pending = false;
+    uint8_t b_id      = 0;
+    template <typename T>
+    void comb_drive(T* top) {
+        top->d_awready = !aw_taken;
+        top->d_wready  = aw_taken && !b_pending;
+        top->d_bvalid  = b_pending;
+        top->d_bid     = b_id;
+        top->d_bresp   = 0;
+        top->d_arready = 0;
+        top->d_rvalid  = 0;
+    }
+    template <typename T>
+    void posedge_update(T* top) {
+        if (top->d_awvalid && top->d_awready) {
+            aw_taken = true; aw_id = top->d_awid; aw_ids.push_back(top->d_awid);
+        }
+        if (aw_taken && top->d_wvalid && top->d_wready) {
+            aw_taken = false; b_pending = true; b_id = aw_id;
+        }
+        if (b_pending && top->d_bvalid && top->d_bready) b_pending = false;
+    }
+};
+static DevSlave g_dev;
+
+// ============================================================================
 // Synthetic gpu_if model. Always ready; records every DCR request it accepts
 // (and every start, in the same log, as addr 0xFFF); answers a read one cycle
 // later with 0x1000 + addr; pulses busy for a few cycles after start.
@@ -204,15 +238,19 @@ static void cycle(vl_simulator<T>& sim, AxiSlave& slave, GpuModel& gpu,
     auto* top = sim.operator->();
     slave.comb_drive(top);
     gpu.comb_drive(top);
+    g_dev.comb_drive(top);
     top->eval();
     slave.comb_drive(top);
     gpu.comb_drive(top);
+    g_dev.comb_drive(top);
     top->eval();
     slave.posedge_update(top);
     gpu.posedge_update(top);
+    g_dev.posedge_update(top);
     tick = sim.step(tick, 2);
     slave.comb_drive(top);
     gpu.comb_drive(top);
+    g_dev.comb_drive(top);
     top->eval();
 }
 
@@ -529,9 +567,34 @@ int main(int argc, char** argv) {
         EXPECT(axil_read(sim, slave, gpu, tick, qreg(0, 0x30)) == 0x10A0, "C: queue 0's response");
     }
 
+    // ----- D. device-side beats carry their queue (D7) -----
+    // Both queues signal an event in the same cycles. Every device AW must
+    // carry its issuing queue in the low ID bits, which is what the checker
+    // on the CP's device path reads as the requester.
+    constexpr uint8_t OP_SIGNAL = 0x08;
+    g_dev.aw_ids.clear();
+    put_cl(0, {{OP_SIGNAL, 0x80000000ull, 0x11}});
+    put_cl(1, {{OP_SIGNAL, 0x80000040ull, 0x22}});
+    axil_write(sim, slave, gpu, tick, CP_CTRL, 0);
+    doorbell(0);
+    doorbell(1);
+    axil_write(sim, slave, gpu, tick, CP_CTRL, 1);
+    wait_seq(0, 7);
+    wait_seq(1, 7);
+    {
+        EXPECT(g_dev.aw_ids.size() == 2, "D: expected one device write per queue");
+        int seen[2] = {0, 0};
+        for (uint32_t id : g_dev.aw_ids) {
+            const uint32_t q = id & 0x1Fu;   // below the xbar's source bit
+            EXPECT(q < 2, "D: device AW ID names no queue");
+            if (q < 2) ++seen[q];
+        }
+        EXPECT(seen[0] == 1 && seen[1] == 1, "D: device beats not stamped with their queue");
+    }
+
     std::printf("PASSED — CP end-to-end: NOP retired, seqnum written to "
                 "cmpl_addr, Q_CONTROL.reset clears the queue; two queues: "
                 "issuer tagging, no lost commands, per-queue launch registers, "
-                "checker-window reads refused\n");
+                "checker-window reads refused, device beats stamped with their queue\n");
     return 0;
 }

@@ -30,6 +30,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      req_rw,
     input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] req_addr,
     input  wire [CHK_OWNER_W-1:0]    req_owner,
+    input  wire                      req_owner_valid,
     output wire                      req_ready,
 
     // request out + verdict
@@ -111,6 +112,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .req_rw              (req_rw),
         .req_addr            (req_addr),
         .req_owner           (req_owner),
+        .req_owner_valid     (req_owner_valid),
         .req_ready           (req_ready),
         .out_valid           (out_valid),
         .out_rw              (out_rw),
