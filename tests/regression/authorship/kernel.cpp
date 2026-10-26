@@ -28,6 +28,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	} else {
 		// Tenant 1's buffer: core 1's write lands, core 0's is dropped.
 		auto t1own = reinterpret_cast<uint32_t*>(arg->t1_addr);
-		t1own[idx] = (core == 1) ? MARK_T1(idx) : MARK_T0(idx);
+		uint32_t who = arg->by_core ? core : arg->role;
+		t1own[idx] = (who == 1) ? MARK_T1(idx) : MARK_T0(idx);
 	}
 }

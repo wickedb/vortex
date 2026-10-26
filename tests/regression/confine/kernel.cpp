@@ -17,7 +17,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	auto origin = reinterpret_cast<volatile uint32_t*>(arg->origin_addr);
 
 	origin[arg->phase * n + idx] = core;
-	if (core != TENANT_M)
+	uint32_t who = arg->by_core ? core : arg->role;
+	if (who != TENANT_M)
 		return;
 
 	if (arg->phase == PHASE_TRAIN) {

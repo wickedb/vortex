@@ -46,15 +46,17 @@
 namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 1024;
+bool        per_launch  = false;   // -L: one launch per tenant (spec T3)
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:Lh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
+            case 'L': per_launch  = true;              break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-h]" << std::endl;
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-h]" << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
         }
     }
@@ -82,6 +84,12 @@ int main(int argc, char** argv) {
     vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
     vx_queue_h q = nullptr;
     CHECK(vx_queue_create(dev, &qi, &q));
+    // -L: tenant 1 runs its kernels from its own queue.
+    vx_queue_info_t qi1 = qi;
+    qi1.flags |= VX_QUEUE_FLAG_HW_QUEUE(1);
+    vx_queue_h q1 = nullptr;
+    if (per_launch)
+        CHECK(vx_queue_create(dev, &qi1, &q1));
 
     vx_buffer_h shared_buf=nullptr, probe1_buf=nullptr, origin1_buf=nullptr,
                 probe2_buf=nullptr, origin2_buf=nullptr;
@@ -131,6 +139,7 @@ int main(int argc, char** argv) {
     arg1.shared_addr = shared_base;
     CHECK(vx_buffer_address(probe1_buf,  &arg1.probe_addr));
     CHECK(vx_buffer_address(origin1_buf, &arg1.origin_addr));
+    arg1.by_core = per_launch ? 0 : 1;
     arg2 = arg1;
     arg2.phase = 2;
     CHECK(vx_buffer_address(probe2_buf,  &arg2.probe_addr));
@@ -147,6 +156,77 @@ int main(int argc, char** argv) {
         li.block_dim[0]= block[0];
         return li;
     };
+
+    if (per_launch) {
+        // Tenant 1 under the grant; tenant 0 revokes; tenant 1 again; then
+        // tenant 0, the owner, into a third probe/origin pair.
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        vx_buffer_h probe3_buf=nullptr, origin3_buf=nullptr;
+        CHECK(vx_buffer_create(dev, used_size, VX_MEM_READ_WRITE, &probe3_buf));
+        CHECK(vx_buffer_create(dev, used_size, VX_MEM_READ_WRITE, &origin3_buf));
+        CHECK(vx_enqueue_write(q, origin3_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        kernel_arg_t arg3 = arg2;
+        arg1.role = 1;
+        arg2.role = 1;
+        arg3.role = 0;
+        CHECK(vx_buffer_address(probe3_buf,  &arg3.probe_addr));
+        CHECK(vx_buffer_address(origin3_buf, &arg3.origin_addr));
+        vx_launch_info_t l1 = make_li(&arg1), l2 = make_li(&arg2), l3 = make_li(&arg3);
+        CHECK(vx_enqueue_launch(q1, &l1, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_dcr_write(q, DCR_CHECKER_EPOCH, 1, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_launch(q1, &l2, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_launch(q, &l3, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+
+        std::vector<uint32_t> p1(num_points), o1(num_points), p2(num_points), o2(num_points),
+                              p3(num_points), o3(num_points), sh(num_points);
+        CHECK(vx_enqueue_read(q, p1.data(), probe1_buf,  0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, o1.data(), origin1_buf, 0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, p2.data(), probe2_buf,  0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, o2.data(), origin2_buf, 0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, p3.data(), probe3_buf,  0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, o3.data(), origin3_buf, 0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, sh.data(), shared_buf, shared_off, used_size, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+
+        int errors = 0;
+        uint32_t c2[2] = {0, 0};
+        auto fail = [&](uint32_t i, const char* what, uint32_t exp, uint32_t got) {
+            if (errors < 16)
+                std::printf("*** [%u] %s: expected=0x%08x actual=0x%08x\n", i, what, exp, got);
+            ++errors;
+        };
+        for (uint32_t i = 0; i < num_points; ++i) {
+            if (o2[i] < 2) ++c2[o2[i]];
+            if (p1[i] != SECRET(i))   fail(i, "tenant 1 under the grant", SECRET(i), p1[i]);
+            if (p2[i] != POISON_WORD) fail(i, "tenant 1 after revocation (leak!)", POISON_WORD, p2[i]);
+            if (p3[i] != SECRET(i))   fail(i, "owner read after revocation", SECRET(i), p3[i]);
+            if (sh[i] != MARK_T0(i))  fail(i, "owner write after revocation", MARK_T0(i), sh[i]);
+        }
+        std::printf("tenant 1's revoked launch on cores: %u %u\n", c2[0], c2[1]);
+        if (c2[0] == 0 || c2[1] == 0) {
+            std::printf("*** the revoked launch did not span both cores (run with --cores=2)\n");
+            ++errors;
+        }
+        for (vx_buffer_h b : {origin3_buf, probe3_buf, origin2_buf, probe2_buf, origin1_buf, probe1_buf, shared_buf})
+            vx_buffer_release(b);
+        vx_kernel_release(kern);
+        vx_module_release(mod);
+        vx_queue_release(q1);
+        vx_queue_release(q);
+        vx_device_dump_perf(dev, stdout);
+        vx_device_release(dev);
+        if (errors) {
+            std::cout << "Found " << errors << " errors!\nFAILED!" << std::endl;
+            return 1;
+        }
+        std::cout << "PASSED!" << std::endl;
+        return 0;
+    }
 
     // launch 1 (grant active) → revoke (ONE register write) → launch 2.
     // The queue is FIFO and each launch drains before the next command, so

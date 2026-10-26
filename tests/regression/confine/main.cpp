@@ -18,6 +18,11 @@
 // laundering writes and the early export are refused, the late export lands.
 // Expected without it (the control): the laundering lands and the test fails.
 //
+// -L: one launch per tenant (spec T3; needs the tenant from the launching
+// queue). Every phase is M's own launch from M's queue, so every task, on
+// either core, does M's work; H's release still comes from H's queue between
+// the launches.
+//
 // Host copies are judged by the checker on the CP's device path (D7) for the
 // queue that issues them, so each tenant moves its own buffers: M's on qm,
 // H's and the unclaimed ones on q. A download never carries joint data off
@@ -46,17 +51,19 @@
 namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 32;
+bool        per_launch  = false;   // -L: one launch per tenant (spec T3)
 bool        claim_stack = true;
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:Sh")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:SLh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
+            case 'L': per_launch  = true;              break;
             case 'S': claim_stack = false;             break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-S (leave the stack unclaimed)] [-h]" << std::endl;
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-S (leave the stack unclaimed)] [-h]" << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
         }
     }
@@ -186,6 +193,8 @@ int main(int argc, char** argv) {
         a.pub_addr    = pub.base;
         a.out_addr    = out.base;
         a.origin_addr = origin.base;
+        a.role        = TENANT_M;
+        a.by_core     = per_launch ? 0 : 1;
 
         vx_launch_info_t li{};
         li.struct_size = sizeof(li);
@@ -195,8 +204,16 @@ int main(int argc, char** argv) {
         li.ndim        = 1;
         li.grid_dim[0] = grid[0];
         li.block_dim[0]= block[0];
-        CHECK(vx_enqueue_launch(q, &li, phase ? 1 : 0, phase ? &launch_ev[phase-1] : nullptr,
-                                &launch_ev[phase]));
+        if (per_launch) {
+            // M's own launch from M's queue; H's release (above) must land
+            // before it, and the launch must finish before H's next command.
+            CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+            CHECK(vx_enqueue_launch(qm, &li, 0, nullptr, nullptr));
+            CHECK(vx_queue_finish(qm, VX_TIMEOUT_INFINITE));
+        } else {
+            CHECK(vx_enqueue_launch(q, &li, phase ? 1 : 0, phase ? &launch_ev[phase-1] : nullptr,
+                                    &launch_ev[phase]));
+        }
     }
 
     // H releases the bookkeeping too, so it is M's alone and M may take it
@@ -206,7 +223,7 @@ int main(int argc, char** argv) {
     dcr(q, DCR_CHECKER_BUF_LEAVE, TENANT_H);
     std::vector<uint32_t> r_mown(NUM_PHASES * n), r_pub(n), r_out(n), r_origin(NUM_PHASES * n);
     vx_event_h last = launch_ev[NUM_PHASES - 1], read_ev = nullptr;
-    CHECK(vx_enqueue_read(q, r_pub.data(), pub.buf, pub.off, words, 1, &last, &read_ev));
+    CHECK(vx_enqueue_read(q, r_pub.data(), pub.buf, pub.off, words, last ? 1 : 0, last ? &last : nullptr, &read_ev));
     CHECK(vx_event_wait_value(read_ev, 1, VX_TIMEOUT_INFINITE));
     CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
     CHECK(vx_enqueue_read(qm, r_mown.data(),   mown.buf,   mown.off,   NUM_PHASES * words, 0, nullptr, nullptr));
@@ -226,8 +243,8 @@ int main(int argc, char** argv) {
     for (uint32_t phase = 0; phase < NUM_PHASES; ++phase) {
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t core = r_origin[phase * n + i];
-            if (core == TENANT_H) { ++h_tasks[phase]; continue; }
-            if (core != TENANT_M) { fail(phase, i, "origin core id", TENANT_M, core); continue; }
+            if (!per_launch && core == TENANT_H) { ++h_tasks[phase]; continue; }
+            if (core > 1) { fail(phase, i, "origin core id", TENANT_M, core); continue; }
             ++m_tasks[phase];
             if (phase == PHASE_TRAIN) {
                 if (r_out[i] == (SECRET(i) ^ KEY)) ++trained;
@@ -259,7 +276,7 @@ int main(int argc, char** argv) {
     }
 
     vx_event_release(read_ev);
-    for (auto ev : launch_ev) vx_event_release(ev);
+    for (auto ev : launch_ev) if (ev) vx_event_release(ev);
     for (auto* p : {&images, &mown, &pub, &out, &origin}) vx_buffer_release(p->buf);
     vx_kernel_release(kern);
     vx_module_release(mod);

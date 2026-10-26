@@ -35,15 +35,17 @@
 namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 1024;
+bool        per_launch  = false;   // -L: one launch per tenant
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:Lh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
+            case 'L': per_launch  = true;              break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-h]" << std::endl;
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-h]" << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
         }
     }
@@ -119,6 +121,7 @@ int main(int argc, char** argv) {
     kernel_arg.t1_addr     = t1_base;
     CHECK(vx_buffer_address(probe_buf,  &kernel_arg.probe_addr));
     CHECK(vx_buffer_address(origin_buf, &kernel_arg.origin_addr));
+    kernel_arg.by_core = per_launch ? 0 : 1;
 
     std::vector<uint32_t> h_secret(num_points), h_zero(num_points, 0);
     for (uint32_t i = 0; i < num_points; ++i)
@@ -152,6 +155,79 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> h_probe(num_points), h_origin(num_points),
                           h_secret_rb(num_points), h_t1_rb(num_points);
+
+    if (per_launch) {
+        // Tenant 0's launch, from queue 0, into probe/origin; tenant 1's,
+        // from queue 1, into its own pair. Every task of a launch runs as
+        // that launch's tenant, on whichever core it lands.
+        vx_buffer_h probe1_buf=nullptr, origin1_buf=nullptr;
+        CHECK(vx_buffer_create(dev, used_size, VX_MEM_READ_WRITE, &probe1_buf));
+        CHECK(vx_buffer_create(dev, used_size, VX_MEM_READ_WRITE, &origin1_buf));
+        CHECK(vx_enqueue_write(q, probe1_buf,  0, h_zero.data(), used_size, 0,nullptr,nullptr));
+        CHECK(vx_enqueue_write(q, origin1_buf, 0, h_zero.data(), used_size, 0,nullptr,nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        kernel_arg_t arg1 = kernel_arg;
+        arg1.role = 1;
+        CHECK(vx_buffer_address(probe1_buf,  &arg1.probe_addr));
+        CHECK(vx_buffer_address(origin1_buf, &arg1.origin_addr));
+        kernel_arg.role = 0;
+        vx_launch_info_t li1 = li;
+        li1.args_host = &arg1;
+        CHECK(vx_enqueue_launch(q, &li, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_launch(q1, &li1, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
+
+        std::vector<uint32_t> h_probe1(num_points), h_origin1(num_points);
+        CHECK(vx_enqueue_read(q, h_probe.data(),     probe_buf,   0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_origin.data(),    origin_buf,  0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_probe1.data(),    probe1_buf,  0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_origin1.data(),   origin1_buf, 0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_secret_rb.data(), secret_buf, secret_off, used_size, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_read(q1, h_t1_rb.data(), t1_buf, t1_off, used_size, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
+
+        int errors = 0;
+        uint32_t cores0[2] = {0, 0}, cores1[2] = {0, 0};
+        auto fail = [&](uint32_t i, const char* what, uint32_t exp, uint32_t got) {
+            if (errors < 16)
+                std::printf("*** [%u] %s: expected=0x%08x actual=0x%08x\n", i, what, exp, got);
+            ++errors;
+        };
+        for (uint32_t i = 0; i < num_points; ++i) {
+            if (h_origin[i]  < 2) ++cores0[h_origin[i]];
+            if (h_origin1[i] < 2) ++cores1[h_origin1[i]];
+            if (h_probe[i] != SECRET(i))     fail(i, "tenant 0's own read", SECRET(i), h_probe[i]);
+            if (h_probe1[i] != POISON_WORD)  fail(i, "tenant 1's read of the secret (leak!)", POISON_WORD, h_probe1[i]);
+            if (h_secret_rb[i] != MARK_T0(i)) fail(i, "secret: tenant 0's write lands, tenant 1's dropped", MARK_T0(i), h_secret_rb[i]);
+            if (h_t1_rb[i] != MARK_T1(i))    fail(i, "tenant 1's own write", MARK_T1(i), h_t1_rb[i]);
+        }
+        std::printf("tenant 0's launch on cores: %u %u; tenant 1's: %u %u\n",
+                    cores0[0], cores0[1], cores1[0], cores1[1]);
+        if (cores1[0] == 0 || cores1[1] == 0) {
+            std::printf("*** tenant 1's launch did not span both cores (run with --cores=2)\n");
+            ++errors;
+        }
+        vx_buffer_release(origin1_buf);
+        vx_buffer_release(probe1_buf);
+        vx_buffer_release(origin_buf);
+        vx_buffer_release(probe_buf);
+        vx_buffer_release(t1_buf);
+        vx_buffer_release(secret_buf);
+        vx_kernel_release(kern);
+        vx_module_release(mod);
+        vx_queue_release(q1);
+        vx_queue_release(q);
+        vx_device_dump_perf(dev, stdout);
+        vx_device_release(dev);
+        if (errors) {
+            std::cout << "Found " << errors << " errors!\nFAILED!" << std::endl;
+            return 1;
+        }
+        std::cout << "PASSED!" << std::endl;
+        return 0;
+    }
 
     vx_event_h launch_ev=nullptr, read_ev=nullptr;
     CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));

@@ -16,6 +16,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	auto origin = reinterpret_cast<uint32_t*>(arg->origin_addr);
 
 	origin[idx] = core;
+	uint32_t who = arg->by_core ? core : arg->role;
 	for (uint32_t s = 0; s < SHARED_SECTORS; ++s) {
 		if (arg->mode == 0) {
 			// Both tenants read the same words.
@@ -24,8 +25,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 		} else {
 			// Same sectors, interleaved words: even for tenant 0, odd for
 			// tenant 1. All tasks on a core write the same value to a word.
-			uint32_t w = s * SECTOR_WORDS + 2 * (idx % (SECTOR_WORDS / 2)) + (core & 1);
-			secret[w] = (core == 0) ? MARK_T0(w) : MARK_XT(w);
+			uint32_t w = s * SECTOR_WORDS + 2 * (idx % (SECTOR_WORDS / 2)) + (who & 1);
+			secret[w] = (who == 0) ? MARK_T0(w) : MARK_XT(w);
 		}
 	}
 }

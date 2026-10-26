@@ -21,6 +21,13 @@
 // access reaches the checker and both modes must pass: that is the control.
 //
 // Run with --cores=2 --checker-enforce, with and without --l2cache --l3cache.
+//
+// -L: one launch per tenant (spec T3; needs the tenant from the launching
+// queue). Tenant 0's launch, then tenant 1's, each from its own queue, each
+// doing its half of the mode. This checks the same outcomes, but not the
+// point of the test: with one tenant per launch two tenants never share the
+// cache at once (that needs concurrent kernels), and the runtime's
+// per-launch flush empties the caches between the launches.
 
 #define SECTOR_WORDS   16u  // 64 B sector
 #define SHARED_SECTORS 4u
@@ -37,6 +44,9 @@ typedef struct {
   uint64_t secret_addr;  // tenant 0's buffer (claimed for eid 0)
   uint64_t probe_addr;   // shared: what each task read, SHARED_SECTORS per task (mode 0)
   uint64_t origin_addr;  // shared: the core id each task ran on
+  // -L: the tenant this launch runs as; without -L, the task's core.
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif

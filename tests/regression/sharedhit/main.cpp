@@ -30,17 +30,19 @@
 namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 1024;
+bool        per_launch  = false;   // -L: one launch per tenant (spec T3)
 uint32_t    mode        = 0;
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:m:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:m:k:Lh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'm': mode        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
+            case 'L': per_launch  = true;              break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-m 0=read|1=write] [-h]" << std::endl;
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-m 0=read|1=write] [-h]" << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
         }
     }
@@ -100,6 +102,7 @@ int main(int argc, char** argv) {
     kernel_arg.secret_addr = secret_base;
     CHECK(vx_buffer_address(probe_buf,  &kernel_arg.probe_addr));
     CHECK(vx_buffer_address(origin_buf, &kernel_arg.origin_addr));
+    kernel_arg.by_core = per_launch ? 0 : 1;
 
     std::vector<uint32_t> h_secret(num_points), h_zero(num_points * SHARED_SECTORS, 0);
     for (uint32_t i = 0; i < num_points; ++i)
@@ -122,6 +125,88 @@ int main(int argc, char** argv) {
     li.block_dim[0]= block[0];
 
     std::vector<uint32_t> h_probe(num_points * SHARED_SECTORS), h_origin(num_points), h_secret_rb(num_points);
+
+    if (per_launch) {
+        // Tenant 0's launch into probe/origin, tenant 1's from its own queue
+        // into a second pair.
+        vx_queue_info_t qi1 = { sizeof(qi1), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
+        qi1.flags |= VX_QUEUE_FLAG_HW_QUEUE(1);
+        vx_queue_h q1 = nullptr;
+        CHECK(vx_queue_create(dev, &qi1, &q1));
+        vx_buffer_h probe1_buf = nullptr, origin1_buf = nullptr;
+        CHECK(vx_buffer_create(dev, probe_size, VX_MEM_READ_WRITE, &probe1_buf));
+        CHECK(vx_buffer_create(dev, used_size,  VX_MEM_READ_WRITE, &origin1_buf));
+        CHECK(vx_enqueue_write(q, probe1_buf,  0, h_zero.data(), probe_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_write(q, origin1_buf, 0, h_zero.data(), used_size,  0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        kernel_arg_t arg1 = kernel_arg;
+        kernel_arg.role = 0;
+        arg1.role = 1;
+        CHECK(vx_buffer_address(probe1_buf,  &arg1.probe_addr));
+        CHECK(vx_buffer_address(origin1_buf, &arg1.origin_addr));
+        vx_launch_info_t li1 = li;
+        li1.args_host = &arg1;
+        CHECK(vx_enqueue_launch(q, &li, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+        CHECK(vx_enqueue_launch(q1, &li1, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q1, VX_TIMEOUT_INFINITE));
+        std::vector<uint32_t> h_probe1(num_points * SHARED_SECTORS), h_origin1(num_points);
+        CHECK(vx_enqueue_read(q, h_probe.data(),  probe_buf,   0, probe_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_probe1.data(), probe1_buf,  0, probe_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_origin1.data(), origin1_buf, 0, used_size, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q, h_secret_rb.data(), secret_buf, secret_off, used_size, 0, nullptr, nullptr));
+        CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE));
+
+        uint32_t leak = 0, owner_bad = 0, c1[2] = {0, 0};
+        int printed = 0;
+        auto report = [&](const char* what, uint32_t i, uint32_t exp, uint32_t got) {
+            if (printed++ < 16)
+                std::printf("*** [%u] %s: expected=0x%08x actual=0x%08x\n", i, what, exp, got);
+        };
+        for (uint32_t i = 0; i < num_points; ++i)
+            if (h_origin1[i] < 2) ++c1[h_origin1[i]];
+        if (mode == 0) {
+            for (uint32_t i = 0; i < num_points; ++i) {
+                for (uint32_t s = 0; s < SHARED_SECTORS; ++s) {
+                    uint32_t w = s * SECTOR_WORDS + (i % SECTOR_WORDS);
+                    if (h_probe[i * SHARED_SECTORS + s] != SECRET(w)) { ++owner_bad; report("tenant 0's own read", i, SECRET(w), h_probe[i * SHARED_SECTORS + s]); }
+                    if (h_probe1[i * SHARED_SECTORS + s] != POISON_WORD) { ++leak; report("tenant 1's read LEAKED", i, POISON_WORD, h_probe1[i * SHARED_SECTORS + s]); }
+                }
+            }
+        } else {
+            for (uint32_t w = 0; w < num_points; ++w) {
+                uint32_t got = h_secret_rb[w];
+                uint32_t exp = (w < SHARED_WORDS && (w % 2) == 0) ? MARK_T0(w) : SECRET(w);
+                if (got != exp) {
+                    if (got == MARK_XT(w)) { ++leak; report("tenant 1's write LANDED", w, exp, got); }
+                    else { ++owner_bad; report("tenant 0's view", w, exp, got); }
+                }
+            }
+        }
+        std::cout << "sharedhit -L: tenant1_breach=" << leak << " tenant0_damage=" << owner_bad
+                  << " | tenant 1's launch on cores " << c1[0] << " " << c1[1] << std::endl;
+        vx_buffer_release(origin1_buf);
+        vx_buffer_release(probe1_buf);
+        vx_buffer_release(origin_buf);
+        vx_buffer_release(probe_buf);
+        vx_buffer_release(secret_buf);
+        vx_kernel_release(kern);
+        vx_module_release(mod);
+        vx_queue_release(q1);
+        vx_queue_release(q);
+        vx_device_release(dev);
+        if (c1[0] == 0 || c1[1] == 0) {
+            std::cout << "tenant 1's launch did not span both cores — run with --cores=2\nFAILED!" << std::endl;
+            return 1;
+        }
+        if (leak || owner_bad) {
+            std::cout << "Found " << (leak + owner_bad) << " errors!\nFAILED!" << std::endl;
+            return 1;
+        }
+        std::cout << "PASSED!" << std::endl;
+        return 0;
+    }
+
     vx_event_h launch_ev = nullptr, read_ev = nullptr;
     CHECK(vx_enqueue_launch(q, &li, 0, nullptr, &launch_ev));
     CHECK(vx_enqueue_read(q, h_probe.data(), probe_buf, 0, probe_size, 1, &launch_ev, nullptr));

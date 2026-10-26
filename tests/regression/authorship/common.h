@@ -18,6 +18,12 @@
 //        0's next launch ran on tenant 1's arguments.
 //
 // Run with: VX_CHECKER=1 VX_CHECKER_ENFORCE=1 and --cores=2.
+//
+// -L: one launch per tenant (spec T3; needs the tenant from the launching
+// queue). In -m0 and -m1, tenant 1's half runs as its own launch from queue
+// 1, before tenant 0's from queue 0, so tenant 0's dropped write to tenant
+// 1's buffer stays observable. -m2 launches only from tenant 0's queue and is
+// the same in both forms.
 
 // Checker DCR registers — mirror of sim/simx/sec/mem_checker.h.
 #define DCR_CHECKER_BUF_BASE   0x300
@@ -63,6 +69,9 @@ typedef struct {
   uint64_t probe2_addr;  // shared: what each task read from grant[idx]
   uint64_t origin_addr;  // shared: the core id each task ran on
   uint64_t count_addr;   // shared: launches that ran with these arguments (-m2)
+  // -L: the tenant this launch runs as; without -L, the task's core.
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif

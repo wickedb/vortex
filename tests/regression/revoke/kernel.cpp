@@ -16,7 +16,8 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	probe[idx]  = shared[idx];
 	origin[idx] = core;
 
-	if (arg->phase == 2 && core == 0) {
+	uint32_t who = arg->by_core ? core : arg->role;
+	if (arg->phase == 2 && who == 0) {
 		shared[idx] = MARK_T0(idx);
 	}
 }

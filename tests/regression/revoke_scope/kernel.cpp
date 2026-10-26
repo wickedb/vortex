@@ -15,6 +15,7 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	auto probe  = reinterpret_cast<uint32_t*>(arg->probe_addr);
 	auto origin = reinterpret_cast<uint32_t*>(arg->origin_addr);
 
-	probe[idx]  = (core == 0) ? bufB[idx] : bufA[idx];
+	uint32_t who = arg->by_core ? core : arg->role;
+	probe[idx]  = (who == 0) ? bufB[idx] : bufA[idx];
 	origin[idx] = core;
 }

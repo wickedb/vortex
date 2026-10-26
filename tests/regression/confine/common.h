@@ -52,6 +52,9 @@ typedef struct {
   uint64_t pub_addr;     // unclaimed: second launder target
   uint64_t out_addr;     // owners {M, H}: the agreed output
   uint64_t origin_addr;  // owners {M, H}: the core each task ran on, per phase
+  // -L: the tenant this launch runs as; without -L, the task's core.
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif

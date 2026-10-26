@@ -7,6 +7,12 @@
 // `probe`/`origin` result buffers stay unclaimed, i.e. system/shared.
 //
 // Run with: VX_CHECKER=1 VX_CHECKER_ENFORCE=1 and --cores=2.
+//
+// -L: one launch per tenant instead (spec T3). Tenant 0's launch from queue
+// 0 reads its secret and writes it; tenant 1's launch from queue 1 probes the
+// secret (poison), writes it (dropped) and writes its own buffer (lands);
+// each launch spans both cores. Needs the tenant taken from the launching
+// queue (RTL --checker-tenant; SimX VX_CHECKER_TENANT_FROM_LAUNCH=1).
 // Without the checker armed the cross-tenant accesses succeed and the test
 // FAILS — that failure is the control result showing enforcement, not luck,
 // produces the isolation.
@@ -40,6 +46,10 @@ typedef struct {
   uint64_t t1_addr;      // tenant 1's buffer (claimed for eid 1)
   uint64_t probe_addr;   // shared: the value each task read from secret[idx]
   uint64_t origin_addr;  // shared: the core id each task ran on
+  // -L (one launch per tenant): which tenant's half this launch runs. Without
+  // -L the kernel acts as the tenant of the core it runs on (test mode).
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif

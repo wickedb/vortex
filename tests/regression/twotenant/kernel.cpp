@@ -20,7 +20,10 @@ __kernel void kernel_main(kernel_arg_t* __UNIFORM__ arg) {
 	probe[idx]  = secret[idx];
 	origin[idx] = core;
 
-	if (core == 0) {
+	// Which tenant's half this task runs: its core in test mode, the
+	// launch's tenant with -L.
+	uint32_t who = arg->by_core ? core : arg->role;
+	if (who == 0) {
 		secret[idx] = MARK_T0(idx);  // own-buffer write: must land
 	} else {
 		secret[idx] = MARK_XT(idx);  // cross-tenant write: must be dropped

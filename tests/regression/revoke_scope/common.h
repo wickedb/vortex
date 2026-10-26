@@ -20,6 +20,11 @@
 // global epoch expired both grants at once and this assertion failed.
 //
 // Run with: VX_CHECKER=1 VX_CHECKER_ENFORCE=1 and --cores=2.
+//
+// -L: one launch per tenant (spec T3; needs the tenant from the launching
+// queue). Each phase runs tenant 0's launch (reads bufB under owner 1's
+// grant) and tenant 1's launch (reads bufA under owner 0's grant), each from
+// its own queue; owner 0 revokes between the phases.
 // Without the checker armed, revocation has no effect and the test FAILS —
 // the control result.
 
@@ -56,6 +61,9 @@ typedef struct {
   uint64_t bufB_addr;   // owner eid 1, READ-granted to others at epoch 0
   uint64_t probe_addr;  // per-launch: the value each task read via its grant
   uint64_t origin_addr; // per-launch: the core id each task ran on
+  // -L: the tenant this launch runs as; without -L, the task's core.
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif

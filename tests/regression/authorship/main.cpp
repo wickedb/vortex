@@ -30,17 +30,19 @@
 namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 1024;
+bool        per_launch  = false;   // -L: one launch per tenant (spec T3)
 uint32_t    mode        = MODE_FOREIGN;
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:m:k:h")) != -1) {
+    while ((c = getopt(argc, argv, "n:m:k:Lh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'm': mode        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
+            case 'L': per_launch  = true;              break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-m mode: 0 foreign "
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-m mode: 0 foreign "
                              "setup, 1 staging interleave, 2 launch hijack] [-h]"
                           << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
@@ -200,6 +202,79 @@ int main(int argc, char** argv) {
         finish(q1);
         dcr(q0, DCR_CHECKER_BUF_COMMIT, 1);
         finish(q0);
+    }
+
+    a.by_core = per_launch ? 0 : 1;
+    if (per_launch && mode != MODE_HIJACK) {
+        // Tenant 1's launch from queue 1 into a second probe set, then
+        // tenant 0's from queue 0 into the first.
+        uint64_t p1_addr = 0, p21_addr = 0, o1_addr = 0;
+        vx_buffer_h probe_1  = make_plain(dev, bytes, &p1_addr);
+        vx_buffer_h probe2_1 = make_plain(dev, bytes, &p21_addr);
+        vx_buffer_h origin_1 = make_plain(dev, bytes, &o1_addr);
+        for (vx_buffer_h b : {probe_1, probe2_1, origin_1})
+            CHECK(vx_enqueue_write(q0, b, 0, h_zero.data(), bytes, 0, nullptr, nullptr));
+        finish(q0);
+        kernel_arg_t b1 = a;
+        b1.role = 1;
+        b1.probe_addr = p1_addr; b1.probe2_addr = p21_addr; b1.origin_addr = o1_addr;
+        a.role = 0;
+        vx_launch_info_t lb = li;
+        lb.args_host = &b1;
+        CHECK(vx_enqueue_launch(q1, &lb, 0, nullptr, nullptr));
+        finish(q1);
+        CHECK(vx_enqueue_launch(q0, &li, 0, nullptr, nullptr));
+        finish(q0);
+
+        std::vector<uint32_t> p0(n), p20(n), p1(n), p21(n), o1(n), t1(n);
+        CHECK(vx_enqueue_read(q0, p0.data(),  probe,    0, bytes, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q0, p20.data(), probe2,   0, bytes, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q0, p1.data(),  probe_1,  0, bytes, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q0, p21.data(), probe2_1, 0, bytes, 0, nullptr, nullptr));
+        CHECK(vx_enqueue_read(q0, o1.data(),  origin_1, 0, bytes, 0, nullptr, nullptr));
+        finish(q0);
+        CHECK(vx_enqueue_read(q1, t1.data(), t1own.buf, t1own.off, bytes, 0, nullptr, nullptr));
+        finish(q1);
+
+        int errors = 0;
+        uint32_t c1[2] = {0, 0};
+        auto fail = [&](uint32_t i, const char* what, uint32_t exp, uint32_t got) {
+            if (errors < 16)
+                std::printf("*** [%u] %s: expected=0x%08x actual=0x%08x\n", i, what, exp, got);
+            ++errors;
+        };
+        for (uint32_t i = 0; i < n; ++i) {
+            if (o1[i] < 2) ++c1[o1[i]];
+            if (p0[i] != SECRET(i))   fail(i, "owner read of the secret", SECRET(i), p0[i]);
+            if (p1[i] != POISON_WORD) fail(i, "tenant 1's read of the secret (leak!)", POISON_WORD, p1[i]);
+            if (mode == MODE_FOREIGN) {
+                if (p20[i] != GRANTED(i)) fail(i, "owner read of the grant", GRANTED(i), p20[i]);
+                if (p21[i] != GRANTED(i)) fail(i, "tenant 1 under tenant 0's grant (revoked by tenant 1?)", GRANTED(i), p21[i]);
+            } else if (t1[i] != MARK_T1(i)) {
+                fail(i, t1[i] == MARK_T0(i) ? "tenant 0's write to tenant 1's buffer (landed!)"
+                                            : "tenant 1's own write", MARK_T1(i), t1[i]);
+            }
+        }
+        std::printf("tenant 1's launch on cores: %u %u\n", c1[0], c1[1]);
+        if (c1[0] == 0 || c1[1] == 0) {
+            std::printf("*** tenant 1's launch did not span both cores (run with --cores=2)\n");
+            ++errors;
+        }
+        for (vx_buffer_h b : {origin_1, probe2_1, probe_1, argsB, countB, countA, origin, probe2, probe,
+                              t1own.buf, grant.buf, secret.buf})
+            vx_buffer_release(b);
+        vx_kernel_release(kern);
+        vx_module_release(mod);
+        vx_queue_release(q1);
+        vx_queue_release(q0);
+        vx_device_dump_perf(dev, stdout);
+        vx_device_release(dev);
+        if (errors) {
+            std::printf("FAILED! (%d errors)\n", errors);
+            return 1;
+        }
+        std::printf("PASSED!\n");
+        return 0;
     }
 
     // Launch 1, from tenant 0's queue.

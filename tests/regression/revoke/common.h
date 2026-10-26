@@ -10,6 +10,11 @@
 // buffer; tenant 1's reads come back poison.
 //
 // Run with: VX_CHECKER=1 VX_CHECKER_ENFORCE=1 and --cores=2.
+//
+// -L: one launch per tenant (spec T3; needs the tenant from the launching
+// queue). Tenant 1 launches from queue 1 under the grant (real data); tenant
+// 0 revokes; tenant 1 launches again (poison); tenant 0 launches as the
+// owner (reads, and its write lands).
 // Without the checker armed, revocation has no effect and the test FAILS —
 // the control result.
 
@@ -42,6 +47,9 @@ typedef struct {
   uint64_t shared_addr;  // tenant 0's buffer, READ-granted to others at epoch 0
   uint64_t probe_addr;   // per-launch: the value each task read
   uint64_t origin_addr;  // per-launch: the core id each task ran on
+  // -L: the tenant this launch runs as; without -L, the task's core.
+  uint32_t role;
+  uint32_t by_core;
 } kernel_arg_t;
 
 #endif
