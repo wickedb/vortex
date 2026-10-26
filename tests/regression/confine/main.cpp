@@ -18,6 +18,10 @@
 // laundering writes and the early export are refused, the late export lands.
 // Expected without it (the control): the laundering lands and the test fails.
 //
+// The export after the release runs on a clean boundary (T8): M's kernels
+// otherwise inherit the taint {H} of the training phase. -N leaves it out,
+// and then that export must be refused too.
+//
 // -L: one launch per tenant (spec T3; needs the tenant from the launching
 // queue). Every phase is M's own launch from M's queue, so every task, on
 // either core, does M's work; H's release still comes from H's queue between
@@ -52,18 +56,20 @@ namespace {
 const char* kernel_file = "kernel.vxbin";
 uint32_t    size        = 32;
 bool        per_launch  = false;   // -L: one launch per tenant (spec T3)
+bool        no_clean    = false;   // -N: no clean boundary before the export
 bool        claim_stack = true;
 
 void parse_args(int argc, char** argv) {
     int c;
-    while ((c = getopt(argc, argv, "n:k:SLh")) != -1) {
+    while ((c = getopt(argc, argv, "n:k:SLNh")) != -1) {
         switch (c) {
             case 'n': size        = std::atoi(optarg); break;
             case 'k': kernel_file = optarg;            break;
             case 'L': per_launch  = true;              break;
+            case 'N': no_clean    = true;              break;
             case 'S': claim_stack = false;             break;
             default:
-                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-S (leave the stack unclaimed)] [-h]" << std::endl;
+                std::cout << "Usage: [-k kernel] [-n words] [-L (one launch per tenant)] [-N (no clean boundary: the late export must be refused)] [-S (leave the stack unclaimed)] [-h]" << std::endl;
                 std::exit(c == 'h' ? 0 : -1);
         }
     }
@@ -183,6 +189,11 @@ int main(int argc, char** argv) {
             dcr(q, DCR_CHECKER_BUF_BASE,  (uint32_t)out.base);
             dcr(q, DCR_CHECKER_BUF_SIZE,  (uint32_t)words);
             dcr(q, DCR_CHECKER_BUF_LEAVE, TENANT_H);
+            // M's kernels inherit the taint {H} of the training phase (T8)
+            // unless the launch is a clean boundary, which M asks for on the
+            // queue that launches it.
+            if (!no_clean)
+                CHECK(vx_enqueue_clean_boundary(per_launch ? qm : q, 0, nullptr, nullptr));
         }
         kernel_arg_t& a = args[phase];
         a = kernel_arg_t{};
@@ -254,10 +265,15 @@ int main(int argc, char** argv) {
             } else if (phase == PHASE_EXPORT_EARLY) {
                 uint32_t got = r_mown[phase * n + i];
                 if (got != 0 && got == r_out[i]) { ++early; fail(phase, i, "export before release (leak!)", 0, got); }
-            } else {
+            } else if (!no_clean) {
                 uint32_t got = r_mown[phase * n + i];
                 if (got == r_out[i]) ++late;
                 else fail(phase, i, "export after release must land", r_out[i], got);
+            } else {
+                // -N: without a clean boundary the kernel inherits {H}, so
+                // even the released output may not land in M's buffer.
+                uint32_t got = r_mown[phase * n + i];
+                if (got != 0 && got == r_out[i]) { ++late; fail(phase, i, "export with an inherited taint (leak!)", 0, got); }
             }
         }
     }
