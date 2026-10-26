@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <deque>
+#include <atomic>
 
 using namespace vortex;
 
@@ -123,6 +124,10 @@ private:
   // Cleared on reset(), which every launch performs: one kernel at a time on
   // the device, so a launch boundary is every core's kernel change.
   mutable std::vector<uint32_t> taint_;
+
+  // The launching tenant (tenant_from_launch). Written on the CP's thread
+  // between launches, read on the kernel's.
+  std::atomic<uint32_t> launch_tenant_{0};
 
   // One shared poison block backs every fault response. The cache does
   // copy-on-write on shared fill data, so handing out the same block is safe.
@@ -531,14 +536,14 @@ public:
     if (!label.valid)
       return true;   // no policy: IO / local memory
     if (in_stack(addr)) {
-      bool ok = !is_fetch && (stack_core(addr) == this->owner_of(hart_id));
+      bool ok = !is_fetch && (stack_core(addr) == this->core_of(hart_id));
       if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
         ok = false;
       if (!ok)
         ++perf_stats_.stack_denies;
       return ok;
     }
-    const uint32_t eid  = this->owner_of(hart_id);
+    const uint32_t eid  = this->tenant_of(hart_id);
     const uint32_t need = need_of(is_write, is_fetch);
     uint32_t contrib;
     const bool ok = this->judge(label, eid, need, &contrib);
@@ -613,6 +618,13 @@ public:
 
   bool enforcing() const { return config_.enforce; }
 
+  // The issuer of a KMU launch-register write. The CP replays a launch's
+  // registers from the launching queue's shadow, each write carrying that
+  // queue, so the latest one before the launch starts names its tenant.
+  void note_launch_issuer(uint32_t issuer) {
+    launch_tenant_.store(issuer);
+  }
+
   std::shared_ptr<mem_block_t> poison() const { return poison_; }
 
   void count_label_deny(bool is_write) {
@@ -621,7 +633,14 @@ public:
   }
 
 private:
-  uint32_t owner_of(uint32_t hart_id) const {
+  // The tenant a request runs as (spec T3): with tenant_from_launch, the CP
+  // queue that launched the kernel (one kernel at a time on the device);
+  // otherwise, in test mode, the core.
+  uint32_t tenant_of(uint32_t hart_id) const {
+    return config_.tenant_from_launch ? launch_tenant_.load() : this->core_of(hart_id);
+  }
+
+  uint32_t core_of(uint32_t hart_id) const {
     constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
     constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
     return hart_id >> (LOG_WARPS + LOG_THREADS);
@@ -848,6 +867,10 @@ int MemChecker::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
   return impl_->dcr_write(addr, value, issuer);
 }
 
+void MemChecker::note_launch_issuer(uint32_t issuer) {
+  impl_->note_launch_issuer(issuer);
+}
+
 bool MemChecker::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
                               uint32_t* taint, bool to_host) {
   return impl_->cp_authorize(addr, is_write, issuer, taint, to_host);
@@ -896,5 +919,6 @@ bool MemChecker::env_config(Config* out) {
   out->test_deny      = env_u32("VX_CHECKER_TEST_DENY", 0);
   out->taint          = env_flag("VX_CHECKER_TAINT", false);
   out->default_perms  = env_u32("VX_CHECKER_DEFAULT_PERMS", VX_CFG_CHECKER_DEFAULT_PERMS);
+  out->tenant_from_launch = env_flag("VX_CHECKER_TENANT_FROM_LAUNCH", false);
   return true;
 }

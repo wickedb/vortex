@@ -457,6 +457,8 @@ int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
   if (is_kmu_dcr) {
     kmu_->dcr_write(addr, value);
+    if (mem_checker_)
+      mem_checker_->note_launch_issuer(issuer);
     return 0;
   }
 #ifdef VX_CFG_VM_ENABLE

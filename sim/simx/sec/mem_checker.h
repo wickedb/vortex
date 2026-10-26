@@ -159,6 +159,9 @@ public:
     // VX_CFG_CHECKER_DEFAULT_PERMS). D9 decided R|X; the build keeps R|W|X
     // until the stack rule (T12) and claim-what-you-write land.
     uint32_t default_perms = PERM_R | PERM_W | PERM_X;
+    // The tenant a kernel runs as is the CP queue that launched it
+    // (VX_CHECKER_TENANT_FROM_LAUNCH, spec T3). Off: the core (test mode).
+    bool     tenant_from_launch = false;
   };
 
   struct PerfStats {
@@ -279,6 +282,9 @@ public:
   // read and drops a write); without enforcement it is only counted.
   bool cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
                     uint32_t* taint, bool to_host);
+
+  // The issuer of a KMU launch-register write (spec T3; see tenant_of).
+  void note_launch_issuer(uint32_t issuer);
 
   const PerfStats& perf_stats() const;
   const FaultStatus& fault_status() const;
