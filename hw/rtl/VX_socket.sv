@@ -742,6 +742,14 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     // peers; priority order keeps icache first and DXA bulk traffic last so
     // it cannot starve core fetch/load traffic. Ports 1.. carry the extra
     // dcache banks straight through.
+    // The L1s' traffic toward the shared hierarchy, before the socket
+    // boundary below (where, with taint, every request is stamped and every
+    // response snooped).
+    VX_mem_bus_if #(
+        .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
+        .TAG_WIDTH (SOCKET_MEM_ARB_TAG_WIDTH)
+    ) l1_out_bus_if[L1_MEM_PORTS]();
+
     for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_mem_bus_if
         if (i == 0) begin : g_i0
             VX_mem_bus_if #(
@@ -782,7 +790,7 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
                 .bus_out_if (socket_arb_out_if)
             );
 
-            `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[0], socket_arb_out_if[0]);
+            `ASSIGN_VX_MEM_BUS_IF (l1_out_bus_if[0], socket_arb_out_if[0]);
         end else begin : g_i
             VX_mem_bus_if #(
                 .DATA_SIZE (`VX_CFG_L1_LINE_SIZE),
@@ -790,9 +798,88 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             ) l1_mem_arb_bus_if();
 
             `ASSIGN_VX_MEM_BUS_IF_EX (l1_mem_arb_bus_if, dcache_mem_bus_if[i], SOCKET_MEM_ARB_TAG_WIDTH, DCACHE_MEM_TAG_WIDTH, UUID_WIDTH);
-            `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[i], l1_mem_arb_bus_if);
+            `ASSIGN_VX_MEM_BUS_IF (l1_out_bus_if[i], l1_mem_arb_bus_if);
         end
     end
+
+    ///////////////////////////////////////////////////////////////////////////
+    // The socket boundary: confinement by taint (P1_and_taint_specv2.md T3).
+    //
+    // One taint per core (SOCKET_SIZE == 1 with labels): the owners whose
+    // confined data the kernel on this core has read. Every request leaving
+    // the L1s is stamped with it, which is no earlier than its issue taint,
+    // and every response entering them ORs in its contributor mask, which
+    // reaches here before the data reaches the register file. So the L1s
+    // need no labels: every line in them was counted when it was filled.
+    //
+    // Cleared when the core starts a different kernel (a new ctx_id on the
+    // dispatch link). Same-tenant inheritance and the scrub that makes the
+    // clear sound (T8) are step 5; until then this matches the SimX proof of
+    // concept, which clears at every launch.
+    ///////////////////////////////////////////////////////////////////////////
+`ifdef VX_CFG_CHECKER_TAINT_ENABLE
+    `STATIC_ASSERT(`VX_CFG_SOCKET_SIZE == 1, ("taint is per core: one core per socket"))
+
+    reg [`VX_CFG_CHECKER_TENANTS-1:0] taint_r;
+    reg [7:0] taint_ctx_r;
+    reg       taint_ctx_valid_r;
+    kmu_req_t taint_kmu_req;
+    assign taint_kmu_req = kmu_req_t'(kmu_bus_if[0].data);
+    `UNUSED_VAR (taint_kmu_req)   // only ctx_id is read
+    wire kernel_change = kmu_bus_if[0].valid && kmu_bus_if[0].ready
+                      && (!taint_ctx_valid_r || (taint_kmu_req.ctx_id != taint_ctx_r));
+
+    // Every response entering the L1s, from every port: its contributor mask.
+    wire [L1_MEM_PORTS-1:0][`VX_CFG_CHECKER_TENANTS-1:0] port_contrib;
+    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_taint_snoop
+        assign port_contrib[i] = (mem_bus_if[i].rsp_valid && mem_bus_if[i].rsp_ready)
+                               ? mem_bus_if[i].rsp_data.attr[`VX_CFG_CHECKER_TENANTS-1:0] : '0;
+    end
+    reg [`VX_CFG_CHECKER_TENANTS-1:0] taint_raise;
+    always @(*) begin
+        taint_raise = '0;
+        for (int i = 0; i < L1_MEM_PORTS; ++i) begin
+            taint_raise |= port_contrib[i];
+        end
+    end
+
+    always @(posedge clk) begin
+        if (reset) begin
+            taint_r           <= '0;
+            taint_ctx_r       <= '0;
+            taint_ctx_valid_r <= 1'b0;
+        end else if (kernel_change) begin
+            // A new kernel starts empty. Responses still arriving now belong
+            // to the previous kernel, which has drained: one kernel at a time.
+            taint_r           <= '0;
+            taint_ctx_r       <= taint_kmu_req.ctx_id;
+            taint_ctx_valid_r <= 1'b1;
+        end else begin
+            taint_r <= taint_r | taint_raise;
+        end
+    end
+
+    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_taint_stamp
+        assign mem_bus_if[i].req_valid       = l1_out_bus_if[i].req_valid;
+        assign mem_bus_if[i].req_data.rw     = l1_out_bus_if[i].req_data.rw;
+        assign mem_bus_if[i].req_data.addr   = l1_out_bus_if[i].req_data.addr;
+        assign mem_bus_if[i].req_data.data   = l1_out_bus_if[i].req_data.data;
+        assign mem_bus_if[i].req_data.byteen = l1_out_bus_if[i].req_data.byteen;
+        assign mem_bus_if[i].req_data.tag    = l1_out_bus_if[i].req_data.tag;
+        always @(*) begin
+            mem_bus_if[i].req_data.attr = l1_out_bus_if[i].req_data.attr;
+            mem_bus_if[i].req_data.attr[MEM_ATTR_TAINT_OFFS +: `VX_CFG_CHECKER_TENANTS] = taint_r;
+        end
+        assign l1_out_bus_if[i].req_ready = mem_bus_if[i].req_ready;
+        assign l1_out_bus_if[i].rsp_valid = mem_bus_if[i].rsp_valid;
+        assign l1_out_bus_if[i].rsp_data  = mem_bus_if[i].rsp_data;
+        assign mem_bus_if[i].rsp_ready    = l1_out_bus_if[i].rsp_ready;
+    end
+`else
+    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_l1_out
+        `ASSIGN_VX_MEM_BUS_IF (mem_bus_if[i], l1_out_bus_if[i]);
+    end
+`endif
 
     ///////////////////////////////////////////////////////////////////////////
 

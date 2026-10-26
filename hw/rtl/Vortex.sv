@@ -147,6 +147,25 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
     // L1 shared by a socket's cores would be a shared cache whose hits nobody
     // judges, the hole labeled lines exists to close.
     `STATIC_ASSERT(`VX_CFG_SOCKET_SIZE == 1, ("the data-plane checker needs private L1s (SOCKET_SIZE == 1)"))
+    // Header v2: until per-core tenant registers (T3) the requester's tenant
+    // is its core id, so every core must name a tenant.
+    `STATIC_ASSERT((`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS) <= `VX_CFG_CHECKER_TENANTS,
+                   ("header v2: the tenant is the core id until T3, so cores must not outnumber tenants"))
+`endif
+`ifdef VX_CFG_CHECKER_TAINT_ENABLE
+    // Taint needs a labeled shared level: the delivery edge returns the
+    // contributor masks and every labeled level judges writes for covering.
+    // With private caches only the port checker would do both, which is not
+    // built; there the taint would be silently inert. Elaboration-time, so
+    // synthesis refuses it too.
+`ifndef VX_CFG_CHECKER_ENABLE
+    if (1) begin : g_taint_needs_checker
+        $fatal(1, "VX_CFG_CHECKER_TAINT_ENABLE needs VX_CFG_CHECKER_ENABLE");
+    end
+`endif
+    if (!(`VX_CFG_L2_ENABLED || `VX_CFG_L3_ENABLED)) begin : g_taint_needs_labels
+        $fatal(1, "VX_CFG_CHECKER_TAINT_ENABLE needs a labeled shared level (L2 or L3): taint with private caches only is not built");
+    end
 `endif
 
     VX_cache_wrap #(

@@ -232,6 +232,8 @@ package VX_gpu_pkg;
     // behaves exactly as before.
     // Header v2 label: owners[TENANTS], perms[3], grantee, grant_perms[3],
     // confined, grant_epoch.
+    // With taint (T5) the same field carries the contributor mask above the
+    // delivery edge, in its low TENANTS bits; the label is always the wider.
 `ifdef VX_CFG_CHECKER_ENABLE
     localparam MEM_RSP_ATTR_WIDTH = `VX_CFG_CHECKER_TENANTS + 3 + MEM_OWNER_WIDTH + 3 + 1
                                   + `VX_CFG_CHECKER_EPOCH_WIDTH;
@@ -243,6 +245,9 @@ package VX_gpu_pkg;
     localparam LABEL_EPOCHS_W = `VX_CFG_CHECKER_TENANTS * `VX_CFG_CHECKER_EPOCH_WIDTH;
 
     typedef struct packed {
+`ifdef VX_CFG_CHECKER_TAINT_ENABLE
+        logic [`VX_CFG_CHECKER_TENANTS-1:0] taint;  // MEM_ATTR_TAINT_OFFS
+`endif
         logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS
 `ifdef VX_CFG_CHECKER_ENABLE
         logic                        is_fetch;      // MEM_ATTR_FETCH_OFFS = 4 + AMO_REQ_BITS
@@ -276,7 +281,15 @@ package VX_gpu_pkg;
     // MSHR parks it as one slice and a replay is judged as its request was.
 `ifdef VX_CFG_CHECKER_ENABLE
     localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_FETCH_OFFS;
+`ifdef VX_CFG_CHECKER_TAINT_ENABLE
+    // Confinement by taint: the core's taint, stamped at the socket boundary,
+    // rides above the owner, so the requester slice {taint, owner, is_fetch}
+    // stays contiguous and a replay is judged with the taint it left with.
+    localparam MEM_ATTR_TAINT_OFFS  = MEM_ATTR_OWNER_OFFS + MEM_OWNER_WIDTH;
+    localparam MEM_REQID_WIDTH      = `VX_CFG_CHECKER_TENANTS + MEM_OWNER_WIDTH + 1;
+`else
     localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH + 1;
+`endif
 `else
     localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_OWNER_OFFS;
     localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH;

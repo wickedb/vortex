@@ -219,12 +219,15 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // A replayed store stamps the writer tag from its own attr, so the MSHR
     // parks the requester with the request (PROJECT.md §2.3): its owner, and
     // with the checker whether it is a fetch (MEM_ATTR_REQID_OFFS).
+    // The slice is {taint (with taint), owner, is_fetch} with the checker,
+    // the owner alone without (VX_gpu_pkg MEM_ATTR_REQID_OFFS).
     wire [MEM_REQID_WIDTH-1:0]     replay_reqid;
-    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[MEM_REQID_WIDTH-1 -: MEM_OWNER_WIDTH];
 `ifdef VX_CFG_CHECKER_ENABLE
     wire                           replay_fetch = replay_reqid[0];
+    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[1 +: MEM_OWNER_WIDTH];
 `else
     wire                           replay_fetch = 1'b0;
+    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid;
 `endif
 
     // AMO engine interconnect (tied to 0 when the bank carries no AMO logic).
@@ -671,6 +674,13 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // so this adds one AND-OR after it. Writes are judged at every labeled
     // level; reads only at the edge (the shared level serving private L1s).
     // ========================================================================
+    //
+    // Confinement by taint (VX_CFG_CHECKER_TAINT_ENABLE): a write is allowed
+    // only into a granule whose owners cover the writer's taint (one AND per
+    // way, in parallel with today's term). At the edge, a delivered read
+    // answers with its contributor mask instead of the label: the socket ORs
+    // it into the core's taint. A denied read contributes nothing.
+    // ========================================================================
     wire label_deny_st0;
     wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] label_hit_st0;
     if (LABEL_ENABLE) begin : g_label_check
@@ -682,11 +692,28 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     `endif
         wire [NUM_WAYS-1:0] allow_w;
         wire [NUM_WAYS-1:0][CHK_LABEL_W-1:0] hit_label_w;
+        // T12: a stack line is judged by the slice rule, not by its label.
+        wire [63:0] line_byte_addr_st0 = 64'(`CS_BANK_TO_FULL_ADDR(st0.req.addr, BANK_ID));
+        wire stack_st0    = chk_in_stack(line_byte_addr_st0);
+        wire stack_ok_st0 = chk_stack_allow(line_byte_addr_st0, req_owner_st0, req_fetch_st0);
+    `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+        wire [CHK_TENANTS-1:0] req_taint_st0 = st0.req.attr[MEM_ATTR_TAINT_OFFS +: CHK_TENANTS];
+        wire [NUM_WAYS-1:0][CHK_TENANTS-1:0] hit_contrib_w;
+    `endif
         for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_way
             chk_label_t lbl;
             assign lbl = chk_label_t'(read_label_st0[i]);
             wire [CHK_EPOCH_W-1:0] owner_epoch = chk_owner_epoch(lbl.owners, label_epochs);
-            assign allow_w[i] = chk_authorize_label(lbl, req_owner_st0, st0.req.rw, req_fetch_st0, owner_epoch);
+        `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+            wire covers = ~st0.req.rw || chk_covers(lbl, req_taint_st0);
+            // Read-only: a write response carries no contributor.
+            assign hit_contrib_w[i] = (tag_matches_st0[i] && ~st0.req.rw && allow_w[i] && ~stack_st0)
+                                    ? chk_contrib(lbl, req_owner_st0) : '0;
+        `else
+            wire covers = 1'b1;
+        `endif
+            assign allow_w[i] = stack_st0 ? stack_ok_st0
+                              : (covers && chk_authorize_label(lbl, req_owner_st0, st0.req.rw, req_fetch_st0, owner_epoch));
             assign hit_label_w[i] = tag_matches_st0[i] ? read_label_st0[i] : '0;
         end
         wire judged = st0.req.rw || (LABEL_EDGE != 0);
@@ -699,7 +726,25 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                 hit_label_or |= hit_label_w[i];
             end
         end
+    `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+        if (LABEL_EDGE != 0) begin : g_edge_contrib
+            // Above the edge the response attr is the contributor mask.
+            reg [CHK_TENANTS-1:0] hit_contrib_or;
+            always @(*) begin
+                hit_contrib_or = '0;
+                for (int i = 0; i < NUM_WAYS; ++i) begin
+                    hit_contrib_or |= hit_contrib_w[i];
+                end
+            end
+            assign label_hit_st0 = `UP(MEM_RSP_ATTR_WIDTH)'(hit_contrib_or);
+            `UNUSED_VAR (hit_label_or)
+        end else begin : g_interior_label
+            assign label_hit_st0 = `UP(MEM_RSP_ATTR_WIDTH)'(hit_label_or);
+            `UNUSED_VAR (hit_contrib_w)
+        end
+    `else
         assign label_hit_st0 = `UP(MEM_RSP_ATTR_WIDTH)'(hit_label_or);
+    `endif
     end else begin : g_no_label_check
         `UNUSED_VAR ({read_label_st0, label_epochs})
         assign label_deny_st0 = 1'b0;
@@ -1232,14 +1277,26 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // Fill-forward is a delivery too: at the edge, judge the chained read
     // against the staged fill's label and the requester the MSHR parked.
     wire fwd_label_deny;
+    // What a forwarded read answers with on the attr: the staged label, or at
+    // the edge with taint, its contributor mask for the parked requester.
+    wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] fwd_rsp_attr;
     if (LABEL_ENABLE && LABEL_EDGE) begin : g_fwd_label
         chk_label_t fwd_lbl;
         assign fwd_lbl = chk_label_t'(fbuf_label_r[CHK_LABEL_W-1:0]);
         wire [CHK_EPOCH_W-1:0] fwd_epoch = chk_owner_epoch(fwd_lbl.owners, label_epochs);
-        assign fwd_label_deny = ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, replay_fetch, fwd_epoch);
+        wire [63:0] fwd_byte_addr = 64'(`CS_BANK_TO_FULL_ADDR(replay_addr, BANK_ID));
+        wire        fwd_stack     = chk_in_stack(fwd_byte_addr);
+        assign fwd_label_deny = fwd_stack ? ~chk_stack_allow(fwd_byte_addr, replay_owner, replay_fetch)
+                              : ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, replay_fetch, fwd_epoch);
+    `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+        assign fwd_rsp_attr = `UP(MEM_RSP_ATTR_WIDTH)'((fwd_label_deny || fwd_stack) ? '0 : chk_contrib(fwd_lbl, replay_owner));
+    `else
+        assign fwd_rsp_attr = fbuf_label_r;
+    `endif
     end else begin : g_no_fwd_label
         `UNUSED_VAR ({replay_owner, replay_fetch})
         assign fwd_label_deny = 1'b0;
+        assign fwd_rsp_attr   = fbuf_label_r;
     end
     wire [`CS_WORD_WIDTH-1:0] fwd_word_rsp = (fwd_label_deny && LABEL_ENFORCE != 0) ? poison_word : fwd_word;
 
@@ -1256,7 +1313,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .valid_in  (crsp_queue_valid || fwd_head),
         .ready_in  (crsp_queue_ready),
         .data_in   (crsp_queue_valid ? {stC.lk.label, stC.req.tag, crsp_queue_data, stC.req.req_idx}
-                                     : {fbuf_label_r, replay_tag, fwd_word_rsp, replay_idx}),
+                                     : {fwd_rsp_attr, replay_tag, fwd_word_rsp, replay_idx}),
         .data_out  ({core_rsp_attr, core_rsp_tag, core_rsp_data, core_rsp_idx}),
         .valid_out (core_rsp_valid),
         .ready_out (core_rsp_ready)

@@ -19,6 +19,7 @@
 #include "vl_simulator.h"
 #include "VVX_mem_checker_top.h"
 #include <VX_types.h>
+#include <VX_config.h>
 #include <cstdio>
 #include <cstdint>
 #include <vector>
@@ -457,6 +458,26 @@ int main(int argc, char** argv) {
     expect(!access(T, false, 2), "v2: grantee 2 reads T");
     expect(access(T, true, 2),   "v2: the grant is read-only");
     expect(access(T, false, 1),  "v2: tenant 1, not the grantee, DENIED");
+  }
+
+  // ---- T12: the stack slices, by address ----
+  // Hart h's stack is the 8 KB below VX_MEM_STACK_BASE_ADDR - h * 8 KB; core
+  // c owns harts [c * WARPS * THREADS, (c+1) * WARPS * THREADS). A claim on
+  // the region changes nothing: the slice rule decides by address.
+  {
+    const uint64_t top   = VX_MEM_STACK_BASE_ADDR;
+    const uint64_t slice = uint64_t(1) << VX_MEM_STACK_LOG2_SIZE;
+    const uint64_t harts_per_core = uint64_t(VX_CFG_NUM_WARPS) * VX_CFG_NUM_THREADS;
+    const uint64_t s0 = top - 1 * slice;                       // hart 0: core 0
+    const uint64_t s1 = top - (harts_per_core + 1) * slice;    // core 1's first hart
+    expect(!access(s0, false, 0) && !access(s0, true, 0), "t12: core 0 reads and writes its own slice");
+    expect(access(s0, false, 1), "t12: core 1 DENIED core 0's slice (read)");
+    expect(access(s0, true, 1),  "t12: core 1 DENIED core 0's slice (write)");
+    expect(!access(s1, true, 1), "t12: core 1 writes its own slice");
+    expect(access(s1, false, 1, /*fetch*/true), "t12: no fetch from a stack slice");
+    expect(access(s0, false, 2), "t12: a tenant with no core DENIED every slice");
+    const uint64_t below = top - (2 * harts_per_core + 1) * slice;   // outside the region
+    expect(!access(below, true, 1), "t12: below the region, the label decides (unclaimed)");
   }
 
   std::printf("\ncounters: reqs=%u checked=%u bypassed=%u allow=%u deny=%u\n",

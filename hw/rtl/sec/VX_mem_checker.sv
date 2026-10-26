@@ -56,7 +56,10 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     parameter LABEL_MODE   = 0,
     // Low tag bits that name an outstanding labeled fill (VX_gpu_pkg
     // LABEL_FILL_ID_W): the label table has 2^LABEL_IDX_W entries.
-    parameter LABEL_IDX_W  = TAG_WIDTH - UUID_WIDTH
+    parameter LABEL_IDX_W  = TAG_WIDTH - UUID_WIDTH,
+    // The requester is a command-processor queue, not a core (D7): it owns
+    // no stack slice, so every stack access is denied (T12).
+    parameter STACK_DENY_ALL = 0
 ) (
     input  wire clk,
     input  wire reset,
@@ -324,7 +327,10 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // ---------------------------------------------------------------------
     wire [CHK_EPOCH_W-1:0] owner_epoch = chk_owner_epoch(rd_header.owners, epochs_flat);
 
-    wire authorized = chk_authorize(rd_header, s1_owner, s1_rw, s1_fetch, owner_epoch);
+    // T12: a stack address is judged by the slice rule, not by its header.
+    wire s1_stack = chk_in_stack(64'(s1_addr));
+    wire authorized = s1_stack ? ((STACK_DENY_ALL == 0) && chk_stack_allow(64'(s1_addr), s1_owner, s1_fetch))
+                               : chk_authorize(rd_header, s1_owner, s1_rw, s1_fetch, owner_epoch);
     wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
 
     // Under enforcement a denied request is NOT forwarded to DRAM: a read is

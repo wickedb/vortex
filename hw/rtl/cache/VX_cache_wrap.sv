@@ -106,7 +106,12 @@ module VX_cache_wrap import VX_gpu_pkg::*; #(
             .MEM_ADDRW    (`CS_MEM_SECTOR_ADDR_WIDTH),
             .MEM_TAG_IN_WIDTH  (CACHE_MEM_TAG_WIDTH),
             .CORE_OUT_BUF      (CORE_OUT_BUF),
-            .MEM_OUT_BUF       (MEM_OUT_BUF)
+            .MEM_OUT_BUF       (MEM_OUT_BUF),
+        `ifdef VX_CFG_CHECKER_TAINT_ENABLE
+            .NC_RSP_ATTR_ZERO  (!PASSTHRU && LABEL_ENABLE && LABEL_EDGE)
+        `else
+            .NC_RSP_ATTR_ZERO  (0)
+        `endif
         ) cache_bypass (
             .clk            (clk),
             .reset          (reset),

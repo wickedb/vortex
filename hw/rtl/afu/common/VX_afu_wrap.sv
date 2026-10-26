@@ -917,7 +917,9 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             // The bridge has one read outstanding.
             .FAULT_DEPTH (2),
             .LABEL_MODE  (0),
-            .LABEL_IDX_W (1)
+            .LABEL_IDX_W (1),
+            // No queue reaches a core's stack slice (T12).
+            .STACK_DENY_ALL (1)
         ) cp_checker (
             .clk            (clk),
             .reset          (subsys_reset),

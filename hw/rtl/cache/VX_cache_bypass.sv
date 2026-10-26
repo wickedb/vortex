@@ -31,7 +31,12 @@ module VX_cache_bypass import VX_gpu_pkg::*; #(
     parameter MEM_TAG_IN_WIDTH  = 1,
 
     parameter CORE_OUT_BUF      = 0,
-    parameter MEM_OUT_BUF       = 0
+    parameter MEM_OUT_BUF       = 0,
+
+    // Confinement by taint: at the delivery edge, the response attr above
+    // the cache is a contributor mask, so a non-cacheable (IO) response must
+    // carry the empty mask rather than whatever label came from below.
+    parameter NC_RSP_ATTR_ZERO  = 0
  ) (
     input wire clk,
     input wire reset,
@@ -197,7 +202,7 @@ module VX_cache_bypass import VX_gpu_pkg::*; #(
         // so the label must survive it; for genuinely uncached (IO) traffic
         // it is ignored, since no labeled cache stores that response.
         assign core_bus_nc_arb_if[i].rsp_data = {
-            mem_bus_out_nc_if[i].rsp_data.attr,
+            (NC_RSP_ATTR_ZERO != 0) ? '0 : mem_bus_out_nc_if[i].rsp_data.attr,
             core_rsp_nc_arb_data_w,
             core_rsp_nc_arb_tag_w
         };

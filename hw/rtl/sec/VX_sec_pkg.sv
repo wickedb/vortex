@@ -229,6 +229,73 @@ package VX_sec_pkg;
     endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 
+    // ---------------------------------------------------------------------
+    // The stack slices (spec T12): a fixed hardware rule, no claims.
+    //
+    // Hart h's stack is the 2^VX_MEM_STACK_LOG2_SIZE bytes below
+    // VX_MEM_STACK_BASE_ADDR - h * that (sw/kernel/src/vx_start.S), so the
+    // owning core of a stack address is arithmetic. Inside the region only
+    // the slice's own core may read or write, never fetch; the covering
+    // check does not apply and nothing taints. It decides by address, in
+    // parallel with the label predicate, which it overrides there. Until
+    // per-core tenant registers (T3) the requester id is the core id.
+    // ---------------------------------------------------------------------
+    localparam int          CHK_STACK_LOG2  = `VX_MEM_STACK_LOG2_SIZE;
+    localparam int          CHK_STACK_HARTS = `VX_CFG_NUM_CLUSTERS * `VX_CFG_NUM_CORES
+                                            * `VX_CFG_NUM_WARPS * `VX_CFG_NUM_THREADS;
+    localparam logic [63:0] CHK_STACK_TOP   = 64'(`VX_MEM_STACK_BASE_ADDR);
+    localparam logic [63:0] CHK_STACK_BOT   = CHK_STACK_TOP - (64'(CHK_STACK_HARTS) << CHK_STACK_LOG2);
+    localparam int          CHK_HART_CORE_SHIFT = `CLOG2(`VX_CFG_NUM_WARPS) + `CLOG2(`VX_CFG_NUM_THREADS);
+
+    function automatic logic chk_in_stack(input logic [63:0] addr);
+        return (addr < CHK_STACK_TOP) && (addr >= CHK_STACK_BOT);
+    endfunction
+
+    /* verilator lint_off UNUSEDSIGNAL */
+    // The slice's core may read and write it; nobody fetches from it.
+    function automatic logic chk_stack_allow(
+        input logic [63:0]            addr,
+        input logic [CHK_OWNER_W-1:0] requester,
+        input logic                   is_fetch
+    );
+        logic [63:0] core;
+        core = ((CHK_STACK_TOP - 64'd1 - addr) >> CHK_STACK_LOG2) >> CHK_HART_CORE_SHIFT;
+        return !is_fetch && (core == 64'(requester));
+    endfunction
+    /* verilator lint_on UNUSEDSIGNAL */
+
+    // ---------------------------------------------------------------------
+    // Confinement by taint (kernel_identity_oct16.md "Updating the taint").
+    //
+    // chk_contrib: what an allowed read adds to the reader's taint. The other
+    // owners of a joint granule, or the owners behind a confined grant;
+    // nothing from unclaimed memory or a trusting grant. A denied read
+    // contributes nothing (the caller masks it).
+    //
+    // chk_covers: a write must land in a granule whose owners cover the
+    // writer's taint. Unclaimed memory covers only an empty taint.
+    // ---------------------------------------------------------------------
+    /* verilator lint_off UNUSEDSIGNAL */
+    function automatic logic [CHK_TENANTS-1:0] chk_contrib(
+        input chk_label_t             lbl,
+        input logic [CHK_OWNER_W-1:0] requester
+    );
+        logic [CHK_TENANTS-1:0] self;
+        self = CHK_TENANTS'(1) << requester;
+        if ((lbl.owners & self) != '0)
+            return lbl.owners & ~self;
+        else
+            return lbl.confined ? lbl.owners : '0;
+    endfunction
+
+    function automatic logic chk_covers(
+        input chk_label_t             lbl,
+        input logic [CHK_TENANTS-1:0] taint
+    );
+        return ((taint & ~lbl.owners) == '0);
+    endfunction
+    /* verilator lint_on UNUSEDSIGNAL */
+
     /* verilator lint_off UNUSEDSIGNAL */
     // `valid` and `tag` are resolved by the store before it hands a header
     // here — by this point the header is either the installed one or the boot
