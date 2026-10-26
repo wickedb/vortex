@@ -411,8 +411,15 @@ module VX_cp_core
       for (int q = 0; q < NUM_QUEUES; ++q)
         for (int i = 0; i < NUM_SHADOW; ++i)
           shadow_r[q][i] <= shadow_reset(i);
-    end else if (px_shadow_wr) begin
-      shadow_r[granted_dcr_q][px_shadow_idx] <= px_shadow_wr_data;
+    end else begin
+      if (px_shadow_wr)
+        shadow_r[granted_dcr_q][px_shadow_idx] <= px_shadow_wr_data;
+      // A clean-boundary request (T8) is one-shot: it applies to the
+      // queue's next launch only, so the shadow drops it once that launch
+      // starts. A queue's own commands are sequential, so its launch and a
+      // write of its own shadow never meet in one cycle.
+      if (gpu_if_int.start)
+        shadow_r[ln_q][SHADOW_CLEAN_IDX] <= '0;
     end
   end
 

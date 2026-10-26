@@ -855,6 +855,8 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_CHECKER_ENABLE
         // The tenant the kernel runs as: the CP queue that launched it (T3).
         logic [MEM_OWNER_WIDTH-1:0]        tenant;
+        // A clean boundary was requested for this launch (T8, option 3).
+        logic                              clean;
 `endif
         logic [`VX_CFG_LMEM_LOG_SIZE:0]    aligned_lmem_size;
         kmu_args_t                         args;   // .compute | .fragment

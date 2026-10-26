@@ -118,6 +118,11 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     // own writes to them are captured into its shadow), so a tenant cannot
     // choose the value.
     reg [MEM_OWNER_WIDTH-1:0] kmu_issuer_r, launch_tenant_r;
+    // The clean-boundary request (T8): replayed with the launch registers,
+    // snapshotted at start like the tenant.
+    reg kmu_clean_r, launch_clean_r;
+    wire clean_wr = dcr_req_valid && dcr_req_rw
+                 && (dcr_req_addr == VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_CLEAN));
     wire kmu_reg_wr = dcr_req_valid && dcr_req_rw
                    && (dcr_req_addr >= VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_BEGIN))
                    && (dcr_req_addr <  VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_END));
@@ -125,11 +130,17 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
         if (reset) begin
             kmu_issuer_r    <= '0;
             launch_tenant_r <= '0;
+            kmu_clean_r     <= 1'b0;
+            launch_clean_r  <= 1'b0;
         end else begin
             if (kmu_reg_wr)
                 kmu_issuer_r <= MEM_OWNER_WIDTH'(dcr_req_issuer);
-            if (start)
+            if (clean_wr)
+                kmu_clean_r <= dcr_req_data[0];
+            if (start) begin
                 launch_tenant_r <= kmu_reg_wr ? MEM_OWNER_WIDTH'(dcr_req_issuer) : kmu_issuer_r;
+                launch_clean_r  <= clean_wr ? dcr_req_data[0] : kmu_clean_r;
+            end
         end
     end
 `endif
@@ -386,6 +397,7 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     assign kmu_req.ctx_id    = ctx_id_r;
 `ifdef VX_CFG_CHECKER_ENABLE
     assign kmu_req.tenant    = launch_tenant_r;
+    assign kmu_req.clean     = launch_clean_r;
 `endif
     assign kmu_req.aligned_lmem_size = aligned_lmem_size_r;
     assign kmu_req.args.compute = kmu_comp;

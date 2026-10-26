@@ -592,9 +592,35 @@ int main(int argc, char** argv) {
         EXPECT(seen[0] == 1 && seen[1] == 1, "D: device beats not stamped with their queue");
     }
 
+    // ----- E. a clean-boundary request is one-shot (T8) -----
+    // Queue 1 asks for a clean boundary, then launches twice: the first
+    // launch replays CLEAN = 1, the second CLEAN = 0.
+    {
+        constexpr uint32_t CLEAN = 0x024;   // VX_DCR_KMU_CLEAN
+        auto replayed_clean = [&]() -> int {
+            int v = -1;
+            for (auto& r : gpu.log) {
+                if (r.addr == 0xFFF) break;
+                if (r.rw && r.addr == CLEAN) v = int(r.data);
+            }
+            return v;
+        };
+        gpu.log.clear();
+        put_cl(1, {{OP_WR, CLEAN, 1}, {OP_LAUNCH, 0, 0}});
+        doorbell(1);
+        wait_seq(1, 9);
+        EXPECT(replayed_clean() == 1, "E: the requested launch did not replay CLEAN = 1");
+        gpu.log.clear();
+        put_cl(1, {{OP_LAUNCH, 0, 0}});
+        doorbell(1);
+        wait_seq(1, 10);
+        EXPECT(replayed_clean() == 0, "E: the clean request outlived its launch");
+    }
+
     std::printf("PASSED — CP end-to-end: NOP retired, seqnum written to "
                 "cmpl_addr, Q_CONTROL.reset clears the queue; two queues: "
                 "issuer tagging, no lost commands, per-queue launch registers, "
-                "checker-window reads refused, device beats stamped with their queue\n");
+                "checker-window reads refused, device beats stamped with their queue, "
+                "clean boundary one-shot\n");
     return 0;
 }

@@ -818,10 +818,11 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     //   counted when it was filled.
     //
     // Both are loaded when the core starts a different kernel (a new ctx_id
-    // on the dispatch link): the tenant from the beat, the taint cleared.
-    // Same-tenant inheritance with the clean-boundary request, and the scrub
-    // that makes the clear sound (T8), are step 5; until then this matches the
-    // SimX proof of concept, which clears at every launch.
+    // on the dispatch link). The tenant comes from the beat. The taint is
+    // INHERITED by the next kernel unless it is a scrub boundary: a tenant
+    // change, or a clean boundary its tenant requested (T8, option 3). Only
+    // there does the core start with an empty taint, after the scrub has
+    // cleared what the previous kernels left on it.
     ///////////////////////////////////////////////////////////////////////////
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
     `define VX_SOCKET_STAMP
@@ -864,7 +865,17 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             tenant_r <= stamp_kmu_req.tenant;
         end
     end
+    wire tenant_change = (stamp_kmu_req.tenant != tenant_r);
+`else
+    // Test mode: the tenant is the core, which never changes.
+    wire tenant_change = 1'b0;
 `endif
+    // A scrub boundary (T8): the core is handed to another tenant, or its
+    // tenant asked for a clean boundary. The first kernel is one too: the
+    // core's state then is whatever reset left.
+    wire scrub_boundary = kernel_change
+                       && (!stamp_ctx_valid_r || tenant_change || stamp_kmu_req.clean);
+    `UNUSED_VAR (scrub_boundary)
 
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
     // Every response entering the L1s, from every port: its contributor mask.
@@ -884,9 +895,10 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     always @(posedge clk) begin
         if (reset) begin
             taint_r <= '0;
-        end else if (kernel_change) begin
-            // A new kernel starts empty. Responses still arriving now belong
-            // to the previous kernel, which has drained: one kernel at a time.
+        end else if (scrub_boundary) begin
+            // A scrubbed core starts empty. Responses still arriving now
+            // belong to the previous kernel, which has drained: one kernel at
+            // a time.
             taint_r <= '0;
         end else begin
             taint_r <= taint_r | taint_raise;

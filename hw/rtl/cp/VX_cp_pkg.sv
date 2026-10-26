@@ -219,6 +219,8 @@ package VX_cp_pkg;
   localparam int NUM_SHADOW   = SHADOW_KMU_N;
 `endif
   localparam int SHADOW_IDX_W = $clog2(NUM_SHADOW);
+  // The clean-boundary slot (T8), cleared by the CP when its launch starts.
+  localparam int SHADOW_CLEAN_IDX = int'(`VX_DCR_KMU_CLEAN) - int'(`VX_DCR_KMU_STATE_BEGIN);
 
   function automatic logic is_shadow_addr(input logic [`VX_DCR_ADDR_BITS-1:0] addr);
     if (addr >= `VX_DCR_ADDR_BITS'(`VX_DCR_KMU_STATE_BEGIN)
