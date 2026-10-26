@@ -63,6 +63,12 @@ public:
 
   int dcr_read(uint32_t addr, uint32_t tag, uint32_t* value);
 
+  // The checker on the command processor's device path (D7): judges one
+  // device line a CP command moves for queue `issuer`. Proceeds when no
+  // checker is built. See MemChecker::cp_authorize.
+  bool cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                    uint32_t* taint, bool to_host);
+
   PerfStats perf_stats() const;
 
   Kmu& kmu()       { return *kmu_; }

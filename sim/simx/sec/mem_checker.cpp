@@ -410,6 +410,16 @@ public:
          << ", foreign=" << perf_stats_.claims_foreign
          << std::endl;
     }
+    if (perf_stats_.cp_lines != 0) {
+      os << "CHECKER: cp: lines=" << perf_stats_.cp_lines
+         << ", cp_bypassed=" << perf_stats_.cp_bypassed
+         << ", cp_allow=" << perf_stats_.cp_allows
+         << ", cp_deny=" << perf_stats_.cp_denies
+         << ", cp_faulted_reads=" << perf_stats_.cp_faulted_reads
+         << ", cp_dropped_writes=" << perf_stats_.cp_dropped_writes
+         << ", cp_taint_denies=" << perf_stats_.cp_taint_denies
+         << std::endl;
+    }
     if (fault_.valid) {
       os << "CHECKER: first_fault: addr=0x" << std::hex << fault_.addr << std::dec
          << ", hart_id=" << fault_.hart_id
@@ -523,6 +533,65 @@ public:
       ++perf_stats_.taint_raises;
     }
     return true;
+  }
+
+  // D7: one device line the command processor moves for queue `issuer`.
+  // Runs on the CP's thread while a kernel may be running on another, so it
+  // reads policy (headers, epochs) and writes only its own cp_* counters.
+  bool cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                    uint32_t* taint, bool to_host) {
+    ++perf_stats_.cp_lines;
+    if (get_addr_type(addr) != AddrType::Global) {
+      ++perf_stats_.cp_bypassed;
+      return true;
+    }
+    const MemLabel label = label_of(this->header_for(addr >> config_.buffer_log2));
+    const uint32_t need = is_write ? PERM_W : PERM_R;
+    // The owner set: the owner, plus the joint co-owners under confinement
+    // (without it joint co-owners are not owners, as in authorize()).
+    const bool     unclaimed = (label.owner == OWNER_ANY);
+    const uint32_t owners    = unclaimed ? 0u
+        : (eid_bit(label.owner) | (config_.taint ? label.joint : 0u));
+    const bool     names_core = issuer < uint32_t(VX_CFG_NUM_CORES * VX_CFG_NUM_CLUSTERS);
+    const uint32_t me        = names_core ? eid_bit(issuer) : 0u;
+    const bool     is_owner  = unclaimed
+        || (names_core && (config_.taint ? (owners & me) != 0 : label.owner == issuer));
+    bool ok;
+    uint32_t contrib = 0;
+    if (is_owner) {
+      ok = (label.perms & need) != 0;
+      contrib = owners & ~me;
+    } else {
+      ok = ((label.shared_perms & need) != 0)
+        && (this->epoch_for(label.owner) <= label.grant_epoch);
+      contrib = label.confined ? owners : 0u;
+    }
+    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
+      ok = false;
+    if (ok && config_.taint && taint) {
+      if (is_write) {
+        if ((*taint & ~owners) != 0) {
+          ok = false;
+          ++perf_stats_.cp_taint_denies;
+        }
+      } else {
+        *taint |= contrib;
+        if (to_host && *taint != 0) {
+          ok = false;
+          ++perf_stats_.cp_taint_denies;
+        }
+      }
+    }
+    if (ok) {
+      ++perf_stats_.cp_allows;
+      return true;
+    }
+    ++perf_stats_.cp_denies;
+    if (!config_.enforce)
+      return true;
+    if (is_write) ++perf_stats_.cp_dropped_writes;
+    else          ++perf_stats_.cp_faulted_reads;
+    return false;
   }
 
   bool enforcing() const { return config_.enforce; }
@@ -796,6 +865,11 @@ void MemChecker::set_epoch(uint32_t owner_eid, uint64_t epoch) {
 
 int MemChecker::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
   return impl_->dcr_write(addr, value, issuer);
+}
+
+bool MemChecker::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                              uint32_t* taint, bool to_host) {
+  return impl_->cp_authorize(addr, is_write, issuer, taint, to_host);
 }
 
 const MemChecker::PerfStats& MemChecker::perf_stats() const {

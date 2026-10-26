@@ -414,11 +414,84 @@ void CommandProcessor::publish_completion(const QState& q) {
     hooks_.dram_write(q.regs.cmpl_addr, &seq, sizeof(seq));
 }
 
+// ----- The checker on the CP's device path (D7) -----
+//
+// Every device line a command moves is judged for the queue that issued the
+// command, which is the tenant: the same identity the setup path uses. The
+// RTL judges the same beats with a dedicated VX_mem_checker between the CP's
+// device bridge and the memory fabric (VX_afu_wrap.sv). Ring fetches and
+// completion writes are host memory and are not judged here or there.
+static constexpr uint64_t DEV_LINE = 64;
+static constexpr uint8_t  DEV_POISON = 0xDD;   // VX_checker_fault / MemChecker
+
+void CommandProcessor::dev_read_(uint32_t qi, uint64_t addr, void* dst, std::size_t bytes) {
+    if (!hooks_.dram_read) return;
+    hooks_.dram_read(addr, dst, bytes);
+    if (!hooks_.dev_authorize) return;
+    auto* out = static_cast<uint8_t*>(dst);
+    for (uint64_t off = 0; off < bytes; ) {
+        uint64_t n = DEV_LINE - ((addr + off) % DEV_LINE);
+        if (n > bytes - off) n = bytes - off;
+        if (!hooks_.dev_authorize(addr + off, false, qi, nullptr, false))
+            std::memset(out + off, DEV_POISON, std::size_t(n));
+        off += n;
+    }
+}
+
+void CommandProcessor::dev_write_(uint32_t qi, uint64_t addr, const void* src, std::size_t bytes) {
+    if (!hooks_.dram_write) return;
+    if (!hooks_.dev_authorize) {
+        hooks_.dram_write(addr, src, bytes);
+        return;
+    }
+    auto* in = static_cast<const uint8_t*>(src);
+    for (uint64_t off = 0; off < bytes; ) {
+        uint64_t n = DEV_LINE - ((addr + off) % DEV_LINE);
+        if (n > bytes - off) n = bytes - off;
+        if (hooks_.dev_authorize(addr + off, true, qi, nullptr, false))
+            hooks_.dram_write(addr + off, in + off, std::size_t(n));
+        off += n;
+    }
+}
+
+// A transfer moves in pieces that straddle no line of either device operand,
+// so each piece is one read line and one write line. A copy's write is judged
+// with the taint its own read line brought along; a download's read is judged
+// as leaving for the host.
+void CommandProcessor::dev_transfer_(uint32_t qi, uint64_t dst, bool dst_dev,
+                                     uint64_t src, bool src_dev, uint64_t total) {
+    constexpr uint64_t CHUNK = 64 * 1024;
+    std::vector<uint8_t> buf(std::size_t(total < CHUNK ? total : CHUNK));
+    for (uint64_t done = 0; done < total; ) {
+        uint64_t n = total - done;
+        if (n > CHUNK) n = CHUNK;
+        hooks_.dram_read(src + done, buf.data(), n);
+        if (!hooks_.dev_authorize) {
+            hooks_.dram_write(dst + done, buf.data(), n);
+            done += n;
+            continue;
+        }
+        for (uint64_t off = 0; off < n; ) {
+            const uint64_t s = src + done + off, d = dst + done + off;
+            uint64_t p = n - off;
+            if (src_dev && DEV_LINE - (s % DEV_LINE) < p) p = DEV_LINE - (s % DEV_LINE);
+            if (dst_dev && DEV_LINE - (d % DEV_LINE) < p) p = DEV_LINE - (d % DEV_LINE);
+            uint32_t taint = 0;
+            if (src_dev && !hooks_.dev_authorize(s, false, qi, &taint, !dst_dev))
+                std::memset(buf.data() + off, DEV_POISON, std::size_t(p));
+            if (!dst_dev || hooks_.dev_authorize(d, true, qi, &taint, false))
+                hooks_.dram_write(d, buf.data() + off, std::size_t(p));
+            off += p;
+        }
+        done += n;
+    }
+}
+
 // wait_op_e encoded in arg2[1:0].
-bool CommandProcessor::event_wait_satisfied_(const Cmd& c) {
+bool CommandProcessor::event_wait_satisfied_(uint32_t qi, const Cmd& c) {
     if (!hooks_.dram_read) return true;   // no DRAM hook -> retire as NOP
     uint64_t cur = 0;
-    hooks_.dram_read(c.arg0, &cur, sizeof(cur));
+    dev_read_(qi, c.arg0, &cur, sizeof(cur));
     const uint64_t target = c.arg1;
     const uint32_t op = uint32_t(c.arg2) & 0x3;
     switch (op) {
@@ -439,13 +512,13 @@ void CommandProcessor::apply_qmd_(uint32_t qi, uint64_t qmd_addr) {
     if (!hooks_.dram_read) return;
     uint64_t addr = cp_translate(qmd_addr, /*physical=*/false);
     uint32_t count = 0;
-    hooks_.dram_read(addr, &count, sizeof(count));
+    dev_read_(qi, addr, &count, sizeof(count));
     addr += sizeof(count);
     constexpr uint32_t MAX_QMD_DCRS = 64;   // backstop against a corrupt count
     if (count > MAX_QMD_DCRS) count = MAX_QMD_DCRS;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t pair[2] = {0, 0};          // {dcr_addr, value}
-        hooks_.dram_read(addr, pair, sizeof(pair));
+        dev_read_(qi, addr, pair, sizeof(pair));
         addr += sizeof(pair);
         // VX_DCR_ADDR_BITS=12. Filtered: the blob is in tenant-writable memory.
         dcr_write_(qi, pair[0] & 0xFFF, pair[1], /*indirect=*/true);
@@ -490,7 +563,7 @@ void CommandProcessor::draw_load_step_(QState& q) {
     uint8_t buf[DRAW_STEP_BYTES] = {0};
     const uint64_t at = q.draw_phys + 4
                       + uint64_t(q.draw_step) * DRAW_STEP_BYTES;
-    hooks_.dram_read(at, buf, DRAW_STEP_BYTES);
+    dev_read_(uint32_t(&q - qs_.data()), at, buf, DRAW_STEP_BYTES);
     decode_cmd_bytes(buf, DRAW_STEP_BYTES, 0, q.draw_cmd);
 }
 
@@ -583,9 +656,8 @@ void CommandProcessor::tick_engine(uint32_t qi) {
                 // bundle (DrawStep), retiring the one OP_DRAW when drained.
                 q.draw_phys = cp_translate(c.arg0, /*physical=*/false);
                 q.draw_num_steps = 0;
-                if (hooks_.dram_read)
-                    hooks_.dram_read(q.draw_phys, &q.draw_num_steps,
-                                     sizeof(q.draw_num_steps));
+                dev_read_(qi, q.draw_phys, &q.draw_num_steps,
+                          sizeof(q.draw_num_steps));
                 if (q.draw_num_steps > MAX_DRAW_STEPS)
                     q.draw_num_steps = MAX_DRAW_STEPS;
                 q.draw_step = 0;
@@ -616,15 +688,13 @@ void CommandProcessor::tick_engine(uint32_t qi) {
             } else if (c.opcode == OP_EVENT_SIG) {
                 // CMD_EVENT_SIGNAL: write arg1 (8-byte value) to arg0
                 // (device counter slot).
-                if (hooks_.dram_write) {
-                    uint64_t v = c.arg1;
-                    hooks_.dram_write(c.arg0, &v, sizeof(v));
-                }
+                uint64_t v = c.arg1;
+                dev_write_(qi, c.arg0, &v, sizeof(v));
                 q.eng_state = EngState::Retire;
             } else if (c.opcode == OP_EVENT_WAIT) {
                 // CMD_EVENT_WAIT: poll arg0 until it satisfies the wait_op
                 // (arg2[1:0]) comparison against arg1; retry each tick.
-                if (event_wait_satisfied_(c)) {
+                if (event_wait_satisfied_(qi, c)) {
                     q.eng_state = EngState::Retire;
                 } else {
                     // Spin in Bid (no state change); re-checked each tick.
@@ -654,17 +724,8 @@ void CommandProcessor::tick_engine(uint32_t qi) {
                         dst = cp_translate(dst, physical);
                         src = cp_translate(src, physical);
                     }
-                    const uint64_t total = c.arg2;
-                    constexpr uint64_t CHUNK = 64 * 1024;
-                    std::vector<uint8_t> buf(
-                        std::size_t(total < CHUNK ? total : CHUNK));
-                    for (uint64_t done = 0; done < total; ) {
-                        uint64_t n = total - done;
-                        if (n > CHUNK) n = CHUNK;
-                        hooks_.dram_read (src + done, buf.data(), n);
-                        hooks_.dram_write(dst + done, buf.data(), n);
-                        done += n;
-                    }
+                    dev_transfer_(qi, dst, c.opcode != OP_MEM_READ,
+                                  src, c.opcode != OP_MEM_WRITE, c.arg2);
                 }
                 q.eng_state = EngState::Retire;
             } else {

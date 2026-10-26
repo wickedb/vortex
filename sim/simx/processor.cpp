@@ -448,6 +448,13 @@ bool ProcessorImpl::cycle() {
   return this->any_running();
 }
 
+bool ProcessorImpl::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                                 uint32_t* taint, bool to_host) {
+  if (!mem_checker_)
+    return true;
+  return mem_checker_->cp_authorize(addr, is_write, issuer, taint, to_host);
+}
+
 int ProcessorImpl::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
   // KMU DCRs route to the KMU and are not broadcast to cores.
   bool is_kmu_dcr = (addr >= VX_DCR_KMU_STATE_BEGIN && addr < VX_DCR_KMU_STATE_END);
@@ -617,4 +624,9 @@ int Processor::dcr_write(uint32_t addr, uint32_t value, uint32_t issuer) {
 
 int Processor::dcr_read(uint32_t addr, uint32_t tag, uint32_t* value) {
   return impl_->dcr_read(addr, tag, value);
+}
+
+bool Processor::cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                             uint32_t* taint, bool to_host) {
+  return impl_->cp_authorize(addr, is_write, issuer, taint, to_host);
 }

@@ -162,6 +162,15 @@ private:
     h.vortex_dcr_write = [this](uint32_t addr, uint32_t value, uint32_t issuer) {
       processor_.dcr_write(addr, value, issuer);
     };
+    // D7: the checker on the CP's device path. Host regions are the host
+    // side of a transfer (the RTL CP reaches them on its host port), so only
+    // device lines are judged.
+    h.dev_authorize = [this](uint64_t addr, bool is_write, uint32_t issuer,
+                             uint32_t* taint, bool to_host) -> bool {
+      if (host_region_ptr(addr))
+        return true;
+      return processor_.cp_authorize(addr, is_write, issuer, taint, to_host);
+    };
     h.vortex_dcr_read = [this](uint32_t addr, uint32_t tag) -> uint32_t {
       // Wait for any background processor_.run() to finish before reading DCR.
       if (future_.valid()) future_.wait();

@@ -200,6 +200,16 @@ public:
     uint64_t taint_denies = 0;
     uint64_t leaves = 0;
     uint64_t leaves_refused = 0;
+    // The command processor's device path (D7): lines its DMA and event
+    // commands moved, judged for the queue that issued them. Kept apart from
+    // the port counters above, which the kernel's thread owns.
+    uint64_t cp_lines = 0;
+    uint64_t cp_bypassed = 0;
+    uint64_t cp_allows = 0;
+    uint64_t cp_denies = 0;
+    uint64_t cp_faulted_reads = 0;
+    uint64_t cp_dropped_writes = 0;
+    uint64_t cp_taint_denies = 0;
   };
 
   // First denied access, latched for status readback (the sim-level stand-in
@@ -247,6 +257,19 @@ public:
   // that would not strictly increase the owner's epoch are ignored, so
   // revocation cannot be undone by replaying an earlier (or equal) value.
   void set_epoch(uint32_t owner_eid, uint64_t epoch);
+
+  // The command processor's device path (D7). Judges one device line a CP
+  // command moves (upload, download, copy, event) for `issuer`, the queue
+  // (= tenant) whose command it is, with the predicate the ports use. A queue
+  // whose index names no core owns nothing: it gets OWNER_ANY's perms or the
+  // grant. With confinement on, `taint` carries what the line read brings
+  // along (a copy's write must be covered by it), and a line leaving for the
+  // host (`to_host`) is refused if it would carry any: data confined to its
+  // owners never leaves the device through the CP. Returns whether the
+  // access proceeds: a deny under enforcement stops it (the caller poisons a
+  // read and drops a write); without enforcement it is only counted.
+  bool cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
+                    uint32_t* taint, bool to_host);
 
   const PerfStats& perf_stats() const;
   const FaultStatus& fault_status() const;

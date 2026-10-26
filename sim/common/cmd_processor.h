@@ -110,6 +110,15 @@ public:
         // available before returning.
         std::function<uint32_t(uint32_t addr, uint32_t tag)> vortex_dcr_read;
 
+        // The checker on the CP's device path (D7). Judges one device line
+        // (64 B, never straddled) that queue `issuer`'s command reads or
+        // writes; false stops it: a read line becomes poison, a write line is
+        // dropped. `taint` carries what a read brings along into a copy's
+        // write; `to_host` marks a read whose data leaves for the host. Unset
+        // (rtlsim, which has no C++ checker) means every access proceeds.
+        std::function<bool(uint64_t addr, bool is_write, uint32_t issuer,
+                           uint32_t* taint, bool to_host)> dev_authorize;
+
         // Pulse Vortex's start signal (for CMD_LAUNCH). The launch FSM
         // calls this once when transitioning into the "started" state.
         std::function<void()> vortex_start;
@@ -340,7 +349,15 @@ private:
     void publish_completion(const QState& q);
     // CMD_EVENT_WAIT compare helper — reads cmd.arg0 from DRAM and compares to
     // cmd.arg1 under the wait_op encoded in arg2[1:0].
-    bool event_wait_satisfied_(const Cmd& c);
+    bool event_wait_satisfied_(uint32_t qi, const Cmd& c);
+    // Device memory as queue `qi`'s command sees it (D7): every line judged
+    // by hooks_.dev_authorize. A denied read line reads as poison, a denied
+    // write line does not land.
+    void dev_read_(uint32_t qi, uint64_t addr, void* dst, std::size_t bytes);
+    void dev_write_(uint32_t qi, uint64_t addr, const void* src, std::size_t bytes);
+    // CMD_MEM_*: one transfer, judged line by line on each device operand.
+    void dev_transfer_(uint32_t qi, uint64_t dst, bool dst_dev,
+                       uint64_t src, bool src_dev, uint64_t total);
     // CMD_LAUNCH_QMD: read the in-memory KMU descriptor at `qmd_addr` and
     // apply its {dcr_addr,value} pairs as indirect writes of queue `qi`.
     void apply_qmd_(uint32_t qi, uint64_t qmd_addr);
