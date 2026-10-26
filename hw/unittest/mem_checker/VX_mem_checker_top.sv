@@ -30,7 +30,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      req_rw,
     input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] req_addr,
     input  wire [CHK_OWNER_W-1:0]    req_owner,
-    input  wire                      req_owner_valid,
+    input  wire                      req_fetch,
     output wire                      req_ready,
 
     // request out + verdict
@@ -76,7 +76,9 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0] cnt_rejected,
     output wire [31:0] cnt_aliased,
     output wire [31:0] cnt_reclaimed,
-    output wire [31:0] cnt_foreign
+    output wire [31:0] cnt_foreign,
+    output wire [31:0] cnt_leaves,
+    output wire [31:0] cnt_leaves_refused
 );
     VX_dcr_bus_if dcr_in_if();
     VX_dcr_bus_if dcr_out_if();
@@ -112,7 +114,7 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .req_rw              (req_rw),
         .req_addr            (req_addr),
         .req_owner           (req_owner),
-        .req_owner_valid     (req_owner_valid),
+        .req_fetch           (req_fetch),
         .req_ready           (req_ready),
         .out_valid           (out_valid),
         .out_rw              (out_rw),
@@ -150,7 +152,9 @@ module VX_mem_checker_top import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .cnt_rejected        (cnt_rejected),
         .cnt_aliased         (cnt_aliased),
         .cnt_reclaimed       (cnt_reclaimed),
-        .cnt_foreign         (cnt_foreign)
+        .cnt_foreign         (cnt_foreign),
+        .cnt_leaves          (cnt_leaves),
+        .cnt_leaves_refused  (cnt_leaves_refused)
     );
 
 endmodule

@@ -71,10 +71,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      req_valid,
     input  wire                      req_rw,
     input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] req_addr,
-    input  wire [CHK_OWNER_W-1:0]    req_owner,   // R2 moves this onto the bus
-    // Low when the requester is no owner (a CP queue that names no core, D7):
-    // req_owner is then ignored and only OWNER_ANY perms or a grant apply.
-    input  wire                      req_owner_valid,
+    input  wire [CHK_OWNER_W-1:0]    req_owner,   // the requesting tenant
+    // An instruction fetch: judged against X rather than R (header v2, T9).
+    input  wire                      req_fetch,
     // Payload the checker does not inspect but MUST carry: it pipelines the
     // request through S1, so emitting these straight from the bus input would
     // pair one request's address with the next request's data. That corrupts
@@ -136,7 +135,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0] cnt_rejected,
     output wire [31:0] cnt_aliased,
     output wire [31:0] cnt_reclaimed,
-    output wire [31:0] cnt_foreign
+    output wire [31:0] cnt_foreign,
+    output wire [31:0] cnt_leaves,
+    output wire [31:0] cnt_leaves_refused
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -155,6 +156,13 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     chk_header_t             probe_header, wr_header;
     wire                     probe_claimed, probe_occupied;
     wire [CHK_EPOCH_W-1:0]   epoch_table [NUM_OWNERS];
+    // One entry per tenant, flattened: what the predicate's one-hot epoch
+    // select and every labeled cache read.
+    wire [CHK_TENANTS*CHK_EPOCH_W-1:0] epochs_flat;
+    for (genvar t = 0; t < CHK_TENANTS; ++t) begin : g_epochs_flat
+        assign epochs_flat[t * CHK_EPOCH_W +: CHK_EPOCH_W] = epoch_table[t];
+    end
+    `STATIC_ASSERT(LABEL_EPOCHS_W == CHK_TENANTS * CHK_EPOCH_W, ("epoch bus width"))
 
     VX_checker_dcr #(
         .INSTANCE_ID ($sformatf("%s-dcr", INSTANCE_ID))
@@ -181,7 +189,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .cnt_rejected        (cnt_rejected),
         .cnt_aliased         (cnt_aliased),
         .cnt_reclaimed       (cnt_reclaimed),
-        .cnt_foreign         (cnt_foreign)
+        .cnt_foreign         (cnt_foreign),
+        .cnt_leaves          (cnt_leaves),
+        .cnt_leaves_refused  (cnt_leaves_refused)
     );
 
     // ---------------------------------------------------------------------
@@ -233,7 +243,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg                      s1_valid, s1_rw, s1_bypass;
     reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] s1_addr;
     reg [CHK_OWNER_W-1:0]    s1_owner;
-    reg                      s1_owner_valid;
+    reg                      s1_fetch;
     reg [TAG_WIDTH-1:0]      s1_tag;
     reg [DATA_SIZE*8-1:0]    s1_data;
     reg [DATA_SIZE-1:0]      s1_byteen;
@@ -298,7 +308,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             s1_rw     <= req_rw;
             s1_addr   <= req_addr;
             s1_owner  <= req_owner;
-            s1_owner_valid <= req_owner_valid;
+            s1_fetch  <= req_fetch;
             s1_bypass <= req_is_io;
             s1_tag    <= req_tag;
             s1_data   <= req_data;
@@ -312,10 +322,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // The decision (S1). One predicate, shared with the testbench through the
     // package so the two cannot drift.
     // ---------------------------------------------------------------------
-    wire [CHK_EPOCH_W-1:0] owner_epoch = epoch_table[rd_header.owner];
+    wire [CHK_EPOCH_W-1:0] owner_epoch = chk_owner_epoch(rd_header.owners, epochs_flat);
 
-    wire authorized = s1_owner_valid ? chk_authorize(rd_header, s1_owner, s1_rw, owner_epoch)
-                                     : chk_authorize_anon(rd_header, s1_rw, owner_epoch);
+    wire authorized = chk_authorize(rd_header, s1_owner, s1_rw, s1_fetch, owner_epoch);
     wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
 
     // Under enforcement a denied request is NOT forwarded to DRAM: a read is
@@ -387,12 +396,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         assign rsp_label = '0;
     end
 
-    for (genvar o = 0; o < NUM_OWNERS; ++o) begin : g_epochs_out
-        assign epochs_out[o * CHK_EPOCH_W +: CHK_EPOCH_W] = epoch_table[o];
-    end
-    if (LABEL_EPOCHS_W > NUM_OWNERS * CHK_EPOCH_W) begin : g_epochs_pad
-        assign epochs_out[LABEL_EPOCHS_W-1:NUM_OWNERS * CHK_EPOCH_W] = '0;
-    end
+    assign epochs_out = epochs_flat;
 
     VX_checker_fault #(
         .DATA_SIZE (DATA_SIZE),
@@ -479,8 +483,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                       INSTANCE_ID, cnt_faulted_reads, cnt_dropped_writes);
             $fdisplay(32'h8000_0002, "CHECKER[%s]: setup: dcr_claims=%0d, headers_written=%0d, epoch_bumps=%0d",
                       INSTANCE_ID, cnt_claims, cnt_headers_written, cnt_epoch_bumps);
-            $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d, foreign=%0d",
-                      INSTANCE_ID, cnt_rejected, cnt_aliased, cnt_reclaimed, cnt_foreign);
+            $fdisplay(32'h8000_0002, "CHECKER[%s]: claims: rejected=%0d, aliased=%0d, reclaimed=%0d, foreign=%0d, leaves=%0d, leaves_refused=%0d",
+                      INSTANCE_ID, cnt_rejected, cnt_aliased, cnt_reclaimed, cnt_foreign,
+                      cnt_leaves, cnt_leaves_refused);
             if (LABEL_MODE != 0)
                 $fdisplay(32'h8000_0002, "CHECKER[%s]: labels: port_passed=%0d", INSTANCE_ID, labeled_passed_r);
             if (fault_overflow)

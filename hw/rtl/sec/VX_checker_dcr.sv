@@ -76,7 +76,10 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     output wire [31:0]               cnt_aliased,
     output wire [31:0]               cnt_reclaimed,
     // Claims refused because they named an owner other than their issuer.
-    output wire [31:0]               cnt_foreign
+    output wire [31:0]               cnt_foreign,
+    // Release (S2): BUF_LEAVE applied, and refused.
+    output wire [31:0]               cnt_leaves,
+    output wire [31:0]               cnt_leaves_refused
 );
     `UNUSED_SPARAM (INSTANCE_ID)
 
@@ -94,6 +97,10 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire is_shared = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_SHARED);
     wire is_commit = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_COMMIT);
     wire is_bump   = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_EPOCH);
+    wire is_joint    = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_JOINT);
+    wire is_confined = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_CONFINED);
+    wire is_grantee  = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_GRANTEE);
+    wire is_leave    = dcr_wr && (dcr_addr == `VX_DCR_CHECKER_BUF_LEAVE);
     // VX_DCR_CHECKER_REVOKE_OWNER is retired (authorship): it let any writer
     // pick whose epoch the next EPOCH write advanced. Writes to it are ignored.
 
@@ -101,13 +108,12 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // Authorship (P1_and_taint_specv2.md D1-D3). Every setup write carries its
     // issuer, the queue it arrived on, which is the tenant. A tenant stages
     // into its own registers, may claim only for itself, and revokes only its
-    // own grants. Issuers are owner ids: today a tenant is a core, so an
-    // issuer that names no core cannot claim (it would truncate onto another
-    // owner's id).
+    // own grants. Issuers are tenants (header v2), so every queue is one.
     // ---------------------------------------------------------------------
     localparam NUM_ISSUERS = `VX_CFG_CHECKER_TENANTS;
     wire [`UP(`CLOG2(NUM_ISSUERS))-1:0] iss = `UP(`CLOG2(NUM_ISSUERS))'(dcr_issuer);
-    wire iss_is_owner = (32'(dcr_issuer) < 32'(NUM_OWNERS));
+    wire iss_is_owner = (32'(dcr_issuer) < 32'(CHK_TENANTS));
+    wire [CHK_TENANTS-1:0] iss_bit = CHK_TENANTS'(1) << dcr_issuer;
 
     // ---------------------------------------------------------------------
     // Staged claims, one set per issuer, so another queue's writes between a
@@ -116,8 +122,13 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // issuer name itself": that is all a commit needs.
     // ---------------------------------------------------------------------
     reg [NUM_ISSUERS-1:0][31:0] stg_base, stg_size, stg_epoch;
-    reg [NUM_ISSUERS-1:0][1:0]  stg_perms, stg_shared;
+    reg [NUM_ISSUERS-1:0][2:0]  stg_perms, stg_shared;
     reg [NUM_ISSUERS-1:0]       stg_owner_self;
+    // Header v2: co-owners (owners = {issuer} | joint), the grantee, and
+    // whether the grant is confined.
+    reg [NUM_ISSUERS-1:0][CHK_TENANTS-1:0] stg_joint;
+    reg [NUM_ISSUERS-1:0][CHK_OWNER_W-1:0] stg_grantee;
+    reg [NUM_ISSUERS-1:0]                  stg_confined;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -127,6 +138,9 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                 stg_perms[i]  <= '0;
                 stg_shared[i] <= '0;
                 stg_epoch[i]  <= 32'hFFFFFFFF;
+                stg_joint[i]    <= '0;
+                stg_grantee[i]  <= '0;
+                stg_confined[i] <= 1'b0;
                 // An unwritten BUF_OWNER reads as owner 0, as in SimX.
                 stg_owner_self[i] <= (i == 0);
             end
@@ -134,24 +148,29 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             if (is_base)   stg_base[iss]   <= dcr_wdata;
             if (is_size)   stg_size[iss]   <= dcr_wdata;
             if (is_owner)  stg_owner_self[iss] <= (dcr_wdata == 32'(dcr_issuer));
-            if (is_perms)  stg_perms[iss]  <= dcr_wdata[1:0];
-            if (is_shared) stg_shared[iss] <= dcr_wdata[1:0];
+            if (is_perms)  stg_perms[iss]  <= dcr_wdata[2:0];
+            if (is_shared) stg_shared[iss] <= dcr_wdata[2:0];
             if (is_epoch)  stg_epoch[iss]  <= dcr_wdata;
+            if (is_joint)    stg_joint[iss]    <= dcr_wdata[CHK_TENANTS-1:0];
+            if (is_grantee)  stg_grantee[iss]  <= dcr_wdata[CHK_OWNER_W-1:0];
+            if (is_confined) stg_confined[iss] <= dcr_wdata[0];
         end
     end
 
-    // The claim being installed, latched at COMMIT: its owner is the issuer.
-    reg [CHK_OWNER_W-1:0] ins_owner;
-    reg [1:0]             ins_perms, ins_shared;
+    // The operation being installed, latched from the pending FIFO: a claim
+    // (owner set {issuer} | joint) or a leave by the issuer (ins_leave).
+    reg                   ins_leave;
+    reg [CHK_TENANTS-1:0] ins_self, ins_owners;
+    reg [2:0]             ins_perms, ins_shared;
     reg [31:0]            ins_epoch;
+    reg [CHK_OWNER_W-1:0] ins_grantee;
+    reg                   ins_confined;
     // A COMMIT whose issuer named someone else (or names no owner) installs
     // nothing and is counted, apart from rejected/aliased.
     wire commit_self = stg_owner_self[iss] && iss_is_owner;
 
-    // The installer reads only the occupant's owner and owner_any: valid and
-    // tag are resolved by the store, and perms/epoch belong to the occupant's
-    // policy, which a refusal must leave untouched rather than inspect.
-    `UNUSED_VAR (probe_header)
+    // A claim reads only the occupant's owner set; a leave rewrites the
+    // occupant's header with the leaver removed, so it reads all of it.
 
     // ---------------------------------------------------------------------
     // Per-owner epoch table. Indexed by the GRANTING owner, which is what
@@ -223,21 +242,29 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire [CHK_BUF_ID_W-1:0] last_of  = CHK_BUF_ID_W'(claim_end >> CHK_BUF_LOG2);
     wire refuse_foreign = is_commit && (stg_size[iss] != 0) && !commit_self;
 
+    // A leave names the leaver, which must be the issuer: only an owner
+    // removes itself (S2). Anything else is refused before it is queued.
+    wire leave_self    = iss_is_owner && (dcr_wdata == 32'(dcr_issuer));
+    wire leave_accept  = is_leave && (stg_size[iss] != 0) && leave_self;
+    wire refuse_leave  = is_leave && !((stg_size[iss] != 0) && leave_self);
+
     // ---------------------------------------------------------------------
-    // Pending claims. The DCR bus has no back-pressure and an install takes
-    // ~2N cycles, so a COMMIT can arrive while another claim is installing --
-    // with several queues, routinely. Each accepted COMMIT is snapshotted
-    // here (issuer, range, perms, grant) and the installer drains them in
-    // order. The snapshot is what makes a later staging write by the same
-    // tenant unable to alter a claim it has already committed.
+    // Pending operations. The DCR bus has no back-pressure and an install
+    // takes ~2N cycles, so a COMMIT can arrive while another claim is
+    // installing -- with several queues, routinely. Each accepted COMMIT or
+    // LEAVE is snapshotted here and the installer drains them in order. The
+    // snapshot is what makes a later staging write by the same tenant unable
+    // to alter an operation it has already issued.
     // ---------------------------------------------------------------------
     localparam PEND_DEPTH = 2 * NUM_ISSUERS;
-    localparam PEND_W     = CHK_OWNER_W + 2 * CHK_BUF_ID_W + 2 + 2 + 32;
+    localparam PEND_W     = 1 + 2 * CHK_TENANTS + 2 * CHK_BUF_ID_W + 3 + 3 + 32
+                          + CHK_OWNER_W + 1;
     wire              pend_empty, pend_full, pend_pop;
     wire [PEND_W-1:0] pend_out;
     wire commit_accept = is_commit && (stg_size[iss] != 0) && commit_self;
-    wire pend_push     = commit_accept && !pend_full;
-    wire pend_drop     = commit_accept && pend_full;
+    wire op_accept     = commit_accept || leave_accept;
+    wire pend_push     = op_accept && !pend_full;
+    wire pend_drop     = op_accept && pend_full;
 
     VX_fifo_queue #(
         .DATAW (PEND_W),
@@ -247,8 +274,9 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .reset    (reset),
         .push     (pend_push),
         .pop      (pend_pop),
-        .data_in  ({CHK_OWNER_W'(dcr_issuer), first_of, last_of,
-                    stg_perms[iss], stg_shared[iss], stg_epoch[iss]}),
+        .data_in  ({leave_accept, iss_bit, iss_bit | stg_joint[iss], first_of, last_of,
+                    stg_perms[iss], stg_shared[iss], stg_epoch[iss],
+                    stg_grantee[iss], stg_confined[iss]}),
         .data_out (pend_out),
         .empty    (pend_empty),
         `UNUSED_PIN (alm_empty),
@@ -257,12 +285,22 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         `UNUSED_PIN (size)
     );
 
-    wire [CHK_OWNER_W-1:0]  p_owner;
+    wire                    p_leave;
+    wire [CHK_TENANTS-1:0]  p_self, p_owners;
     wire [CHK_BUF_ID_W-1:0] p_first, p_last;
-    wire [1:0]              p_perms, p_shared;
+    wire [2:0]              p_perms, p_shared;
     wire [31:0]             p_epoch;
-    assign {p_owner, p_first, p_last, p_perms, p_shared, p_epoch} = pend_out;
+    wire [CHK_OWNER_W-1:0]  p_grantee;
+    wire                    p_confined;
+    assign {p_leave, p_self, p_owners, p_first, p_last, p_perms, p_shared, p_epoch,
+            p_grantee, p_confined} = pend_out;
     wire start_install = !pend_empty;
+
+    // S4, decided once per claim: a grant names one tenant, and only a sole
+    // owner grants. A joint claim carrying a grant is refused whole.
+    wire grant_refused = !ins_leave && (ins_shared != '0)
+                      && ((ins_owners != ins_self)
+                       || (32'(ins_grantee) >= 32'(CHK_TENANTS)));
 
     // ALIAS: the entry this granule indexes is occupied by a DIFFERENT buffer.
     // Refuse whoever owns the occupant — two buffers is the problem, not two
@@ -271,17 +309,25 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // store capacity to reach it at all.
     wire scan_alias_conflict = probe_occupied && !probe_claimed;
 
-    // CROSS-OWNER: this granule already belongs to a different non-OWNER_ANY
-    // owner. The invariant the per-sector writer tag depends on (§2.3).
-    wire scan_owner_conflict = probe_claimed
-                            && !probe_header.owner_any
-                            && (probe_header.owner != ins_owner);
+    // The setup rules per granule (kernel_identity_oct16.md S1, S2, S4; T6):
+    //   claim: the granule is unclaimed (S1), or its owner set is exactly
+    //          {issuer} and stays so (S4: a perms or grant change). No
+    //          re-claim changes an owner set (T6), and granule exclusivity
+    //          is what one writer id per sector depends on (§2.3).
+    //   leave: the granule is claimed, lists the issuer, and keeps another
+    //          owner (S2).
+    wire scan_claim_conflict = probe_claimed
+                            && !((probe_header.owners == ins_self)
+                              && (ins_owners == ins_self));
+    wire scan_leave_conflict = !probe_claimed
+                            || ((probe_header.owners & ins_self) == '0)
+                            || (probe_header.owners == ins_self);
+    wire scan_owner_conflict = grant_refused
+                            || (ins_leave ? scan_leave_conflict : scan_claim_conflict);
 
-    // RE-CLAIM by the same owner (e.g. a re-grant). Legal and counted, so
-    // "no owner ever silently replaced another" stays a measured zero rather
-    // than an assumption. Only an installed header can be re-claimed.
-    wire scan_is_reclaim = probe_claimed
-                        && (probe_header.owner == ins_owner);
+    // RE-CLAIM by the sole owner (a re-grant). Legal and counted, so "no claim
+    // ever replaced another" stays a measured zero rather than an assumption.
+    wire scan_is_reclaim = !ins_leave && probe_claimed;
 
     wire at_last = (cur_id == last_id);
 
@@ -294,11 +340,9 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             // edge, so on the cycle a conflict is detected they still read 0 —
             // and for a single-granule claim at_last is true on that very first
             // SCAN cycle, so the FSM would fall through to ST_WRITE and install
-            // the claim it had just decided to refuse. It would then count
-            // `rejected` as well, so the counter said fail-closed while the
-            // store said otherwise. Caught by the TB's "owner 0 still owns A
-            // after the refused claim" case; a deny-count check would have
-            // passed it.
+            // the claim it had just decided to refuse. Caught by the TB's
+            // "owner 0 still owns A after the refused claim" case; a deny-count
+            // check would have passed it.
             ST_SCAN:  if (refuse_alias || refuse_owner
                        || scan_alias_conflict || scan_owner_conflict)
                                                         state_n = ST_DONE;
@@ -310,6 +354,7 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     end
 
     reg [31:0] claims_r, written_r, rejected_r, aliased_r, reclaimed_r, foreign_r;
+    reg [31:0] leaves_r, leaves_refused_r;
     reg [31:0] reclaim_acc;
 
     always @(posedge clk) begin
@@ -327,14 +372,24 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             reclaimed_r  <= '0;
             reclaim_acc  <= '0;
             foreign_r    <= '0;
-            ins_owner    <= '0;
+            leaves_r     <= '0;
+            leaves_refused_r <= '0;
+            ins_leave    <= 1'b0;
+            ins_self     <= '0;
+            ins_owners   <= '0;
             ins_perms    <= '0;
             ins_shared   <= '0;
             ins_epoch    <= '0;
+            ins_grantee  <= '0;
+            ins_confined <= 1'b0;
         end else begin
             state <= state_n;
             if (refuse_foreign)
                 foreign_r <= foreign_r + 1;
+            // A leave refused before it was queued (not the issuer, or no
+            // range staged); one refused per granule rule is counted at DONE.
+            if (refuse_leave)
+                leaves_refused_r <= leaves_refused_r + 1;
             case (state)
                 ST_IDLE: begin
                     if (start_install) begin
@@ -344,10 +399,14 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                         refuse_alias <= 1'b0;
                         refuse_owner <= 1'b0;
                         reclaim_acc  <= '0;
-                        ins_owner    <= p_owner;
+                        ins_leave    <= p_leave;
+                        ins_self     <= p_self;
+                        ins_owners   <= p_owners;
                         ins_perms    <= p_perms;
                         ins_shared   <= p_shared;
                         ins_epoch    <= p_epoch;
+                        ins_grantee  <= p_grantee;
+                        ins_confined <= p_confined;
                     end
                 end
                 ST_SCAN: begin
@@ -368,9 +427,16 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
                         cur_id <= cur_id + 1;
                 end
                 ST_DONE: begin
-                    if (refuse_owner)      rejected_r  <= rejected_r + 1;
-                    else if (refuse_alias) aliased_r   <= aliased_r + 1;
-                    else begin
+                    if (ins_leave) begin
+                        if (refuse_owner || refuse_alias)
+                            leaves_refused_r <= leaves_refused_r + 1;
+                        else
+                            leaves_r <= leaves_r + 1;
+                    end else if (refuse_owner) begin
+                        rejected_r  <= rejected_r + 1;
+                    end else if (refuse_alias) begin
+                        aliased_r   <= aliased_r + 1;
+                    end else begin
                         claims_r    <= claims_r + 1;
                         reclaimed_r <= reclaimed_r + reclaim_acc;
                     end
@@ -380,25 +446,35 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         end
     end
 
-    assign probe_en     = (state == ST_SCAN);
+    // The probe also reads during the write pass: a leave rewrites each
+    // granule's own header (the store's probe port reads asynchronously).
+    assign probe_en     = (state == ST_SCAN) || (state == ST_WRITE);
     assign probe_buf_id = cur_id;
 
     assign wr_en     = (state == ST_WRITE);
     assign wr_buf_id = cur_id;
 
     always @(*) begin
-        wr_header              = '0;
-        wr_header.valid        = 1'b1;
-        wr_header.owner_any    = 1'b0;   // a tenant claims for itself, never for all
-        wr_header.owner        = ins_owner;
-        wr_header.perms        = ins_perms;
-        wr_header.shared_perms = ins_shared;
-        // 0xFFFFFFFF means "no expiry": saturate rather than truncate, or a
-        // never-expiring grant would silently become one that expires at
-        // epoch 0xFFFF's wrap.
-        wr_header.grant_epoch  = (ins_epoch == 32'hFFFFFFFF)
-                               ? {CHK_EPOCH_W{1'b1}}
-                               : ins_epoch[CHK_EPOCH_W-1:0];
+        if (ins_leave) begin
+            // S2: the granule's header with the leaver removed. A joint
+            // granule carries no grant, so the remaining set inherits none.
+            wr_header        = probe_header;
+            wr_header.owners = probe_header.owners & ~ins_self;
+        end else begin
+            wr_header             = '0;
+            wr_header.owners      = ins_owners;
+            wr_header.perms       = ins_perms;
+            wr_header.grantee     = (ins_shared != '0) ? ins_grantee : '0;
+            wr_header.grant_perms = ins_shared;
+            wr_header.confined    = (ins_shared != '0) && ins_confined;
+            // 0xFFFFFFFF means "no expiry": saturate rather than truncate, or
+            // a never-expiring grant would silently become one that expires
+            // at epoch 0xFFFF's wrap.
+            wr_header.grant_epoch = (ins_epoch == 32'hFFFFFFFF)
+                                  ? {CHK_EPOCH_W{1'b1}}
+                                  : ins_epoch[CHK_EPOCH_W-1:0];
+        end
+        wr_header.valid = 1'b1;
     end
 
     assign pend_pop = (state == ST_IDLE) && start_install;
@@ -407,20 +483,17 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     assign install_busy = (state != ST_IDLE) || !pend_empty;
 
     // ---------------------------------------------------------------------
-    // Boot default: unclaimed memory is system/shared, so kernel code, stacks
-    // and launch args are reachable before any claim is installed. This is
-    // FAIL-OPEN and it is a known open item (§10 m3) — after the control-plane
-    // filter, the command ring is the surviving trusted-but-unprotected
-    // surface. Kept identical to SimX rather than quietly hardened, so the
+    // Unclaimed memory: the empty owner set with the default perms (D9,
+    // VX_CFG_CHECKER_DEFAULT_PERMS). Kept identical to SimX's default so the
     // two tiers measure the same policy.
     // ---------------------------------------------------------------------
     always @(*) begin
-        default_header              = '0;
-        default_header.valid        = 1'b0;
-        default_header.owner_any    = 1'b1;
-        default_header.perms        = CHK_PERM_R | CHK_PERM_W;
-        default_header.shared_perms = '0;
-        default_header.grant_epoch  = {CHK_EPOCH_W{1'b1}};
+        default_header             = '0;
+        default_header.valid       = 1'b0;
+        default_header.owners      = '0;
+        default_header.perms       = CHK_DEFAULT_PERMS;
+        default_header.grant_perms = '0;
+        default_header.grant_epoch = {CHK_EPOCH_W{1'b1}};
     end
 
     assign cnt_claims          = claims_r;
@@ -430,6 +503,8 @@ module VX_checker_dcr import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     assign cnt_aliased         = aliased_r;
     assign cnt_reclaimed       = reclaimed_r;
     assign cnt_foreign         = foreign_r;
+    assign cnt_leaves          = leaves_r;
+    assign cnt_leaves_refused  = leaves_refused_r;
 
 `ifdef SIMULATION
     // PEND_DEPTH covers two outstanding COMMITs per tenant. More than that

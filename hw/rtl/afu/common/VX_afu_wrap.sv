@@ -884,10 +884,10 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
         //
         // The requester is the CP queue that issued the beat: VX_cp_core
         // stamps it into the low AXI ID bits and the bridge carries the ID
-        // into the tag. A queue whose index names no core owns nothing.
+        // into the tag. Every queue is a tenant (header v2); one that has
+        // claimed nothing owns nothing.
         localparam CP_CHK_ASHIFT = `CLOG2(FAB_DATA_SIZE);
         wire [VX_DCR_ISSUER_WIDTH-1:0] cp_req_issuer = cp_mem_req_tag[VX_DCR_ISSUER_WIDTH-1:0];
-        wire cp_req_is_owner = (32'(cp_req_issuer) < 32'(1 << MEM_OWNER_WIDTH));
         `STATIC_ASSERT(VX_DCR_ISSUER_WIDTH < `VX_CP_AXI_TID_WIDTH, ("CP device AXI ID cannot carry the issuing queue"))
 
         VX_dcr_bus_if cp_chk_dcr_if();
@@ -928,7 +928,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .req_rw         (cp_mem_req_rw),
             .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(cp_mem_req_addr) << CP_CHK_ASHIFT),
             .req_owner      (MEM_OWNER_WIDTH'(cp_req_issuer)),
-            .req_owner_valid(cp_req_is_owner),
+            .req_fetch      (1'b0),
             .req_tag        (cp_mem_req_tag),
             .req_data       (cp_mem_req_data),
             .req_byteen     (cp_mem_req_byteen),
@@ -960,7 +960,8 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             `UNUSED_PIN (cnt_claims),
             `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
             `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
-            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign)
+            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign),
+            `UNUSED_PIN (cnt_leaves),    `UNUSED_PIN (cnt_leaves_refused)
         );
 
         assign fab_req_addr[FAB_CP_PORT] = cp_chk_out_addr[`VX_CFG_MEM_ADDR_WIDTH-1:CP_CHK_ASHIFT];

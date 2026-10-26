@@ -299,6 +299,13 @@ VX_CFG_CHECKER_HEADER_ENTRIES = 0
 # queues (the C++ model always; the RTL with the checker enabled).
 VX_CFG_CHECKER_TENANTS = 8
 
+# Perms of unclaimed memory (header v2: the empty owner set), as R=1 W=2 X=4.
+# D9 decided R|X (5): readable and fetchable by every tenant, writable by none.
+# Default 7 (R|W|X) until the stack rule (T12) and claim-what-you-write land,
+# because kernels store to unclaimed stacks and outputs today. SimX reads
+# VX_CHECKER_DEFAULT_PERMS, with this as its default.
+VX_CFG_CHECKER_DEFAULT_PERMS = 7
+
 # Reads of the checker's DCR window (0x300-0x340) through the command processor.
 # 0 refuses them, as a production build must: per-owner state such as epochs and
 # deny counters must not be readable by other tenants (spec D5). Simulation keeps

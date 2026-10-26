@@ -127,6 +127,9 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         // extracts. Carrying it narrowed to MEM_OWNER_WIDTH rather than as a
         // full hart id is what keeps the metadata cost at 1 bit for --cores=2.
         assign mem_req_attr_struct[i].owner = MEM_OWNER_WIDTH'(CORE_ID);
+    `ifdef VX_CFG_CHECKER_ENABLE
+        assign mem_req_attr_struct[i].is_fetch = 1'b0;   // data access: R or W
+    `endif
     `ifdef VX_CFG_LMEM_ENABLE
         // is local memory address
         assign mem_req_attr_struct[i].is_addr_local =

@@ -77,6 +77,9 @@ package VX_sec_pkg;
     // still needs one bit to be a value at all, and the field has to exist for
     // the single-core case to resolve to eid 0 the way SimX's owner_of() does.
     localparam int CHK_OWNER_W    = MEM_OWNER_WIDTH;
+    // Header v2 (T1): owners are tenants, VX_CFG_CHECKER_TENANTS of them,
+    // independent of the core count. The owner set is a bitmask by tenant.
+    localparam int CHK_TENANTS    = `VX_CFG_CHECKER_TENANTS;
 
     // ---------------------------------------------------------------------
     // Epoch width. SimX uses a 64-bit counter, which is absurd in hardware:
@@ -87,8 +90,15 @@ package VX_sec_pkg;
     localparam int CHK_EPOCH_W    = `VX_CFG_CHECKER_EPOCH_WIDTH;
 
     // Permission bits, from the generated header so SimX / RTL / host agree.
-    localparam logic [1:0] CHK_PERM_R = 2'(`VX_CHECKER_PERM_R);
-    localparam logic [1:0] CHK_PERM_W = 2'(`VX_CHECKER_PERM_W);
+    localparam logic [2:0] CHK_PERM_R = 3'(`VX_CHECKER_PERM_R);
+    localparam logic [2:0] CHK_PERM_W = 3'(`VX_CHECKER_PERM_W);
+    localparam logic [2:0] CHK_PERM_X = 3'(`VX_CHECKER_PERM_X);
+    // Perms of unclaimed memory (D9; VX_CFG_CHECKER_DEFAULT_PERMS). Read by
+    // the setup path only; a build that labels caches without instantiating
+    // the checker never reads it.
+    /* verilator lint_off UNUSEDPARAM */
+    localparam logic [2:0] CHK_DEFAULT_PERMS = 3'(`VX_CFG_CHECKER_DEFAULT_PERMS);
+    /* verilator lint_on UNUSEDPARAM */
 
     // ---------------------------------------------------------------------
     // The buffer policy header.
@@ -99,13 +109,19 @@ package VX_sec_pkg;
     // access counting would force a read-modify-write on shared metadata for
     // every access, serializing exactly the path the thesis claims is parallel.
     // ---------------------------------------------------------------------
+    //
+    // Header v2 (T2, kernel_identity_oct16.md): an owner SET, so unclaimed is
+    // the empty set and the owner_any wildcard is gone; X; and a grant that
+    // names its grantee. A grant exists only on a single-owner granule (S4),
+    // whose epoch gates it.
     typedef struct packed {
         logic                      valid;        // a claim is installed here
         logic [`UP(CHK_TAG_W)-1:0] tag;          // which buffer (degenerate at the design point)
-        logic                      owner_any;    // wildcard: any tenant, subject to perms
-        logic [CHK_OWNER_W-1:0]    owner;        // owning principal
-        logic [1:0]                perms;        // owner access — NEVER epoch-gated
-        logic [1:0]                shared_perms; // non-owner access: the grant
+        logic [CHK_TENANTS-1:0]    owners;       // owner set; empty = unclaimed
+        logic [2:0]                perms;        // R W X for every owner — NEVER epoch-gated
+        logic [CHK_OWNER_W-1:0]    grantee;      // the one tenant the grant is for
+        logic [2:0]                grant_perms;  // R W X for the grantee
+        logic                      confined;     // the grant taints its reader
         logic [CHK_EPOCH_W-1:0]    grant_epoch;  // grant holds while epoch(owner) <= this
     } chk_header_t;
 
@@ -128,58 +144,90 @@ package VX_sec_pkg;
     // every cached copy of a grant expires at once without being touched.
     // ---------------------------------------------------------------------
     typedef struct packed {
-        logic                      owner_any;
-        logic [CHK_OWNER_W-1:0]    owner;
-        logic [1:0]                perms;
-        logic [1:0]                shared_perms;
+        logic [CHK_TENANTS-1:0]    owners;
+        logic [2:0]                perms;
+        logic [CHK_OWNER_W-1:0]    grantee;
+        logic [2:0]                grant_perms;
+        logic                      confined;
         logic [CHK_EPOCH_W-1:0]    grant_epoch;
     } chk_label_t;
 
+    /* verilator lint_off UNUSEDPARAM */
     localparam int CHK_LABEL_W = $bits(chk_label_t);
+    /* verilator lint_on UNUSEDPARAM */
 
     /* verilator lint_off UNUSEDSIGNAL */
     // A label is the header's POLICY: `valid` and `tag` are store residency,
     // resolved before a header reaches here, and deliberately dropped.
     function automatic chk_label_t chk_label_of(input chk_header_t hdr);
         chk_label_t l;
-        l.owner_any    = hdr.owner_any;
-        l.owner        = hdr.owner;
+        l.owners       = hdr.owners;
         l.perms        = hdr.perms;
-        l.shared_perms = hdr.shared_perms;
+        l.grantee      = hdr.grantee;
+        l.grant_perms  = hdr.grant_perms;
+        l.confined     = hdr.confined;
         l.grant_epoch  = hdr.grant_epoch;
         return l;
     endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 
     // ---------------------------------------------------------------------
-    // The authorization predicate, as a function so the TB and the datapath
-    // cannot drift. Mirrors MemChecker::check() (sim/simx/sec/mem_checker.cpp).
+    // The authorization predicate (header v2), as functions so the TB, the
+    // port checker and every labeled cache cannot drift. Mirrors
+    // MemChecker::judge() (sim/simx/sec/mem_checker.cpp).
     //
-    //   Authorize(r,b,op) <=> ( r = Owner(b)   & op in OwnerPerms(b) )
-    //                       | ( r = Grantee(b) & op in GrantPerms(b)
-    //                                          & CurrentEpoch(Owner(b)) <= GrantEpoch(b) )
+    //   need = W for a write, X for a fetch, R otherwise
+    //   unclaimed (owners == {}):  need in perms (the default perms)
+    //   requester an owner:        need in perms, never epoch-gated
+    //   otherwise:                 requester == grantee, need in grant_perms,
+    //                              and epoch(the owner) <= grant_epoch
     //
-    // Two asymmetries, both deliberate: the owner (and OWNER_ANY) is never
-    // epoch-gated — revocation expires grants to *others*, it does not evict
-    // the owner — and the epoch that gates a grant is the GRANTING owner's,
-    // which is what makes revocation scoped per owner.
+    // The epoch that gates a grant is the GRANTING owner's, so revocation is
+    // scoped per owner. Grants exist only on single-owner granules, so the
+    // owner's epoch is a one-hot mux on `owners` (chk_owner_epoch): no
+    // encoder, and no deeper than v1's binary-indexed mux.
     // ---------------------------------------------------------------------
+    function automatic logic [2:0] chk_need(input logic is_write, input logic is_fetch);
+        return is_write ? CHK_PERM_W : (is_fetch ? CHK_PERM_X : CHK_PERM_R);
+    endfunction
+
+    function automatic logic [CHK_EPOCH_W-1:0] chk_owner_epoch(
+        input logic [CHK_TENANTS-1:0]             owners,
+        input logic [CHK_TENANTS*CHK_EPOCH_W-1:0] epochs
+    );
+        logic [CHK_EPOCH_W-1:0] e;
+        e = '0;
+        for (int t = 0; t < CHK_TENANTS; ++t) begin
+            if (owners[t])
+                e = e | epochs[t * CHK_EPOCH_W +: CHK_EPOCH_W];
+        end
+        return e;
+    endfunction
+
     // THE predicate, on a label: the checker applies it to the header it just
-    // read, a labeled cache to the label it stored with the line.
+    // read, a labeled cache to the label it stored with the line. `confined`
+    // is the taint plumbing's (step 4); the predicate itself does not read it.
+    /* verilator lint_off UNUSEDSIGNAL */
     function automatic logic chk_authorize_label(
         input chk_label_t             lbl,
         input logic [CHK_OWNER_W-1:0] requester,
         input logic                   is_write,
+        input logic                   is_fetch,
         input logic [CHK_EPOCH_W-1:0] owner_epoch
     );
-        logic [1:0] need;
-        need = is_write ? CHK_PERM_W : CHK_PERM_R;
-        if (lbl.owner_any || (lbl.owner == requester)) begin
+        logic [2:0] need;
+        logic       is_owner;
+        need = chk_need(is_write, is_fetch);
+        is_owner = |(lbl.owners & (CHK_TENANTS'(1) << requester));
+        if ((lbl.owners == '0) || is_owner) begin
             return |(lbl.perms & need);
         end else begin
-            return (|(lbl.shared_perms & need)) && (owner_epoch <= lbl.grant_epoch);
+            return (requester == lbl.grantee)
+                && (|(lbl.grant_perms & need))
+                && (owner_epoch <= lbl.grant_epoch);
         end
     endfunction
+    /* verilator lint_on UNUSEDSIGNAL */
 
     /* verilator lint_off UNUSEDSIGNAL */
     // `valid` and `tag` are resolved by the store before it hands a header
@@ -189,27 +237,10 @@ package VX_sec_pkg;
         input chk_header_t            hdr,
         input logic [CHK_OWNER_W-1:0] requester,
         input logic                   is_write,
+        input logic                   is_fetch,
         input logic [CHK_EPOCH_W-1:0] owner_epoch
     );
-        return chk_authorize_label(chk_label_of(hdr), requester, is_write, owner_epoch);
-    endfunction
-
-    // The same predicate for a requester that is no owner at all: a command-
-    // processor queue whose index names no core (D7). It owns nothing, so it
-    // gets OWNER_ANY's perms or the grant, never an owner's perms. Truncating
-    // its index onto CHK_OWNER_W bits instead would make it another tenant.
-    function automatic logic chk_authorize_anon(
-        input chk_header_t            hdr,
-        input logic                   is_write,
-        input logic [CHK_EPOCH_W-1:0] owner_epoch
-    );
-        logic [1:0] need;
-        need = is_write ? CHK_PERM_W : CHK_PERM_R;
-        if (hdr.owner_any) begin
-            return |(hdr.perms & need);
-        end else begin
-            return (|(hdr.shared_perms & need)) && (owner_epoch <= hdr.grant_epoch);
-        end
+        return chk_authorize_label(chk_label_of(hdr), requester, is_write, is_fetch, owner_epoch);
     endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 

@@ -217,8 +217,15 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire [MSHR_ADDR_WIDTH-1:0]     replay_id;
     amo_req_t                      replay_amo;
     // A replayed store stamps the writer tag from its own attr, so the MSHR
-    // parks the owner with the request (PROJECT.md §2.3).
-    wire [MEM_OWNER_WIDTH-1:0]     replay_owner;
+    // parks the requester with the request (PROJECT.md §2.3): its owner, and
+    // with the checker whether it is a fetch (MEM_ATTR_REQID_OFFS).
+    wire [MEM_REQID_WIDTH-1:0]     replay_reqid;
+    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[MEM_REQID_WIDTH-1 -: MEM_OWNER_WIDTH];
+`ifdef VX_CFG_CHECKER_ENABLE
+    wire                           replay_fetch = replay_reqid[0];
+`else
+    wire                           replay_fetch = 1'b0;
+`endif
 
     // AMO engine interconnect (tied to 0 when the bank carries no AMO logic).
     wire                          amo_hit_st1, amo_commit_busy, amo_chain_stall, amo_wb_pending, amo_wbq_full;
@@ -491,7 +498,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg [`UP(MEM_ATTR_WIDTH)-1:0] replay_attr;
     always @(*) begin
         replay_attr = '0;
-        replay_attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH] = replay_owner;
+        replay_attr[MEM_ATTR_REQID_OFFS +: MEM_REQID_WIDTH] = replay_reqid;
     end
 
     // Input mux -> arbitrated request (whole-struct populate). AMO priority
@@ -668,13 +675,18 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     wire [`UP(MEM_RSP_ATTR_WIDTH)-1:0] label_hit_st0;
     if (LABEL_ENABLE) begin : g_label_check
         wire [MEM_OWNER_WIDTH-1:0] req_owner_st0 = st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH];
+    `ifdef VX_CFG_CHECKER_ENABLE
+        wire req_fetch_st0 = st0.req.attr[MEM_ATTR_FETCH_OFFS];
+    `else
+        wire req_fetch_st0 = 1'b0;
+    `endif
         wire [NUM_WAYS-1:0] allow_w;
         wire [NUM_WAYS-1:0][CHK_LABEL_W-1:0] hit_label_w;
         for (genvar i = 0; i < NUM_WAYS; ++i) begin : g_way
             chk_label_t lbl;
             assign lbl = chk_label_t'(read_label_st0[i]);
-            wire [CHK_EPOCH_W-1:0] owner_epoch = label_epochs[lbl.owner * CHK_EPOCH_W +: CHK_EPOCH_W];
-            assign allow_w[i] = chk_authorize_label(lbl, req_owner_st0, st0.req.rw, owner_epoch);
+            wire [CHK_EPOCH_W-1:0] owner_epoch = chk_owner_epoch(lbl.owners, label_epochs);
+            assign allow_w[i] = chk_authorize_label(lbl, req_owner_st0, st0.req.rw, req_fetch_st0, owner_epoch);
             assign hit_label_w[i] = tag_matches_st0[i] ? read_label_st0[i] : '0;
         end
         wire judged = st0.req.rw || (LABEL_EDGE != 0);
@@ -944,7 +956,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .AMO_ENABLE  (AMO_ENABLE != 0),
         .AMO_PASSTHRU ((AMO_ENABLE != 0) && (IS_LLC == 0)),
         .WORD_SEL_WIDTH (WORD_SEL_WIDTH),
-        .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS + MEM_OWNER_WIDTH)
+        .DATA_WIDTH  (WORD_SEL_WIDTH + WORD_SIZE + `CS_WORD_WIDTH + TAG_WIDTH + REQ_SEL_WIDTH + AMO_REQ_BITS + MEM_REQID_WIDTH)
     ) cache_mshr (
         .clk                 (clk),
         .reset               (reset),
@@ -965,7 +977,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         .dequeue_valid       (replay_valid),
         .dequeue_addr        (replay_addr),
         .dequeue_rw          (replay_rw),
-        .dequeue_data        ({replay_wsel, replay_byteen, replay_data, replay_tag, replay_idx, replay_amo, replay_owner}),
+        .dequeue_data        ({replay_wsel, replay_byteen, replay_data, replay_tag, replay_idx, replay_amo, replay_reqid}),
         .dequeue_id          (replay_id),
         .dequeue_ready       (replay_ready || fwd_fire),
         .allocate_valid      (mshr_allocate_st0 && ~pipe_stall),
@@ -977,7 +989,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         // and serialize their commits on the single filled line.
         .allocate_is_amo     (AMO_ENABLE ? st0.req.amo.amo_valid : 1'b0),
         .allocate_data       ({st0.req.word_idx, st0.req.byteen, write_word_st0, st0.req.tag, st0.req.req_idx, st0.req.amo,
-                               st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]}),
+                               st0.req.attr[MEM_ATTR_REQID_OFFS +: MEM_REQID_WIDTH]}),
         .allocate_id         (mshr_alloc_id),
         .allocate_pending    (mshr_pending_raw),
         .allocate_pending_wr (mshr_pending_wr_raw),
@@ -1223,9 +1235,10 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     if (LABEL_ENABLE && LABEL_EDGE) begin : g_fwd_label
         chk_label_t fwd_lbl;
         assign fwd_lbl = chk_label_t'(fbuf_label_r[CHK_LABEL_W-1:0]);
-        wire [CHK_EPOCH_W-1:0] fwd_epoch = label_epochs[fwd_lbl.owner * CHK_EPOCH_W +: CHK_EPOCH_W];
-        assign fwd_label_deny = ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, fwd_epoch);
+        wire [CHK_EPOCH_W-1:0] fwd_epoch = chk_owner_epoch(fwd_lbl.owners, label_epochs);
+        assign fwd_label_deny = ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, replay_fetch, fwd_epoch);
     end else begin : g_no_fwd_label
+        `UNUSED_VAR ({replay_owner, replay_fetch})
         assign fwd_label_deny = 1'b0;
     end
     wire [`CS_WORD_WIDTH-1:0] fwd_word_rsp = (fwd_label_deny && LABEL_ENFORCE != 0) ? poison_word : fwd_word;

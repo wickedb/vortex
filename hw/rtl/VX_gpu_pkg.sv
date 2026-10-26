@@ -211,7 +211,16 @@ package VX_gpu_pkg;
     // --cores=2 against HART_ID_WIDTH. That narrowing is what keeps the
     // metadata cost honest; see MEM_ATTR_OWNER_OFFS below for why it sits
     // above amo.
+    //
+    // Header v2 (P1_and_taint_specv2.md T1): owners are tenants, a build-time
+    // count independent of the core count, so with the checker the field is
+    // a tenant id. Until per-core tenant registers land (T3) the tenant is the
+    // core id, which the checker static-asserts fits.
+`ifdef VX_CFG_CHECKER_ENABLE
+    localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_CHECKER_TENANTS));
+`else
     localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS));
+`endif
 
     // Response attribute: the data-plane checker's policy LABEL (sec/
     // VX_sec_pkg chk_label_t), resolved at the memory port and carried with
@@ -221,17 +230,23 @@ package VX_gpu_pkg;
     // (VX_sec_pkg static-asserts against it). Zero without the checker: the
     // field then collapses to one constant-zero bit (`UP) and every response
     // behaves exactly as before.
+    // Header v2 label: owners[TENANTS], perms[3], grantee, grant_perms[3],
+    // confined, grant_epoch.
 `ifdef VX_CFG_CHECKER_ENABLE
-    localparam MEM_RSP_ATTR_WIDTH = 1 + MEM_OWNER_WIDTH + 2 + 2 + `VX_CFG_CHECKER_EPOCH_WIDTH;
+    localparam MEM_RSP_ATTR_WIDTH = `VX_CFG_CHECKER_TENANTS + 3 + MEM_OWNER_WIDTH + 3 + 1
+                                  + `VX_CFG_CHECKER_EPOCH_WIDTH;
 `else
     localparam MEM_RSP_ATTR_WIDTH = 0;
 `endif
     // The live per-owner epoch table, flattened, as the checker exports it to
-    // every labeled cache (one CHECKER_EPOCH_WIDTH entry per owner).
-    localparam LABEL_EPOCHS_W = (1 << MEM_OWNER_WIDTH) * `VX_CFG_CHECKER_EPOCH_WIDTH;
+    // every labeled cache (one CHECKER_EPOCH_WIDTH entry per tenant).
+    localparam LABEL_EPOCHS_W = `VX_CFG_CHECKER_TENANTS * `VX_CFG_CHECKER_EPOCH_WIDTH;
 
     typedef struct packed {
-        logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS = 4 + AMO_REQ_BITS
+        logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS
+`ifdef VX_CFG_CHECKER_ENABLE
+        logic                        is_fetch;      // MEM_ATTR_FETCH_OFFS = 4 + AMO_REQ_BITS
+`endif
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4
         logic                        is_addr_om;    // MEM_ATTR_OM_OFFS    = 3
         logic                        is_addr_local; // MEM_ATTR_LOCAL_OFFS = 2
@@ -248,7 +263,24 @@ package VX_gpu_pkg;
     // cast by offset in VX_cache_bank, so a field inserted below
     // MEM_ATTR_AMO_OFFS would silently shift it and reinterpret the AMO
     // sideband. Everything at or below offset 4 keeps its position.
+    // An instruction fetch, judged against X rather than R (header v2, T9).
+    // Only with the checker, so a baseline build's bus is unchanged.
+`ifdef VX_CFG_CHECKER_ENABLE
+    localparam MEM_ATTR_FETCH_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
+    localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_FETCH_OFFS + 1;
+`else
     localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
+`endif
+    // The requester as the checker judges it: {owner, is_fetch} with the
+    // checker, the owner alone without. Contiguous in the attr, so a cache's
+    // MSHR parks it as one slice and a replay is judged as its request was.
+`ifdef VX_CFG_CHECKER_ENABLE
+    localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_FETCH_OFFS;
+    localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH + 1;
+`else
+    localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_OWNER_OFFS;
+    localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH;
+`endif
 
     // Total width of the mem-bus attr field. Use this as the parameter
     // default for VX_mem_bus_if's ATTR_WIDTH parameter and as the

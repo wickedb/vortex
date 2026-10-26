@@ -10,6 +10,10 @@ PROJECT := mem_checker
 # NUM_CORES=2.
 CONFIGS += -DVX_CFG_NUM_CORES=2
 
+# Built as in a checker build: header v2's requester is a tenant id
+# (MEM_OWNER_WIDTH = CLOG2(TENANTS)) only with the checker enabled.
+CONFIGS += -DVX_CFG_CHECKER_ENABLE
+
 # A non-zero lookup latency, so case 13 holds a request in S1 while the bus
 # moves on. The design point is 0; the checks are latency-independent.
 CONFIGS += -DVX_CFG_CHECKER_LOOKUP_LATENCY=4

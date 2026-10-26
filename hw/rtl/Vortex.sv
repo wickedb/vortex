@@ -257,7 +257,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .req_rw         (mem_bus_if[i].req_data.rw),
             .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(mem_bus_if[i].req_data.addr) << CHK_ASHIFT),
             .req_owner      (mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
-            .req_owner_valid(1'b1),
+            .req_fetch      (mem_bus_if[i].req_data.attr[MEM_ATTR_FETCH_OFFS]),
             .req_tag        (mem_bus_if[i].req_data.tag),
             .req_data       (mem_bus_if[i].req_data.data),
             .req_byteen     (mem_bus_if[i].req_data.byteen),
@@ -289,7 +289,8 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             `UNUSED_PIN (cnt_claims),
             `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
             `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
-            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign)
+            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign),
+            `UNUSED_PIN (cnt_leaves),    `UNUSED_PIN (cnt_leaves_refused)
         );
 
         // Request side: the checker gates what reaches DRAM. Payload fields it

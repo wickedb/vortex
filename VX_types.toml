@@ -174,25 +174,28 @@ VX_DCR_DXA_STATE_END = 0x280
 VX_DCR_CHECKER_STATE_BEGIN  = 0x300
 VX_DCR_CHECKER_BUF_BASE     = 0x300  # staged: buffer base address
 VX_DCR_CHECKER_BUF_SIZE     = 0x301  # staged: buffer size in bytes
-VX_DCR_CHECKER_BUF_OWNER    = 0x302  # staged: owner eid (OWNER_ANY = shared)
+VX_DCR_CHECKER_BUF_OWNER    = 0x302  # staged: the claiming tenant; must be the issuer
 VX_DCR_CHECKER_BUF_PERMS    = 0x303  # staged: owner perms, never epoch-gated
 VX_DCR_CHECKER_BUF_EPOCH    = 0x304  # staged: grant epoch (NO_EXPIRY = never)
 VX_DCR_CHECKER_BUF_COMMIT   = 0x305  # write installs the staged claim
 VX_DCR_CHECKER_EPOCH        = 0x306  # set staged owner's epoch (the revoke)
-VX_DCR_CHECKER_BUF_SHARED   = 0x307  # staged: non-owner perms (grant to others)
+VX_DCR_CHECKER_BUF_SHARED   = 0x307  # staged: grant perms (R, W, X) for BUF_GRANTEE
 VX_DCR_CHECKER_REVOKE_OWNER = 0x308  # stage whose epoch the next EPOCH write bumps
-VX_DCR_CHECKER_BUF_JOINT    = 0x309  # staged: co-owner bitmask (taint PoC, SimX only)
-VX_DCR_CHECKER_BUF_CONFINED = 0x30A  # staged: shared grant is confined (taint PoC, SimX only)
-VX_DCR_CHECKER_BUF_LEAVE    = 0x30B  # owner (value) leaves the staged range (taint PoC, SimX only)
+VX_DCR_CHECKER_BUF_JOINT    = 0x309  # staged: co-owner bitmask; owners = {OWNER} | JOINT
+VX_DCR_CHECKER_BUF_CONFINED = 0x30A  # staged: the grant is confined (readers are tainted)
+VX_DCR_CHECKER_BUF_LEAVE    = 0x30B  # owner (value) leaves the staged range; must be the issuer
+VX_DCR_CHECKER_BUF_GRANTEE  = 0x30C  # staged: the one tenant a grant is for (header v2)
 VX_DCR_CHECKER_STATE_END    = 0x340
 
 # Checker policy constants.
 [checker_const]
 VX_CHECKER_PERM_R         = 0x1
 VX_CHECKER_PERM_W         = 0x2
-# Wildcard owner: any tenant may access, subject to perms. The boot default for
-# every granule, so unclaimed memory (kernel code, stacks, launch args) is
-# system/shared. OWNER_ANY headers are never epoch-gated.
+VX_CHECKER_PERM_X         = 0x4  # fetch (header v2, T9)
+# Header v2 has no wildcard owner: unclaimed memory is the empty owner set,
+# governed by the default perms. OWNER_ANY survives only as an owner value no
+# tenant is, so a claim naming it is refused (it names someone other than the
+# issuer).
 VX_CHECKER_OWNER_ANY      = 0xFFFFFFFF
 # A grant with no expiry. Distinct from epoch 0, which a single revocation ends.
 VX_CHECKER_GRANT_NO_EXPIRY = 0xFFFFFFFF

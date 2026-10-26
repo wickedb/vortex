@@ -233,6 +233,10 @@ module VX_fetch import VX_gpu_pkg::*; #(
     always @(*) begin
         icache_req_attr       = '0;
         icache_req_attr.owner = MEM_OWNER_WIDTH'(CORE_ID);
+    `ifdef VX_CFG_CHECKER_ENABLE
+        // A fetch needs X, not R (header v2, T9).
+        icache_req_attr.is_fetch = 1'b1;
+    `endif
     end
     assign icache_bus_if.req_data.attr   = icache_req_attr;
     assign icache_bus_if.req_data.rw     = 1'b0;

@@ -59,15 +59,20 @@ static void dcr(uint32_t addr, uint32_t data, uint32_t issuer) {
   tick();
 }
 
-// Stage a claim from `issuer` without committing it.
+// Stage a claim from `issuer` without committing it. Header v2: a grant names
+// its grantee, by default the other of tenants 0 and 1; `joint` adds
+// co-owners.
 static void stage(uint64_t base, uint64_t size, uint32_t owner, uint32_t perms,
-                  uint32_t shared, uint32_t epoch, uint32_t issuer) {
-  dcr(VX_DCR_CHECKER_BUF_BASE,   (uint32_t)base, issuer);
-  dcr(VX_DCR_CHECKER_BUF_SIZE,   (uint32_t)size, issuer);
-  dcr(VX_DCR_CHECKER_BUF_OWNER,  owner,          issuer);
-  dcr(VX_DCR_CHECKER_BUF_PERMS,  perms,          issuer);
-  dcr(VX_DCR_CHECKER_BUF_SHARED, shared,         issuer);
-  dcr(VX_DCR_CHECKER_BUF_EPOCH,  epoch,          issuer);
+                  uint32_t shared, uint32_t epoch, uint32_t issuer,
+                  int grantee = -1, uint32_t joint = 0) {
+  dcr(VX_DCR_CHECKER_BUF_BASE,    (uint32_t)base, issuer);
+  dcr(VX_DCR_CHECKER_BUF_SIZE,    (uint32_t)size, issuer);
+  dcr(VX_DCR_CHECKER_BUF_OWNER,   owner,          issuer);
+  dcr(VX_DCR_CHECKER_BUF_PERMS,   perms,          issuer);
+  dcr(VX_DCR_CHECKER_BUF_SHARED,  shared,         issuer);
+  dcr(VX_DCR_CHECKER_BUF_EPOCH,   epoch,          issuer);
+  dcr(VX_DCR_CHECKER_BUF_GRANTEE, (grantee < 0) ? (owner ^ 1u) : uint32_t(grantee), issuer);
+  dcr(VX_DCR_CHECKER_BUF_JOINT,   joint,          issuer);
 }
 
 static void commit(uint32_t issuer) {
@@ -81,10 +86,20 @@ static void commit(uint32_t issuer) {
 // own queue unless `issuer` says otherwise.
 static void claim(uint64_t base, uint64_t size, uint32_t owner,
                   uint32_t perms, uint32_t shared, uint32_t epoch,
-                  int issuer = -1) {
+                  int issuer = -1, int grantee = -1, uint32_t joint = 0) {
   const uint32_t iss = (issuer < 0) ? owner : uint32_t(issuer);
-  stage(base, size, owner, perms, shared, epoch, iss);
+  stage(base, size, owner, perms, shared, epoch, iss, grantee, joint);
   commit(iss);
+}
+
+// Release (S2): `eid` leaves the range, written from queue `issuer`.
+static void leave(uint64_t base, uint64_t size, uint32_t eid, int issuer = -1) {
+  const uint32_t iss = (issuer < 0) ? eid : uint32_t(issuer);
+  dcr(VX_DCR_CHECKER_BUF_BASE,  (uint32_t)base, iss);
+  dcr(VX_DCR_CHECKER_BUF_SIZE,  (uint32_t)size, iss);
+  dcr(VX_DCR_CHECKER_BUF_LEAVE, eid,            iss);
+  for (int i = 0; i < 64 && sim->req_ready == 0; ++i) tick();
+  tick(4);
 }
 
 // The scoped revoke: one EPOCH write from the owner's queue. No header is
@@ -96,16 +111,13 @@ static void revoke(uint32_t owner, uint32_t new_epoch, int issuer = -1) {
   tick(2);
 }
 
-// A requester that is no owner: a CP queue whose index names no core (D7).
-static constexpr uint32_t ANON = 0xffffffffu;
-
 // Present one request and hold it until the checker accepts it.
-static void accept(uint64_t addr, bool is_write, uint32_t owner) {
+static void accept(uint64_t addr, bool is_write, uint32_t owner, bool fetch = false) {
   sim->req_valid = 1;
   sim->req_rw    = is_write ? 1 : 0;
   sim->req_addr  = (uint32_t)addr;
-  sim->req_owner = (owner == ANON) ? 0 : owner;
-  sim->req_owner_valid = (owner == ANON) ? 0 : 1;
+  sim->req_owner = owner;
+  sim->req_fetch = fetch ? 1 : 0;
   int guard = 0;
   while (!sim->req_ready && guard++ < 128) tick();
   tick();
@@ -127,9 +139,9 @@ static bool verdict() {
 }
 
 // Drive one request through and return whether it was denied.
-static bool access(uint64_t addr, bool is_write, uint32_t owner) {
+static bool access(uint64_t addr, bool is_write, uint32_t owner, bool fetch = false) {
   sim->out_ready = 1;
-  accept(addr, is_write, owner);
+  accept(addr, is_write, owner, fetch);
   sim->req_valid = 0;
   return verdict();
 }
@@ -187,15 +199,16 @@ int main(int argc, char** argv) {
   revoke(0, 2);                                     // bump owner 0 again
   expect(!access(B, false, 0), "owner 0's revoke did NOT touch owner 1's grant");
 
-  // ---- 8. an EPOCH write from a queue that is no owner is a no-op (fails
-  //      closed). REVOKE_OWNER is retired: naming owner 1 there changes nothing.
+  // ---- 8. an EPOCH write from another tenant's queue advances only that
+  //      tenant's epoch. REVOKE_OWNER is retired: naming owner 1 there changes
+  //      nothing.
   {
     const uint32_t bumps = sim->cnt_epoch_bumps;
     dcr(VX_DCR_CHECKER_REVOKE_OWNER, /*owner*/1, /*issuer*/3);
     dcr(VX_DCR_CHECKER_EPOCH, 99, /*issuer*/3);
     tick(2);
-    expect(sim->cnt_epoch_bumps == bumps, "EPOCH from a non-owner queue bumps nothing");
-    expect(!access(B, false, 0), "EPOCH from a non-owner queue is a no-op, grant intact");
+    expect(sim->cnt_epoch_bumps == bumps + 1, "EPOCH from tenant 3 bumps tenant 3's own epoch");
+    expect(!access(B, false, 0), "tenant 3's EPOCH leaves owner 1's grant intact");
   }
 
   // ---- 9. granule exclusivity: a cross-owner claim is refused WHOLE (§10 #4a)
@@ -311,11 +324,17 @@ int main(int argc, char** argv) {
     claim(G, GRANULE, VX_CHECKER_OWNER_ANY, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/0);
     expect(sim->cnt_foreign == foreign0 + 2, "auth: an OWNER_ANY claim is foreign");
 
-    // A3. An issuer that names no core (2-core build: owners 0 and 1) cannot
-    //     claim, even for itself: its id would truncate onto another owner's.
-    claim(G, GRANULE, /*owner*/3, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/3);
-    expect(sim->cnt_foreign == foreign0 + 3, "auth: an issuer with no core cannot claim");
-    expect(!access(G, false, 1), "auth: G stayed unclaimed");
+    // A3. Header v2: tenants are not cores. Tenant 3 (no core in a 2-core
+    //     build) claims for itself, and its id does not truncate onto
+    //     another owner's.
+    {
+      const uint64_t G3 = 72 * GRANULE;
+      claim(G3, GRANULE, /*owner*/3, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, /*issuer*/3);
+      expect(sim->cnt_foreign == foreign0 + 2, "auth: tenant 3's own claim is not foreign");
+      expect(!access(G3, false, 3), "auth: tenant 3 reads its own G3");
+      expect(access(G3, false, 1),  "auth: tenant 1 denied tenant 3's G3");
+      expect(!access(G, false, 1),  "auth: G stayed unclaimed");
+    }
 
     // A4. Staging is per issuer: owner 1 stages and commits H between owner
     //     0's staging of G and owner 0's commit.
@@ -359,35 +378,97 @@ int main(int argc, char** argv) {
     expect(access(F, false, 1),  "auth: owner 0 revokes its own grant");
   }
 
-  // ---- D7: a requester that is no owner (a CP queue naming no core) ----
-  // It reaches the checker as req_owner_valid=0. With owner 0's index on
-  // req_owner it must still be nobody: no owner perms, only OWNER_ANY or the
-  // grant.
+  // ---- D7: a tenant that has claimed nothing owns nothing ----
+  // A CP queue reaches the checker as its tenant id. Tenant 2 has no core in
+  // a 2-core build; it must not truncate onto owner 0's id.
   {
     const uint32_t RW = VX_CHECKER_PERM_R | VX_CHECKER_PERM_W;
     const uint64_t L = 60 * GRANULE;   // owner 0's, private
-    const uint64_t M = 64 * GRANULE;   // owner 0's, granted R
-    const uint64_t N = 68 * GRANULE;   // unclaimed (boot default OWNER_ANY)
+    const uint64_t M = 64 * GRANULE;   // owner 0's, granted R to tenant 1
+    const uint64_t N = 68 * GRANULE;   // unclaimed
     claim(L, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY);
     claim(M, GRANULE, 0, RW, VX_CHECKER_PERM_R, VX_CHECKER_GRANT_NO_EXPIRY);
-    expect(!access(L, false, 0),   "anon: owner 0 reads its own L (control)");
-    expect(access(L, false, ANON), "anon: no-owner requester DENIED owner 0's L read");
-    expect(access(L, true,  ANON), "anon: no-owner requester DENIED owner 0's L write");
-    expect(!access(M, false, ANON), "anon: no-owner requester holds the grant on M (read)");
-    expect(access(M, true,  ANON), "anon: the grant is read-only for it too");
-    expect(!access(N, false, ANON) && !access(N, true, ANON),
-           "anon: unclaimed memory follows the boot default");
+    expect(!access(L, false, 0), "t2: owner 0 reads its own L (control)");
+    expect(access(L, false, 2),  "t2: tenant 2 DENIED owner 0's L read");
+    expect(access(L, true,  2),  "t2: tenant 2 DENIED owner 0's L write");
+    expect(!access(M, false, 1), "t2: tenant 1 holds the grant on M");
+    expect(access(M, false, 2),  "t2: the grant names tenant 1, not tenant 2");
+    expect(!access(N, false, 2) && !access(N, true, 2),
+           "t2: unclaimed memory follows the default perms");
+  }
+
+  // ---- Header v2 (T2, T6, T9, S1, S2, S4) ----
+  {
+    const uint32_t RW  = VX_CHECKER_PERM_R | VX_CHECKER_PERM_W;
+    const uint32_t RWX = RW | VX_CHECKER_PERM_X;
+    const uint64_t P = 76 * GRANULE;   // owner 0, RW: data, not code
+    const uint64_t Q = 80 * GRANULE;   // owner 0, RWX
+    const uint64_t J = 84 * GRANULE;   // joint {0, 1}
+    const uint64_t K = 88 * GRANULE;   // owner 0 alone
+    const uint64_t T = 92 * GRANULE;   // owner 0, R granted to tenant 2
+
+    // V1. X: a fetch needs X. Unclaimed memory is fetchable (default perms).
+    claim(P, GRANULE, 0, RW,  0, VX_CHECKER_GRANT_NO_EXPIRY);
+    claim(Q, GRANULE, 0, RWX, 0, VX_CHECKER_GRANT_NO_EXPIRY);
+    expect(access(P, false, 0, /*fetch*/true),  "v2: owner's fetch from an RW granule DENIED");
+    expect(!access(P, false, 0),                "v2: owner's read of the same granule allowed");
+    expect(!access(Q, false, 0, /*fetch*/true), "v2: owner's fetch from an RWX granule allowed");
+    expect(!access(68 * GRANULE, false, 1, /*fetch*/true), "v2: fetch from unclaimed memory allowed");
+
+    // V2. A joint claim: both owners have the owner perms, nobody else does.
+    const uint32_t rej0 = sim->cnt_rejected;
+    claim(J, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, -1, -1, /*joint*/0x2);
+    expect(!access(J, false, 0) && !access(J, true, 0), "v2: joint owner 0 reads and writes J");
+    expect(!access(J, false, 1) && !access(J, true, 1), "v2: joint owner 1 reads and writes J");
+    expect(access(J, false, 2), "v2: tenant 2 DENIED the joint granule");
+
+    // V3. S4: a joint claim carries no grant; refused whole.
+    claim(96 * GRANULE, GRANULE, 0, RW, VX_CHECKER_PERM_R, VX_CHECKER_GRANT_NO_EXPIRY, -1, 2, 0x2);
+    expect(sim->cnt_rejected == rej0 + 1, "v2: a grant on a joint claim is refused");
+    expect(!access(96 * GRANULE, true, 2), "v2: ...and the granule stayed unclaimed");
+
+    // V4. T6: no re-claim changes an owner set. Owner 0 re-claiming J alone
+    //     would drop owner 1; owner 0 adding owner 1 to K would add one.
+    claim(J, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY);
+    expect(sim->cnt_rejected == rej0 + 2, "v2: re-claim of a joint granule refused");
+    expect(!access(J, false, 1), "v2: owner 1 still co-owns J");
+    claim(K, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY);
+    claim(K, GRANULE, 0, RW, 0, VX_CHECKER_GRANT_NO_EXPIRY, -1, -1, 0x2);
+    expect(sim->cnt_rejected == rej0 + 3, "v2: re-claim adding a co-owner refused");
+    expect(access(K, false, 1), "v2: K stayed owner 0's alone");
+
+    // V5. S2: only an owner removes itself, and one owner must remain.
+    const uint32_t lv0 = sim->cnt_leaves, lr0 = sim->cnt_leaves_refused;
+    leave(J, GRANULE, /*eid*/0, /*issuer*/1);
+    expect(sim->cnt_leaves_refused == lr0 + 1, "v2: a leave naming another tenant refused");
+    expect(!access(J, false, 0), "v2: ...owner 0 still owns J");
+    leave(J, GRANULE, /*eid*/0);
+    expect(sim->cnt_leaves == lv0 + 1, "v2: owner 0 leaves J");
+    expect(access(J, false, 0),  "v2: after leaving, owner 0 DENIED J");
+    expect(!access(J, true, 1),  "v2: owner 1 keeps J");
+    leave(J, GRANULE, /*eid*/1);
+    expect(sim->cnt_leaves_refused == lr0 + 2, "v2: the last owner cannot leave");
+    expect(!access(J, false, 1), "v2: ...owner 1 still owns J");
+    leave(K, GRANULE, /*eid*/1);
+    expect(sim->cnt_leaves_refused == lr0 + 3, "v2: a non-owner cannot leave");
+
+    // V6. A grant names its grantee.
+    claim(T, GRANULE, 0, RW, VX_CHECKER_PERM_R, VX_CHECKER_GRANT_NO_EXPIRY, -1, /*grantee*/2);
+    expect(!access(T, false, 2), "v2: grantee 2 reads T");
+    expect(access(T, true, 2),   "v2: the grant is read-only");
+    expect(access(T, false, 1),  "v2: tenant 1, not the grantee, DENIED");
   }
 
   std::printf("\ncounters: reqs=%u checked=%u bypassed=%u allow=%u deny=%u\n",
               (unsigned)sim->cnt_reqs, (unsigned)sim->cnt_checked,
               (unsigned)sim->cnt_bypassed, (unsigned)sim->cnt_allows,
               (unsigned)sim->cnt_denies);
-  std::printf("setup   : claims=%u written=%u bumps=%u rejected=%u aliased=%u reclaimed=%u foreign=%u\n",
+  std::printf("setup   : claims=%u written=%u bumps=%u rejected=%u aliased=%u reclaimed=%u foreign=%u leaves=%u/%u refused\n",
               (unsigned)sim->cnt_claims, (unsigned)sim->cnt_headers_written,
               (unsigned)sim->cnt_epoch_bumps, (unsigned)sim->cnt_rejected,
               (unsigned)sim->cnt_aliased, (unsigned)sim->cnt_reclaimed,
-              (unsigned)sim->cnt_foreign);
+              (unsigned)sim->cnt_foreign, (unsigned)sim->cnt_leaves,
+              (unsigned)sim->cnt_leaves_refused);
 
   if (errors) {
     std::printf("\n%d/%d checks FAILED\n", errors, checks);
