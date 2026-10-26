@@ -474,6 +474,16 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
 
     if (C_M_AXI_MEM_NUM_BANKS == 1) begin : g_single_port
 
+    `ifdef VX_CFG_CHECKER_ENABLE
+        // D7: the CP's device beats reach DRAM here through VX_mm_axi_arb, on
+        // no path the checker sees. Refused until that path is adapted. An
+        // elaboration-time $fatal, so synthesis refuses it too (STATIC_ASSERT
+        // is a simulation-time check and empty in synthesis).
+        if (1) begin : g_d7_refuse
+            $fatal(1, "VX_CFG_CHECKER_ENABLE: the single-bank AFU path has no checker on the CP's device path (D7); use PLATFORM_MEMORY_NUM_BANKS > 1");
+        end
+    `endif
+
         // ---- Vortex's AXI port, ahead of the arbiter ----
         wire                              vx_awvalid_a [C_M_AXI_MEM_NUM_BANKS];
         wire                              vx_awready_a [C_M_AXI_MEM_NUM_BANKS];
@@ -829,8 +839,17 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
         // like Vortex's own. They enter the fabric unchanged and
         // PLATFORM_MEMORY_OFFSET is applied once, at the bank port, for both
         // masters.
+        wire                            cp_mem_req_valid;
+        wire                            cp_mem_req_rw;
         wire [CP_LINE_ADDRW-1:0]        cp_mem_req_addr;
+        wire [C_M_AXI_MEM_DATA_WIDTH-1:0] cp_mem_req_data;
+        wire [FAB_DATA_SIZE-1:0]        cp_mem_req_byteen;
         wire [`VX_CP_AXI_TID_WIDTH-1:0] cp_mem_req_tag;
+        wire                            cp_mem_req_ready;
+        wire                            cp_mem_rsp_valid;
+        wire [C_M_AXI_MEM_DATA_WIDTH-1:0] cp_mem_rsp_data;
+        wire [`VX_CP_AXI_TID_WIDTH-1:0] cp_mem_rsp_tag;
+        wire                            cp_mem_rsp_ready;
 
         VX_membus_from_axi #(
             .ADDR_W (64),
@@ -840,22 +859,128 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .clk            (clk),
             .reset          (subsys_reset),
             .axi_s          (cp_axi_dev),
-            .mem_req_valid  (fab_req_valid[FAB_CP_PORT]),
-            .mem_req_rw     (fab_req_rw[FAB_CP_PORT]),
+            .mem_req_valid  (cp_mem_req_valid),
+            .mem_req_rw     (cp_mem_req_rw),
             .mem_req_addr   (cp_mem_req_addr),
-            .mem_req_data   (fab_req_data[FAB_CP_PORT]),
-            .mem_req_byteen (fab_req_byteen[FAB_CP_PORT]),
+            .mem_req_data   (cp_mem_req_data),
+            .mem_req_byteen (cp_mem_req_byteen),
             .mem_req_tag    (cp_mem_req_tag),
-            .mem_req_ready  (fab_req_ready[FAB_CP_PORT]),
-            .mem_rsp_valid  (fab_rsp_valid[FAB_CP_PORT]),
-            .mem_rsp_data   (fab_rsp_data[FAB_CP_PORT]),
-            .mem_rsp_tag    (fab_rsp_tag[FAB_CP_PORT][`VX_CP_AXI_TID_WIDTH-1:0]),
-            .mem_rsp_ready  (fab_rsp_ready[FAB_CP_PORT])
+            .mem_req_ready  (cp_mem_req_ready),
+            .mem_rsp_valid  (cp_mem_rsp_valid),
+            .mem_rsp_data   (cp_mem_rsp_data),
+            .mem_rsp_tag    (cp_mem_rsp_tag),
+            .mem_rsp_ready  (cp_mem_rsp_ready)
         );
+
+    `ifdef VX_CFG_CHECKER_ENABLE
+        // ---- D7: the checker on the CP's device path ----
+        // A dedicated VX_mem_checker judges every upload, download, copy and
+        // event beat the command processor sends to device memory, with the
+        // same predicate as the GPU's port checkers. It observes the same DCR
+        // stream as they do (tapped beside Vortex's port, same issuer), so its
+        // header store and epoch table are a copy kept by construction, not by
+        // a coherence protocol. These beats bypass the GPU's caches, so there
+        // is no labeled level above it: LABEL_MODE=0 judges each request.
+        //
+        // The requester is the CP queue that issued the beat: VX_cp_core
+        // stamps it into the low AXI ID bits and the bridge carries the ID
+        // into the tag. A queue whose index names no core owns nothing.
+        localparam CP_CHK_ASHIFT = `CLOG2(FAB_DATA_SIZE);
+        wire [VX_DCR_ISSUER_WIDTH-1:0] cp_req_issuer = cp_mem_req_tag[VX_DCR_ISSUER_WIDTH-1:0];
+        wire cp_req_is_owner = (32'(cp_req_issuer) < 32'(1 << MEM_OWNER_WIDTH));
+        `STATIC_ASSERT(VX_DCR_ISSUER_WIDTH < `VX_CP_AXI_TID_WIDTH, ("CP device AXI ID cannot carry the issuing queue"))
+
+        VX_dcr_bus_if cp_chk_dcr_if();
+        VX_dcr_bus_if cp_chk_dcr_out_if();
+        assign cp_chk_dcr_if.req_valid      = dcr_req_valid;
+        assign cp_chk_dcr_if.req_data.rw    = dcr_req_rw;
+        assign cp_chk_dcr_if.req_data.addr  = dcr_req_addr;
+        assign cp_chk_dcr_if.req_data.data  = dcr_req_data;
+        // Vortex's DCR port answers reads; this copy only observes.
+        assign cp_chk_dcr_out_if.rsp_valid  = 1'b0;
+        assign cp_chk_dcr_out_if.rsp_data   = '0;
+        `UNUSED_VAR (cp_chk_dcr_if.rsp_valid)
+        `UNUSED_VAR (cp_chk_dcr_if.rsp_data)
+        `UNUSED_VAR (cp_chk_dcr_out_if.req_valid)
+        `UNUSED_VAR (cp_chk_dcr_out_if.req_data)
+
+        wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] cp_chk_out_addr;
+        wire [`VX_CP_AXI_TID_WIDTH-1:0]   cp_chk_out_tag;
+        wire cp_chk_out_deny, cp_chk_out_fault;
+        `UNUSED_VAR ({cp_chk_out_deny, cp_chk_out_fault})
+        `UNUSED_VAR (cp_chk_out_addr[CP_CHK_ASHIFT-1:0])
+
+        VX_mem_checker #(
+            .INSTANCE_ID ("cp_checker"),
+            .DATA_SIZE   (FAB_DATA_SIZE),
+            .TAG_WIDTH   (`VX_CP_AXI_TID_WIDTH),
+            // The bridge has one read outstanding.
+            .FAULT_DEPTH (2),
+            .LABEL_MODE  (0),
+            .LABEL_IDX_W (1)
+        ) cp_checker (
+            .clk            (clk),
+            .reset          (subsys_reset),
+            .dcr_bus_if     (cp_chk_dcr_if),
+            .dcr_bus_out_if (cp_chk_dcr_out_if),
+            .dcr_issuer     (dcr_req_issuer),
+            .req_valid      (cp_mem_req_valid),
+            .req_rw         (cp_mem_req_rw),
+            .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(cp_mem_req_addr) << CP_CHK_ASHIFT),
+            .req_owner      (MEM_OWNER_WIDTH'(cp_req_issuer)),
+            .req_owner_valid(cp_req_is_owner),
+            .req_tag        (cp_mem_req_tag),
+            .req_data       (cp_mem_req_data),
+            .req_byteen     (cp_mem_req_byteen),
+            .req_ready      (cp_mem_req_ready),
+            .out_valid      (fab_req_valid[FAB_CP_PORT]),
+            .out_rw         (fab_req_rw[FAB_CP_PORT]),
+            .out_addr       (cp_chk_out_addr),
+            .out_data       (fab_req_data[FAB_CP_PORT]),
+            .out_byteen     (fab_req_byteen[FAB_CP_PORT]),
+            .out_tag        (cp_chk_out_tag),
+            .out_deny       (cp_chk_out_deny),
+            .out_fault      (cp_chk_out_fault),
+            .out_ready      (fab_req_ready[FAB_CP_PORT]),
+            .dram_rsp_valid (fab_rsp_valid[FAB_CP_PORT]),
+            .dram_rsp_data  (fab_rsp_data[FAB_CP_PORT]),
+            .dram_rsp_tag   (fab_rsp_tag[FAB_CP_PORT][`VX_CP_AXI_TID_WIDTH-1:0]),
+            .dram_rsp_ready (fab_rsp_ready[FAB_CP_PORT]),
+            .rsp_valid      (cp_mem_rsp_valid),
+            .rsp_data       (cp_mem_rsp_data),
+            .rsp_tag        (cp_mem_rsp_tag),
+            `UNUSED_PIN (rsp_label),
+            .rsp_ready      (cp_mem_rsp_ready),
+            `UNUSED_PIN (epochs_out),
+            `UNUSED_PIN (fault_overflow),
+            `UNUSED_PIN (cnt_reqs),    `UNUSED_PIN (cnt_checked),
+            `UNUSED_PIN (cnt_bypassed),`UNUSED_PIN (cnt_allows),
+            `UNUSED_PIN (cnt_denies),
+            `UNUSED_PIN (cnt_faulted_reads), `UNUSED_PIN (cnt_dropped_writes),
+            `UNUSED_PIN (cnt_claims),
+            `UNUSED_PIN (cnt_headers_written), `UNUSED_PIN (cnt_epoch_bumps),
+            `UNUSED_PIN (cnt_rejected),`UNUSED_PIN (cnt_aliased),
+            `UNUSED_PIN (cnt_reclaimed), `UNUSED_PIN (cnt_foreign)
+        );
+
+        assign fab_req_addr[FAB_CP_PORT] = cp_chk_out_addr[`VX_CFG_MEM_ADDR_WIDTH-1:CP_CHK_ASHIFT];
+        assign fab_req_tag[FAB_CP_PORT]  = FAB_TAG_WIDTH'(cp_chk_out_tag);
+        `UNUSED_VAR (cp_mem_req_addr)
+    `else
+        assign fab_req_valid[FAB_CP_PORT]  = cp_mem_req_valid;
+        assign fab_req_rw[FAB_CP_PORT]     = cp_mem_req_rw;
+        assign fab_req_data[FAB_CP_PORT]   = cp_mem_req_data;
+        assign fab_req_byteen[FAB_CP_PORT] = cp_mem_req_byteen;
+        assign cp_mem_req_ready            = fab_req_ready[FAB_CP_PORT];
+        assign cp_mem_rsp_valid            = fab_rsp_valid[FAB_CP_PORT];
+        assign cp_mem_rsp_data             = fab_rsp_data[FAB_CP_PORT];
+        assign cp_mem_rsp_tag              = fab_rsp_tag[FAB_CP_PORT][`VX_CP_AXI_TID_WIDTH-1:0];
+        assign fab_rsp_ready[FAB_CP_PORT]  = cp_mem_rsp_ready;
 
         assign fab_req_addr[FAB_CP_PORT] = cp_mem_req_addr[VX_MEM_ADDR_A_WIDTH-1:0];
         assign fab_req_tag[FAB_CP_PORT]  = FAB_TAG_WIDTH'(cp_mem_req_tag);
         `UNUSED_VAR (cp_mem_req_addr[CP_LINE_ADDRW-1:VX_MEM_ADDR_A_WIDTH])
+    `endif
         `UNUSED_VAR (fab_rsp_tag[FAB_CP_PORT])
 
         // The optional AXI4 sideband signals (size/burst) are unused by the

@@ -193,6 +193,24 @@ package VX_sec_pkg;
     );
         return chk_authorize_label(chk_label_of(hdr), requester, is_write, owner_epoch);
     endfunction
+
+    // The same predicate for a requester that is no owner at all: a command-
+    // processor queue whose index names no core (D7). It owns nothing, so it
+    // gets OWNER_ANY's perms or the grant, never an owner's perms. Truncating
+    // its index onto CHK_OWNER_W bits instead would make it another tenant.
+    function automatic logic chk_authorize_anon(
+        input chk_header_t            hdr,
+        input logic                   is_write,
+        input logic [CHK_EPOCH_W-1:0] owner_epoch
+    );
+        logic [1:0] need;
+        need = is_write ? CHK_PERM_W : CHK_PERM_R;
+        if (hdr.owner_any) begin
+            return |(hdr.perms & need);
+        end else begin
+            return (|(hdr.shared_perms & need)) && (owner_epoch <= hdr.grant_epoch);
+        end
+    endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 
 endpackage

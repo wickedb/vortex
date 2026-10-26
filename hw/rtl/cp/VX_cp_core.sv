@@ -43,10 +43,10 @@
 
 // Connect a VX_mem_axi_if `src` (master) to a `slot` of an xbar's `src`
 // array (the xbar drives that array as an AXI slave).
-`define CP_AXI_LINK(slot, src)            \
+`define CP_AXI_LINK_ID(slot, src, awid_v, arid_v) \
   assign slot.awvalid = src.awvalid;      \
   assign slot.awaddr  = src.awaddr;       \
-  assign slot.awid    = src.awid;         \
+  assign slot.awid    = awid_v;           \
   assign slot.awlen   = src.awlen;        \
   assign slot.awsize  = src.awsize;       \
   assign slot.awburst = src.awburst;      \
@@ -62,7 +62,7 @@
   assign slot.bready  = src.bready;       \
   assign slot.arvalid = src.arvalid;      \
   assign slot.araddr  = src.araddr;       \
-  assign slot.arid    = src.arid;         \
+  assign slot.arid    = arid_v;           \
   assign slot.arlen   = src.arlen;        \
   assign slot.arsize  = src.arsize;       \
   assign slot.arburst = src.arburst;      \
@@ -73,6 +73,8 @@
   assign src.rlast    = slot.rlast;       \
   assign src.rresp    = slot.rresp;       \
   assign slot.rready  = src.rready
+
+`define CP_AXI_LINK(slot, src) `CP_AXI_LINK_ID(slot, src, src.awid, src.arid)
 
 module VX_cp_core
   import VX_cp_pkg::*;
@@ -351,17 +353,32 @@ module VX_cp_core
   localparam int QW = (NUM_QUEUES > 1) ? $clog2(NUM_QUEUES) : 1;
   logic any_kmu_grant, any_dma_grant, any_dcr_grant, any_event_grant;
   cmd_t granted_kmu_cmd, granted_dma_cmd, granted_dcr_cmd, granted_event_cmd;
-  logic [QW-1:0] granted_kmu_q, granted_dcr_q;
+  logic [QW-1:0] granted_kmu_q, granted_dcr_q, granted_dma_q, granted_event_q;
   always_comb begin
     any_kmu_grant = 1'b0; granted_kmu_cmd = '0; granted_kmu_q = '0;
-    any_dma_grant = 1'b0; granted_dma_cmd = '0;
+    any_dma_grant = 1'b0; granted_dma_cmd = '0; granted_dma_q = '0;
     any_dcr_grant = 1'b0; granted_dcr_cmd = '0; granted_dcr_q = '0;
-    any_event_grant = 1'b0; granted_event_cmd = '0;
+    any_event_grant = 1'b0; granted_event_cmd = '0; granted_event_q = '0;
     for (int i = 0; i < NUM_QUEUES; ++i) begin
       if (kmu_grant[i])   begin any_kmu_grant   = 1'b1; granted_kmu_cmd   = kmu_cmd[i]; granted_kmu_q = QW'(i); end
-      if (dma_grant[i])   begin any_dma_grant   = 1'b1; granted_dma_cmd   = dma_cmd[i];   end
+      if (dma_grant[i])   begin any_dma_grant   = 1'b1; granted_dma_cmd   = dma_cmd[i]; granted_dma_q = QW'(i); end
       if (dcr_grant[i])   begin any_dcr_grant   = 1'b1; granted_dcr_cmd   = dcr_cmd[i]; granted_dcr_q = QW'(i); end
-      if (event_grant[i]) begin any_event_grant = 1'b1; granted_event_cmd = event_cmd[i]; end
+      if (event_grant[i]) begin any_event_grant = 1'b1; granted_event_cmd = event_cmd[i]; granted_event_q = QW'(i); end
+    end
+  end
+
+  // The queue each device-side master is working for (D7): latched at the
+  // grant, which the bid gate only gives an idle unit, and held until its next
+  // grant. A unit retires a command only after its last device beat has
+  // answered (R data, or B), so no beat outlives the queue it was issued for.
+  logic [QW-1:0] dma_q_r, event_q_r;
+  always_ff @(posedge clk) begin
+    if (reset) begin
+      dma_q_r   <= '0;
+      event_q_r <= '0;
+    end else begin
+      if (any_dma_grant)   dma_q_r   <= granted_dma_q;
+      if (any_event_grant) event_q_r <= granted_event_q;
     end
   end
 
@@ -572,8 +589,19 @@ module VX_cp_core
   VX_mem_axi_if #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .ID_W(ID_W))
                        xbar_dev_src [N_SRC_DEV] ();
 
-  `CP_AXI_LINK(xbar_dev_src[SLOT_DMA_DEV], dma_dev_axi);
-  `CP_AXI_LINK(xbar_dev_src[SLOT_EVENT],   event_axi);
+  // Every device-side beat carries its queue in the low ID bits (D7). The
+  // xbar prefixes the source slot above them and the AFU's AXI-to-membus
+  // bridge carries the ID into the request tag unchanged, so the checker on
+  // the CP's device path reads the issuer off each request's tag -- the same
+  // queue = tenant identity the DCR path carries on dcr_req_issuer. DMA and
+  // event units keep running concurrently: nothing is shared but the stamp.
+  `STATIC_ASSERT(QW + $clog2(N_SRC_DEV) <= ID_W, ("CP device AXI ID too narrow for the queue index and the xbar source"))
+  `CP_AXI_LINK_ID(xbar_dev_src[SLOT_DMA_DEV], dma_dev_axi, ID_W'(dma_q_r),   ID_W'(dma_q_r));
+  `CP_AXI_LINK_ID(xbar_dev_src[SLOT_EVENT],   event_axi,   ID_W'(event_q_r), ID_W'(event_q_r));
+  `UNUSED_VAR (dma_dev_axi.awid)
+  `UNUSED_VAR (dma_dev_axi.arid)
+  `UNUSED_VAR (event_axi.awid)
+  `UNUSED_VAR (event_axi.arid)
 
   // Register slice on the path to device memory (memory subsystem).
   VX_mem_axi_if #(

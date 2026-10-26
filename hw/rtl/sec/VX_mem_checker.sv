@@ -72,6 +72,9 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      req_rw,
     input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] req_addr,
     input  wire [CHK_OWNER_W-1:0]    req_owner,   // R2 moves this onto the bus
+    // Low when the requester is no owner (a CP queue that names no core, D7):
+    // req_owner is then ignored and only OWNER_ANY perms or a grant apply.
+    input  wire                      req_owner_valid,
     // Payload the checker does not inspect but MUST carry: it pipelines the
     // request through S1, so emitting these straight from the bus input would
     // pair one request's address with the next request's data. That corrupts
@@ -230,6 +233,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg                      s1_valid, s1_rw, s1_bypass;
     reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] s1_addr;
     reg [CHK_OWNER_W-1:0]    s1_owner;
+    reg                      s1_owner_valid;
     reg [TAG_WIDTH-1:0]      s1_tag;
     reg [DATA_SIZE*8-1:0]    s1_data;
     reg [DATA_SIZE-1:0]      s1_byteen;
@@ -294,6 +298,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             s1_rw     <= req_rw;
             s1_addr   <= req_addr;
             s1_owner  <= req_owner;
+            s1_owner_valid <= req_owner_valid;
             s1_bypass <= req_is_io;
             s1_tag    <= req_tag;
             s1_data   <= req_data;
@@ -309,7 +314,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // ---------------------------------------------------------------------
     wire [CHK_EPOCH_W-1:0] owner_epoch = epoch_table[rd_header.owner];
 
-    wire authorized = chk_authorize(rd_header, s1_owner, s1_rw, owner_epoch);
+    wire authorized = s1_owner_valid ? chk_authorize(rd_header, s1_owner, s1_rw, owner_epoch)
+                                     : chk_authorize_anon(rd_header, s1_rw, owner_epoch);
     wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
 
     // Under enforcement a denied request is NOT forwarded to DRAM: a read is

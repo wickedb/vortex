@@ -350,6 +350,15 @@ module vortex_afu import ccip_if_pkg::*; import local_mem_cfg_pkg::*; import VX_
     wire cp_interrupt;
     `UNUSED_VAR (cp_interrupt)
 
+`ifdef VX_CFG_CHECKER_ENABLE
+    // D7: the CP's device beats reach local memory here on no path the checker
+    // sees. Refused until this AFU gets the XRT AFU's CP-path checker.
+    // Elaboration-time, so synthesis refuses it too.
+    if (1) begin : g_d7_refuse
+        $fatal(1, "VX_CFG_CHECKER_ENABLE: the OPAE AFU has no checker on the CP's device path (D7)");
+    end
+`endif
+
     VX_cp_core cp_core (
         .clk        (clk),
         .reset      (subsys_reset),

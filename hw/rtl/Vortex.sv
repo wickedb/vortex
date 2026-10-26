@@ -257,6 +257,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .req_rw         (mem_bus_if[i].req_data.rw),
             .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(mem_bus_if[i].req_data.addr) << CHK_ASHIFT),
             .req_owner      (mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
+            .req_owner_valid(1'b1),
             .req_tag        (mem_bus_if[i].req_data.tag),
             .req_data       (mem_bus_if[i].req_data.data),
             .req_byteen     (mem_bus_if[i].req_data.byteen),
