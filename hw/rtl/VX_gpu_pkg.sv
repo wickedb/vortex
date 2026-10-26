@@ -218,6 +218,10 @@ package VX_gpu_pkg;
     // core id, which the checker static-asserts fits.
 `ifdef VX_CFG_CHECKER_ENABLE
     localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_CHECKER_TENANTS));
+    // The requesting core, beside the tenant: the stack-slice rule (T12)
+    // decides by core, and with VX_CFG_CHECKER_TENANT_FROM_LAUNCH the tenant
+    // no longer is the core.
+    localparam MEM_CORE_WIDTH  = `UP(`CLOG2(`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS));
 `else
     localparam MEM_OWNER_WIDTH = `UP(`CLOG2(`VX_CFG_NUM_CORES * `VX_CFG_NUM_CLUSTERS));
 `endif
@@ -248,8 +252,9 @@ package VX_gpu_pkg;
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
         logic [`VX_CFG_CHECKER_TENANTS-1:0] taint;  // MEM_ATTR_TAINT_OFFS
 `endif
-        logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS
+        logic [MEM_OWNER_WIDTH-1:0]  owner;         // MEM_ATTR_OWNER_OFFS: the tenant
 `ifdef VX_CFG_CHECKER_ENABLE
+        logic [MEM_CORE_WIDTH-1:0]   core;          // MEM_ATTR_CORE_OFFS: the stack-slice rule's requester
         logic                        is_fetch;      // MEM_ATTR_FETCH_OFFS = 4 + AMO_REQ_BITS
 `endif
         amo_req_t                    amo;           // MEM_ATTR_AMO_OFFS   = 4
@@ -272,7 +277,8 @@ package VX_gpu_pkg;
     // Only with the checker, so a baseline build's bus is unchanged.
 `ifdef VX_CFG_CHECKER_ENABLE
     localparam MEM_ATTR_FETCH_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
-    localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_FETCH_OFFS + 1;
+    localparam MEM_ATTR_CORE_OFFS   = MEM_ATTR_FETCH_OFFS + 1;
+    localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_CORE_OFFS + MEM_CORE_WIDTH;
 `else
     localparam MEM_ATTR_OWNER_OFFS  = MEM_ATTR_AMO_OFFS + AMO_REQ_BITS;
 `endif
@@ -283,12 +289,13 @@ package VX_gpu_pkg;
     localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_FETCH_OFFS;
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
     // Confinement by taint: the core's taint, stamped at the socket boundary,
-    // rides above the owner, so the requester slice {taint, owner, is_fetch}
-    // stays contiguous and a replay is judged with the taint it left with.
+    // rides above the owner, so the requester slice {taint, owner, core,
+    // is_fetch} stays contiguous and a replay is judged with the taint it
+    // left with.
     localparam MEM_ATTR_TAINT_OFFS  = MEM_ATTR_OWNER_OFFS + MEM_OWNER_WIDTH;
-    localparam MEM_REQID_WIDTH      = `VX_CFG_CHECKER_TENANTS + MEM_OWNER_WIDTH + 1;
+    localparam MEM_REQID_WIDTH      = `VX_CFG_CHECKER_TENANTS + MEM_OWNER_WIDTH + MEM_CORE_WIDTH + 1;
 `else
-    localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH + 1;
+    localparam MEM_REQID_WIDTH      = MEM_OWNER_WIDTH + MEM_CORE_WIDTH + 1;
 `endif
 `else
     localparam MEM_ATTR_REQID_OFFS  = MEM_ATTR_OWNER_OFFS;
@@ -845,6 +852,10 @@ package VX_gpu_pkg;
         logic [PC_BITS-1:0]                entry;
         logic [`VX_CFG_MEM_ADDR_WIDTH-1:0] param;
         logic [7:0]                        ctx_id;
+`ifdef VX_CFG_CHECKER_ENABLE
+        // The tenant the kernel runs as: the CP queue that launched it (T3).
+        logic [MEM_OWNER_WIDTH-1:0]        tenant;
+`endif
         logic [`VX_CFG_LMEM_LOG_SIZE:0]    aligned_lmem_size;
         kmu_args_t                         args;   // .compute | .fragment
     } kmu_req_t;

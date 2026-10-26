@@ -236,6 +236,7 @@ module VX_fetch import VX_gpu_pkg::*; #(
     `ifdef VX_CFG_CHECKER_ENABLE
         // A fetch needs X, not R (header v2, T9).
         icache_req_attr.is_fetch = 1'b1;
+        icache_req_attr.core     = MEM_CORE_WIDTH'(CORE_ID);
     `endif
     end
     assign icache_bus_if.req_data.attr   = icache_req_attr;

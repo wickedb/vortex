@@ -119,6 +119,7 @@ static void accept(uint64_t addr, bool is_write, uint32_t owner, bool fetch = fa
   sim->req_addr  = (uint32_t)addr;
   sim->req_owner = owner;
   sim->req_fetch = fetch ? 1 : 0;
+  sim->req_core  = owner;   // test mode: the tenant is the core
   int guard = 0;
   while (!sim->req_ready && guard++ < 128) tick();
   tick();

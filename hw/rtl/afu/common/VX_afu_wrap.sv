@@ -931,6 +931,7 @@ module VX_afu_wrap import VX_gpu_pkg::*; #(
             .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(cp_mem_req_addr) << CP_CHK_ASHIFT),
             .req_owner      (MEM_OWNER_WIDTH'(cp_req_issuer)),
             .req_fetch      (1'b0),
+            .req_core       ('0),   // no core: every stack access is denied
             .req_tag        (cp_mem_req_tag),
             .req_data       (cp_mem_req_data),
             .req_byteen     (cp_mem_req_byteen),

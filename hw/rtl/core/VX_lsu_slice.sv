@@ -129,6 +129,7 @@ module VX_lsu_slice import VX_gpu_pkg::*; #(
         assign mem_req_attr_struct[i].owner = MEM_OWNER_WIDTH'(CORE_ID);
     `ifdef VX_CFG_CHECKER_ENABLE
         assign mem_req_attr_struct[i].is_fetch = 1'b0;   // data access: R or W
+        assign mem_req_attr_struct[i].core     = MEM_CORE_WIDTH'(CORE_ID);
     `endif
     `ifdef VX_CFG_LMEM_ENABLE
         // is local memory address

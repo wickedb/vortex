@@ -24,6 +24,13 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     input  wire                         dcr_req_rw,
     input  wire [VX_DCR_ADDR_WIDTH-1:0] dcr_req_addr,
     input  wire [VX_DCR_DATA_WIDTH-1:0] dcr_req_data,
+`ifdef VX_CFG_CHECKER_ENABLE
+    // The CP queue a DCR write came from (authorship). The launch registers
+    // are replayed into the KMU from the launching queue's shadow, each write
+    // carrying that queue as issuer, so the issuer of the last launch-register
+    // write before `start` is the tenant the launch runs as (spec T3).
+    input  wire [VX_DCR_ISSUER_WIDTH-1:0] dcr_req_issuer,
+`endif
 
     // Kernel dispatch
     input  wire                         start,
@@ -103,6 +110,29 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     end
 
     wire kmu_bus_if_fire = kmu_bus_if.valid && kmu_bus_if.ready;
+
+`ifdef VX_CFG_CHECKER_ENABLE
+    // The launching tenant: the issuer of the latest launch-register write,
+    // snapshotted at `start` so a write after it cannot rename a running
+    // launch. Only the CP's launch replay writes these registers (a queue's
+    // own writes to them are captured into its shadow), so a tenant cannot
+    // choose the value.
+    reg [MEM_OWNER_WIDTH-1:0] kmu_issuer_r, launch_tenant_r;
+    wire kmu_reg_wr = dcr_req_valid && dcr_req_rw
+                   && (dcr_req_addr >= VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_BEGIN))
+                   && (dcr_req_addr <  VX_DCR_ADDR_WIDTH'(`VX_DCR_KMU_STATE_END));
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            kmu_issuer_r    <= '0;
+            launch_tenant_r <= '0;
+        end else begin
+            if (kmu_reg_wr)
+                kmu_issuer_r <= MEM_OWNER_WIDTH'(dcr_req_issuer);
+            if (start)
+                launch_tenant_r <= kmu_reg_wr ? MEM_OWNER_WIDTH'(dcr_req_issuer) : kmu_issuer_r;
+        end
+    end
+`endif
 
     // DCR write logic
     always_ff @(posedge clk) begin
@@ -354,6 +384,9 @@ module VX_kmu import VX_gpu_pkg::*; import VX_trace_pkg::*; #(
     assign kmu_req.entry     = from_fullPC(dcr_entry);
     assign kmu_req.param     = `VX_CFG_MEM_ADDR_WIDTH'(dcr_param);
     assign kmu_req.ctx_id    = ctx_id_r;
+`ifdef VX_CFG_CHECKER_ENABLE
+    assign kmu_req.tenant    = launch_tenant_r;
+`endif
     assign kmu_req.aligned_lmem_size = aligned_lmem_size_r;
     assign kmu_req.args.compute = kmu_comp;
 

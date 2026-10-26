@@ -253,14 +253,15 @@ package VX_sec_pkg;
 
     /* verilator lint_off UNUSEDSIGNAL */
     // The slice's core may read and write it; nobody fetches from it.
+    // `requester_core` is the requesting core (attr.core), not the tenant.
     function automatic logic chk_stack_allow(
-        input logic [63:0]            addr,
-        input logic [CHK_OWNER_W-1:0] requester,
-        input logic                   is_fetch
+        input logic [63:0] addr,
+        input logic [31:0] requester_core,
+        input logic        is_fetch
     );
         logic [63:0] core;
         core = ((CHK_STACK_TOP - 64'd1 - addr) >> CHK_STACK_LOG2) >> CHK_HART_CORE_SHIFT;
-        return !is_fetch && (core == 64'(requester));
+        return !is_fetch && (core == 64'(requester_core));
     endfunction
     /* verilator lint_on UNUSEDSIGNAL */
 

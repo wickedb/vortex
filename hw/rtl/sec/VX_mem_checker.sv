@@ -75,6 +75,8 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     input  wire                      req_rw,
     input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] req_addr,
     input  wire [CHK_OWNER_W-1:0]    req_owner,   // the requesting tenant
+    // The requesting core: the stack-slice rule (T12) decides by core.
+    input  wire [31:0]               req_core,
     // An instruction fetch: judged against X rather than R (header v2, T9).
     input  wire                      req_fetch,
     // Payload the checker does not inspect but MUST carry: it pipelines the
@@ -246,6 +248,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     reg                      s1_valid, s1_rw, s1_bypass;
     reg [`VX_CFG_MEM_ADDR_WIDTH-1:0] s1_addr;
     reg [CHK_OWNER_W-1:0]    s1_owner;
+    reg [31:0]               s1_core;
     reg                      s1_fetch;
     reg [TAG_WIDTH-1:0]      s1_tag;
     reg [DATA_SIZE*8-1:0]    s1_data;
@@ -311,6 +314,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
             s1_rw     <= req_rw;
             s1_addr   <= req_addr;
             s1_owner  <= req_owner;
+            s1_core   <= req_core;
             s1_fetch  <= req_fetch;
             s1_bypass <= req_is_io;
             s1_tag    <= req_tag;
@@ -329,7 +333,7 @@ module VX_mem_checker import VX_gpu_pkg::*, VX_sec_pkg::*; #(
 
     // T12: a stack address is judged by the slice rule, not by its header.
     wire s1_stack = chk_in_stack(64'(s1_addr));
-    wire authorized = s1_stack ? ((STACK_DENY_ALL == 0) && chk_stack_allow(64'(s1_addr), s1_owner, s1_fetch))
+    wire authorized = s1_stack ? ((STACK_DENY_ALL == 0) && chk_stack_allow(64'(s1_addr), s1_core, s1_fetch))
                                : chk_authorize(rd_header, s1_owner, s1_rw, s1_fetch, owner_epoch);
     wire denied     = s1_valid && ~s1_bypass && ~authorized && (LABEL_MODE == 0);
 

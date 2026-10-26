@@ -28,6 +28,7 @@ show_help()
     echo "  where"
     echo "--checker / --checker-enforce: build the data-plane access checker in (RTL lanes; compile-time)"
     echo "--checker-taint: also build confinement by taint in (RTL; needs --checker* and --l2cache or --l3cache)"
+    echo "--checker-tenant: the tenant is the launching CP queue, not the core id (RTL; needs --checker*)"
     echo "--driver: gpu, simx, rtlsim, opae, xrt, aved"
     echo "--target: aved driver only -- avedsim (default), sim, hw"
     echo "--app: any subfolder test under regression, graphics, mpi, opencl, or hip"
@@ -83,6 +84,7 @@ parse_args() {
             --checker)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_ENABLE") ;;
             --checker-enforce) CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_ENABLE -DVX_CFG_CHECKER_ENFORCE=1") ;;
             --checker-taint) CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_TAINT_ENABLE") ;;
+            --checker-tenant) CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_CHECKER_TENANT_FROM_LAUNCH") ;;
             --l2cache)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_L2_ENABLE") ;;
             --l3cache)  CONFIGS=$(add_option "$CONFIGS" "-DVX_CFG_L3_ENABLE") ;;
             --perf=*)   CONFIGS=$(add_option "$CONFIGS" "-DPERF_ENABLE"); PERF_CLASS=${i#*=} ;;

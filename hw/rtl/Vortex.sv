@@ -95,6 +95,9 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
         .dcr_req_rw (dcr_req_rw),
         .dcr_req_addr(dcr_req_addr),
         .dcr_req_data(dcr_req_data),
+    `ifdef VX_CFG_CHECKER_ENABLE
+        .dcr_req_issuer(dcr_req_issuer),
+    `endif
     `ifdef VX_CFG_EXT_RASTER_ENABLE
         .raster_launch_if (raster_launch_if),
     `endif
@@ -277,6 +280,7 @@ module Vortex import VX_gpu_pkg::*, VX_trace_pkg::*, VX_tlb_pkg::*; (
             .req_addr       (`VX_CFG_MEM_ADDR_WIDTH'(mem_bus_if[i].req_data.addr) << CHK_ASHIFT),
             .req_owner      (mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH]),
             .req_fetch      (mem_bus_if[i].req_data.attr[MEM_ATTR_FETCH_OFFS]),
+            .req_core       (32'(mem_bus_if[i].req_data.attr[MEM_ATTR_CORE_OFFS +: MEM_CORE_WIDTH])),
             .req_tag        (mem_bus_if[i].req_data.tag),
             .req_data       (mem_bus_if[i].req_data.data),
             .req_byteen     (mem_bus_if[i].req_data.byteen),

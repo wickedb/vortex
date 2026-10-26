@@ -299,6 +299,13 @@ VX_CFG_CHECKER_HEADER_ENTRIES = 0
 # queues (the C++ model always; the RTL with the checker enabled).
 VX_CFG_CHECKER_TENANTS = 8
 
+# The tenant a kernel runs as (spec T3): the command-processor queue that
+# launched it, latched by the KMU from the issuer of the launch registers the
+# CP replays, carried on the dispatch beat and stamped by each core's socket.
+# Off (test mode): the tenant is the core id, so one launch spanning two cores
+# runs as two tenants, which the older regressions rely on.
+VX_CFG_CHECKER_TENANT_FROM_LAUNCH = false
+
 # Confinement by taint in RTL (spec step 4: T3, T4, T5). Each core keeps a
 # taint, the owners whose confined data its kernel has read, stamped on every
 # request leaving the L1s and raised by the contributor mask on every response

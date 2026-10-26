@@ -803,32 +803,70 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
     end
 
     ///////////////////////////////////////////////////////////////////////////
-    // The socket boundary: confinement by taint (P1_and_taint_specv2.md T3).
+    // The socket boundary (P1_and_taint_specv2.md T3): the core's requester
+    // registers, stamped onto every request leaving the L1s.
     //
-    // One taint per core (SOCKET_SIZE == 1 with labels): the owners whose
-    // confined data the kernel on this core has read. Every request leaving
-    // the L1s is stamped with it, which is no earlier than its issue taint,
-    // and every response entering them ORs in its contributor mask, which
-    // reaches here before the data reaches the register file. So the L1s
-    // need no labels: every line in them was counted when it was filled.
+    // * The tenant (VX_CFG_CHECKER_TENANT_FROM_LAUNCH): the CP queue that
+    //   launched the kernel now on this core, carried on the dispatch beat.
+    //   It replaces the core id the LSU and fetch put in attr.owner; the core
+    //   id itself rides in attr.core for the stack-slice rule.
+    // * The taint (VX_CFG_CHECKER_TAINT_ENABLE): the owners whose confined
+    //   data the kernel on this core has read. Stamped no earlier than its
+    //   issue taint, and raised by the contributor mask of every response
+    //   entering the L1s, which reaches here before the data reaches the
+    //   register file. So the L1s need no labels: every line in them was
+    //   counted when it was filled.
     //
-    // Cleared when the core starts a different kernel (a new ctx_id on the
-    // dispatch link). Same-tenant inheritance and the scrub that makes the
-    // clear sound (T8) are step 5; until then this matches the SimX proof of
-    // concept, which clears at every launch.
+    // Both are loaded when the core starts a different kernel (a new ctx_id
+    // on the dispatch link): the tenant from the beat, the taint cleared.
+    // Same-tenant inheritance with the clean-boundary request, and the scrub
+    // that makes the clear sound (T8), are step 5; until then this matches the
+    // SimX proof of concept, which clears at every launch.
     ///////////////////////////////////////////////////////////////////////////
 `ifdef VX_CFG_CHECKER_TAINT_ENABLE
-    `STATIC_ASSERT(`VX_CFG_SOCKET_SIZE == 1, ("taint is per core: one core per socket"))
+    `define VX_SOCKET_STAMP
+`endif
+`ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
+`ifndef VX_CFG_CHECKER_ENABLE
+    if (1) begin : g_tenant_needs_checker
+        $fatal(1, "VX_CFG_CHECKER_TENANT_FROM_LAUNCH needs VX_CFG_CHECKER_ENABLE");
+    end
+`endif
+    `define VX_SOCKET_STAMP
+`endif
+`ifdef VX_SOCKET_STAMP
+    `undef VX_SOCKET_STAMP
+    `STATIC_ASSERT(`VX_CFG_SOCKET_SIZE == 1, ("the requester registers are per core: one core per socket"))
 
-    reg [`VX_CFG_CHECKER_TENANTS-1:0] taint_r;
-    reg [7:0] taint_ctx_r;
-    reg       taint_ctx_valid_r;
-    kmu_req_t taint_kmu_req;
-    assign taint_kmu_req = kmu_req_t'(kmu_bus_if[0].data);
-    `UNUSED_VAR (taint_kmu_req)   // only ctx_id is read
+    kmu_req_t stamp_kmu_req;
+    assign stamp_kmu_req = kmu_req_t'(kmu_bus_if[0].data);
+    `UNUSED_VAR (stamp_kmu_req)   // only ctx_id and tenant are read
+    reg [7:0] stamp_ctx_r;
+    reg       stamp_ctx_valid_r;
     wire kernel_change = kmu_bus_if[0].valid && kmu_bus_if[0].ready
-                      && (!taint_ctx_valid_r || (taint_kmu_req.ctx_id != taint_ctx_r));
+                      && (!stamp_ctx_valid_r || (stamp_kmu_req.ctx_id != stamp_ctx_r));
+    always @(posedge clk) begin
+        if (reset) begin
+            stamp_ctx_r       <= '0;
+            stamp_ctx_valid_r <= 1'b0;
+        end else if (kernel_change) begin
+            stamp_ctx_r       <= stamp_kmu_req.ctx_id;
+            stamp_ctx_valid_r <= 1'b1;
+        end
+    end
 
+`ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
+    reg [MEM_OWNER_WIDTH-1:0] tenant_r;
+    always @(posedge clk) begin
+        if (reset) begin
+            tenant_r <= '0;
+        end else if (kernel_change) begin
+            tenant_r <= stamp_kmu_req.tenant;
+        end
+    end
+`endif
+
+`ifdef VX_CFG_CHECKER_TAINT_ENABLE
     // Every response entering the L1s, from every port: its contributor mask.
     wire [L1_MEM_PORTS-1:0][`VX_CFG_CHECKER_TENANTS-1:0] port_contrib;
     for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_taint_snoop
@@ -842,24 +880,21 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
             taint_raise |= port_contrib[i];
         end
     end
-
+    reg [`VX_CFG_CHECKER_TENANTS-1:0] taint_r;
     always @(posedge clk) begin
         if (reset) begin
-            taint_r           <= '0;
-            taint_ctx_r       <= '0;
-            taint_ctx_valid_r <= 1'b0;
+            taint_r <= '0;
         end else if (kernel_change) begin
             // A new kernel starts empty. Responses still arriving now belong
             // to the previous kernel, which has drained: one kernel at a time.
-            taint_r           <= '0;
-            taint_ctx_r       <= taint_kmu_req.ctx_id;
-            taint_ctx_valid_r <= 1'b1;
+            taint_r <= '0;
         end else begin
             taint_r <= taint_r | taint_raise;
         end
     end
+`endif
 
-    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_taint_stamp
+    for (genvar i = 0; i < L1_MEM_PORTS; ++i) begin : g_stamp
         assign mem_bus_if[i].req_valid       = l1_out_bus_if[i].req_valid;
         assign mem_bus_if[i].req_data.rw     = l1_out_bus_if[i].req_data.rw;
         assign mem_bus_if[i].req_data.addr   = l1_out_bus_if[i].req_data.addr;
@@ -868,7 +903,12 @@ module VX_socket import VX_gpu_pkg::*, VX_tlb_pkg::*;
         assign mem_bus_if[i].req_data.tag    = l1_out_bus_if[i].req_data.tag;
         always @(*) begin
             mem_bus_if[i].req_data.attr = l1_out_bus_if[i].req_data.attr;
+        `ifdef VX_CFG_CHECKER_TENANT_FROM_LAUNCH
+            mem_bus_if[i].req_data.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH] = tenant_r;
+        `endif
+        `ifdef VX_CFG_CHECKER_TAINT_ENABLE
             mem_bus_if[i].req_data.attr[MEM_ATTR_TAINT_OFFS +: `VX_CFG_CHECKER_TENANTS] = taint_r;
+        `endif
         end
         assign l1_out_bus_if[i].req_ready = mem_bus_if[i].req_ready;
         assign l1_out_bus_if[i].rsp_valid = mem_bus_if[i].rsp_valid;

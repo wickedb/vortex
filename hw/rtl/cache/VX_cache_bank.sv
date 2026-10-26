@@ -219,12 +219,13 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     // A replayed store stamps the writer tag from its own attr, so the MSHR
     // parks the requester with the request (PROJECT.md §2.3): its owner, and
     // with the checker whether it is a fetch (MEM_ATTR_REQID_OFFS).
-    // The slice is {taint (with taint), owner, is_fetch} with the checker,
-    // the owner alone without (VX_gpu_pkg MEM_ATTR_REQID_OFFS).
+    // The slice is {taint (with taint), owner, core, is_fetch} with the
+    // checker, the owner alone without (VX_gpu_pkg MEM_ATTR_REQID_OFFS).
     wire [MEM_REQID_WIDTH-1:0]     replay_reqid;
 `ifdef VX_CFG_CHECKER_ENABLE
     wire                           replay_fetch = replay_reqid[0];
-    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[1 +: MEM_OWNER_WIDTH];
+    wire [MEM_CORE_WIDTH-1:0]      replay_core  = replay_reqid[1 +: MEM_CORE_WIDTH];
+    wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid[1 + MEM_CORE_WIDTH +: MEM_OWNER_WIDTH];
 `else
     wire                           replay_fetch = 1'b0;
     wire [MEM_OWNER_WIDTH-1:0]     replay_owner = replay_reqid;
@@ -687,15 +688,17 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         wire [MEM_OWNER_WIDTH-1:0] req_owner_st0 = st0.req.attr[MEM_ATTR_OWNER_OFFS +: MEM_OWNER_WIDTH];
     `ifdef VX_CFG_CHECKER_ENABLE
         wire req_fetch_st0 = st0.req.attr[MEM_ATTR_FETCH_OFFS];
+        wire [MEM_CORE_WIDTH-1:0] req_core_st0 = st0.req.attr[MEM_ATTR_CORE_OFFS +: MEM_CORE_WIDTH];
     `else
         wire req_fetch_st0 = 1'b0;
+        wire req_core_st0  = 1'b0;
     `endif
         wire [NUM_WAYS-1:0] allow_w;
         wire [NUM_WAYS-1:0][CHK_LABEL_W-1:0] hit_label_w;
         // T12: a stack line is judged by the slice rule, not by its label.
         wire [63:0] line_byte_addr_st0 = 64'(`CS_BANK_TO_FULL_ADDR(st0.req.addr, BANK_ID));
         wire stack_st0    = chk_in_stack(line_byte_addr_st0);
-        wire stack_ok_st0 = chk_stack_allow(line_byte_addr_st0, req_owner_st0, req_fetch_st0);
+        wire stack_ok_st0 = chk_stack_allow(line_byte_addr_st0, 32'(req_core_st0), req_fetch_st0);
     `ifdef VX_CFG_CHECKER_TAINT_ENABLE
         wire [CHK_TENANTS-1:0] req_taint_st0 = st0.req.attr[MEM_ATTR_TAINT_OFFS +: CHK_TENANTS];
         wire [NUM_WAYS-1:0][CHK_TENANTS-1:0] hit_contrib_w;
@@ -1286,7 +1289,7 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
         wire [CHK_EPOCH_W-1:0] fwd_epoch = chk_owner_epoch(fwd_lbl.owners, label_epochs);
         wire [63:0] fwd_byte_addr = 64'(`CS_BANK_TO_FULL_ADDR(replay_addr, BANK_ID));
         wire        fwd_stack     = chk_in_stack(fwd_byte_addr);
-        assign fwd_label_deny = fwd_stack ? ~chk_stack_allow(fwd_byte_addr, replay_owner, replay_fetch)
+        assign fwd_label_deny = fwd_stack ? ~chk_stack_allow(fwd_byte_addr, 32'(replay_core), replay_fetch)
                               : ~chk_authorize_label(fwd_lbl, replay_owner, 1'b0, replay_fetch, fwd_epoch);
     `ifdef VX_CFG_CHECKER_TAINT_ENABLE
         assign fwd_rsp_attr = `UP(MEM_RSP_ATTR_WIDTH)'((fwd_label_deny || fwd_stack) ? '0 : chk_contrib(fwd_lbl, replay_owner));
@@ -1295,6 +1298,9 @@ module VX_cache_bank import VX_gpu_pkg::*, VX_sec_pkg::*; #(
     `endif
     end else begin : g_no_fwd_label
         `UNUSED_VAR ({replay_owner, replay_fetch})
+    `ifdef VX_CFG_CHECKER_ENABLE
+        `UNUSED_VAR (replay_core)
+    `endif
         assign fwd_label_deny = 1'b0;
         assign fwd_rsp_attr   = fbuf_label_r;
     end

@@ -160,6 +160,9 @@ module VX_cta_dispatch import VX_gpu_pkg::*; #(
     // by the fan-out arbiters; the endpoint discriminates via kmu_req.kind.
     kmu_req_t kmu_req;
     assign kmu_req = kmu_req_t'(kmu_bus_if.data);
+`ifdef VX_CFG_CHECKER_ENABLE
+    `UNUSED_VAR (kmu_req.tenant)   // read at the socket boundary (VX_socket)
+`endif
     `UNUSED_VAR (kmu_bus_if.kind)
     `UNUSED_VAR (kmu_bus_if.dest)
     `UNUSED_VAR (kmu_bus_if.eop)
