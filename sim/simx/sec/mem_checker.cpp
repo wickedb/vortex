@@ -377,6 +377,9 @@ public:
          << ", deliver_write_deny=" << perf_stats_.label_write_denies
          << std::endl;
     }
+    if (perf_stats_.stack_denies != 0) {
+      os << "CHECKER: stack: denies=" << perf_stats_.stack_denies << std::endl;
+    }
     if (config_.taint) {
       os << "CHECKER: taint: raises=" << perf_stats_.taint_raises
          << ", write_denies=" << perf_stats_.taint_denies
@@ -502,10 +505,39 @@ public:
     return i;
   }
 
+  // The stack slices (spec T12): a fixed hardware rule, no claims. Hart h's
+  // stack is the 2^VX_MEM_STACK_LOG2_SIZE bytes below
+  // VX_MEM_STACK_BASE_ADDR - h * that (sw/kernel/src/vx_start.S), so the
+  // owning core of a stack address is arithmetic. Inside the region only the
+  // slice's own core may read or write, never fetch; the covering check does
+  // not apply and nothing taints. Everyone else is denied, including the
+  // command processor (D7).
+  static constexpr uint64_t STACK_TOP   = VX_MEM_STACK_BASE_ADDR;
+  static constexpr uint32_t STACK_LOG2  = VX_MEM_STACK_LOG2_SIZE;
+  static constexpr uint64_t STACK_HARTS = uint64_t(VX_CFG_NUM_CLUSTERS) * VX_CFG_NUM_CORES
+                                        * VX_CFG_NUM_WARPS * VX_CFG_NUM_THREADS;
+  static bool in_stack(uint64_t addr) {
+    return addr < STACK_TOP && addr >= STACK_TOP - (STACK_HARTS << STACK_LOG2);
+  }
+  static uint32_t stack_core(uint64_t addr) {
+    constexpr uint32_t LOG_WARPS   = log2ceil(VX_CFG_NUM_WARPS);
+    constexpr uint32_t LOG_THREADS = log2ceil(VX_CFG_NUM_THREADS);
+    const uint64_t hart = (STACK_TOP - 1 - addr) >> STACK_LOG2;
+    return uint32_t(hart >> (LOG_WARPS + LOG_THREADS));
+  }
+
   bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
-                 bool is_fetch) const {
+                 bool is_fetch, uint64_t addr) const {
     if (!label.valid)
       return true;   // no policy: IO / local memory
+    if (in_stack(addr)) {
+      bool ok = !is_fetch && (stack_core(addr) == this->owner_of(hart_id));
+      if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
+        ok = false;
+      if (!ok)
+        ++perf_stats_.stack_denies;
+      return ok;
+    }
     const uint32_t eid  = this->owner_of(hart_id);
     const uint32_t need = need_of(is_write, is_fetch);
     uint32_t contrib;
@@ -547,8 +579,10 @@ public:
       return true;
     }
     const MemLabel label = label_of(this->header_for(addr >> config_.buffer_log2));
-    uint32_t contrib;
-    bool ok = this->judge(label, issuer, need_of(is_write, false), &contrib);
+    uint32_t contrib = 0;
+    // T12: no queue reaches a core's stack slice.
+    bool ok = !in_stack(addr)
+           && this->judge(label, issuer, need_of(is_write, false), &contrib);
     if (ok && config_.taint && taint) {
       if (is_write) {
         if ((*taint & ~label.owners) != 0) {
@@ -766,7 +800,7 @@ private:
     uint64_t added = config_.lookup_latency;
 
     bool ok = this->authorize(label_of(this->header_for(buffer_id)),
-                              req.hart_id, req.is_write(), req.flags.fetch);
+                              req.hart_id, req.is_write(), req.flags.fetch, req.addr);
 
     if (ok) {
       ++perf_stats_.allows;
@@ -836,8 +870,8 @@ MemLabel MemChecker::resolve_label(uint64_t addr) const {
 }
 
 bool MemChecker::authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
-                           bool is_fetch) const {
-  return impl_->authorize(label, hart_id, is_write, is_fetch);
+                           bool is_fetch, uint64_t addr) const {
+  return impl_->authorize(label, hart_id, is_write, is_fetch, addr);
 }
 
 bool MemChecker::enforcing() const {

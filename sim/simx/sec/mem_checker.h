@@ -212,6 +212,9 @@ public:
     uint64_t taint_denies = 0;
     uint64_t leaves = 0;
     uint64_t leaves_refused = 0;
+    // Stack-slice rule (T12): accesses to a core's stack slice by anyone but
+    // that core, and fetches from it.
+    uint64_t stack_denies = 0;
     // The command processor's device path (D7): lines its DMA and event
     // commands moved, judged for the queue that issued them. Kept apart from
     // the port counters above, which the kernel's thread owns.
@@ -291,7 +294,7 @@ public:
   // LabelAuthority: what a labeled cache consults (sec/label.h).
   MemLabel resolve_label(uint64_t addr) const override;
   bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
-                 bool is_fetch) const override;
+                 bool is_fetch, uint64_t addr) const override;
   bool enforcing() const override;
   std::shared_ptr<mem_block_t> poison() const override;
   void count_label_deny(bool is_write) override;

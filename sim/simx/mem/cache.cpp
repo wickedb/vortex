@@ -1203,8 +1203,8 @@ private:
     // and answers with poison, like a denied read.
     if (lab_ != nullptr) {
       const MemLabel &label = this->label_of(hit_sec, bank_req.addr);
-      const bool rd_ok = lab_->authorize(label, hid, false, false);
-      const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true, false);
+      const bool rd_ok = lab_->authorize(label, hid, false, false, bank_req.addr);
+      const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true, false, bank_req.addr);
       if (!(rd_ok && wr_ok)) {
         lab_->count_label_deny(rd_ok);
       }
@@ -1790,7 +1790,7 @@ private:
   bool label_allows_write(sector_t &sec, uint64_t addr, uint32_t hart_id) {
     if (lab_ == nullptr)
       return true;
-    bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true, false);
+    bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true, false, addr);
     if (!ok && config_.write_back)
       lab_->count_label_deny(true);
     return ok || !lab_->enforcing();
@@ -1803,7 +1803,7 @@ private:
     if (lab_ == nullptr)
       return;
     rsp.label = this->label_of(sec, addr);
-    if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false, is_fetch)) {
+    if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false, is_fetch, addr)) {
       lab_->count_label_deny(false);
       if (lab_->enforcing())
         rsp.data = lab_->poison();

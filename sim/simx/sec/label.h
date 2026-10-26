@@ -38,8 +38,10 @@ public:
   // The checker's predicate, applied to a label at the point of delivery.
   // `hart_id` identifies the requester (tenant = core until per-core tenant
   // registers land, as at the port). A fetch needs X, a write W, a read R.
+  // `addr` is the line's address: the stack-slice rule (spec T12) decides by
+  // address, not by label.
   virtual bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
-                         bool is_fetch) const = 0;
+                         bool is_fetch, uint64_t addr) const = 0;
 
   // Whether a deny takes effect (the port checker's ENFORCE). Without it a
   // labeled cache counts its denies but delivers and merges as if allowed.
