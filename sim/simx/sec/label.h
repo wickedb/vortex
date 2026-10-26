@@ -36,8 +36,10 @@ public:
   virtual MemLabel resolve_label(uint64_t addr) const = 0;
 
   // The checker's predicate, applied to a label at the point of delivery.
-  // `hart_id` identifies the requester (owner = core, as at the port).
-  virtual bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const = 0;
+  // `hart_id` identifies the requester (tenant = core until per-core tenant
+  // registers land, as at the port). A fetch needs X, a write W, a read R.
+  virtual bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
+                         bool is_fetch) const = 0;
 
   // Whether a deny takes effect (the port checker's ENFORCE). Without it a
   // labeled cache counts its denies but delivers and merges as if allowed.

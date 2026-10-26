@@ -1159,7 +1159,8 @@ private:
     bank_req_t req;
     mshr_.dequeue(&req);
     MemRsp rsp{req.req_tag, req.hart_id, req.uuid};
-    this->deliver_read(rsp, set.lines.at(present_id).sectors.at(sector_id), req.addr, req.hart_id);
+    this->deliver_read(rsp, set.lines.at(present_id).sectors.at(sector_id), req.addr, req.hart_id,
+                       req.flags.fetch);
     this->core_rsp_out.send(rsp);
     DT(3, this->name() << " fwd-rsp: " << rsp);
     return true;
@@ -1202,8 +1203,8 @@ private:
     // and answers with poison, like a denied read.
     if (lab_ != nullptr) {
       const MemLabel &label = this->label_of(hit_sec, bank_req.addr);
-      const bool rd_ok = lab_->authorize(label, hid, false);
-      const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true);
+      const bool rd_ok = lab_->authorize(label, hid, false, false);
+      const bool wr_ok = (op == MemOp::AMO_LR) || lab_->authorize(label, hid, true, false);
       if (!(rd_ok && wr_ok)) {
         lab_->count_label_deny(rd_ok);
       }
@@ -1470,6 +1471,7 @@ private:
           fill.hart_id = bank_req.hart_id;
           fill.uuid    = bank_req.uuid;
           fill.flags.labeled = (lab_ != nullptr);  // judged at delivery
+          fill.flags.fetch   = bank_req.flags.fetch;
           this->mem_req_out.send(fill, MEM_REQ_DELAY);
           ++pending_fill_reqs_;
         }
@@ -1522,7 +1524,7 @@ private:
       if (need_core_rsp(bank_req) && !bank_req.skip_core_rsp) {
         MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
         if (!bank_req.write)
-          this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id);
+          this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id, bank_req.flags.fetch);
         this->core_rsp_out.send(rsp);
         crsp_sent_ = true;
         DT(3, this->name() << " replay-rsp: " << rsp);
@@ -1646,7 +1648,7 @@ private:
         if (need_rsp) {
           MemRsp rsp{bank_req.req_tag, bank_req.hart_id, bank_req.uuid};
           if (!bank_req.write)
-            this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id);
+            this->deliver_read(rsp, hit_sec, bank_req.addr, bank_req.hart_id, bank_req.flags.fetch);
           this->core_rsp_out.send(rsp);
           crsp_sent_ = true;
           DT(3, this->name() << " core-rsp: " << rsp);
@@ -1699,6 +1701,7 @@ private:
             fill.hart_id   = bank_req.hart_id;
             fill.uuid  = bank_req.uuid;
             fill.flags.labeled = (lab_ != nullptr);  // judged at delivery
+            fill.flags.fetch   = bank_req.flags.fetch;
             this->mem_req_out.send(fill, MEM_REQ_DELAY);
             DT(3, this->name() << " fill-req: " << fill);
             ++pending_fill_reqs_;
@@ -1787,19 +1790,20 @@ private:
   bool label_allows_write(sector_t &sec, uint64_t addr, uint32_t hart_id) {
     if (lab_ == nullptr)
       return true;
-    bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true);
+    bool ok = lab_->authorize(this->label_of(sec, addr), hart_id, true, false);
     if (!ok && config_.write_back)
       lab_->count_label_deny(true);
     return ok || !lab_->enforcing();
   }
 
   // Read delivery: the line's data and label, or poison at the edge on a deny.
-  void deliver_read(MemRsp &rsp, sector_t &sec, uint64_t addr, uint32_t hart_id) {
+  void deliver_read(MemRsp &rsp, sector_t &sec, uint64_t addr, uint32_t hart_id,
+                    bool is_fetch) {
     rsp.data = sec.data;
     if (lab_ == nullptr)
       return;
     rsp.label = this->label_of(sec, addr);
-    if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false)) {
+    if (lab_edge_ && !lab_->authorize(rsp.label, hart_id, false, is_fetch)) {
       lab_->count_label_deny(false);
       if (lab_->enforcing())
         rsp.data = lab_->poison();

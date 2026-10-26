@@ -50,6 +50,9 @@ static_assert(DCR_CHECKER_BASE         == VX_DCR_CHECKER_STATE_BEGIN,  "window s
 static_assert(DCR_CHECKER_END          == VX_DCR_CHECKER_STATE_END,    "window end drifted from VX_types.toml");
 static_assert(PERM_R    == VX_CHECKER_PERM_R,    "PERM_R drifted from VX_types.toml");
 static_assert(PERM_W    == VX_CHECKER_PERM_W,    "PERM_W drifted from VX_types.toml");
+static_assert(PERM_X    == VX_CHECKER_PERM_X,    "PERM_X drifted from VX_types.toml");
+static_assert(DCR_CHECKER_BUF_GRANTEE == VX_DCR_CHECKER_BUF_GRANTEE, "BUF_GRANTEE drifted from VX_types.toml");
+static_assert(VX_CFG_CHECKER_TENANTS <= 32, "owner sets are 32-bit masks");
 static_assert(OWNER_ANY == VX_CHECKER_OWNER_ANY, "OWNER_ANY drifted from VX_types.toml");
 
 namespace {
@@ -152,16 +155,15 @@ private:
   std::vector<StoreEntry> header_store_;
   uint32_t header_mask_;
 
-  // Policy for granules with no installed header. install_single_owner() sets
-  // it; the boot default is OWNER_ANY + R|W, i.e. unclaimed memory (kernel
-  // code, stacks, launch args) is system/shared. Holding it in one place
+  // Policy for granules with no installed header: the empty owner set with
+  // Config::default_perms (D9). Holding it in one place
   // rather than pre-filling every entry is what lets an entry's valid bit mean
   // "claimed" — the property the tag check depends on.
   BufferHeader default_header_;
 
   // Per-owner epoch table (fix for the global-revocation bug: owner A
   // revoking its grant to B must not also expire owner C's unrelated grant
-  // to D). Indexed by BufferHeader::owner_eid — the *granting* owner, not
+  // to D). Indexed by tenant: the *granting* owner, not
   // the grantee — since that is what the check in check() compares against.
   // Sized on demand; an owner with no entry yet reads as epoch 0, matching
   // the pre-revocation default every owner started at.
@@ -180,6 +182,7 @@ private:
     uint32_t epoch = 0xFFFFFFFFu;
     uint32_t joint = 0;
     uint32_t confined = 0;
+    uint32_t grantee = 0;
   };
   // One staging set per issuer (spec D3). With shared staging, another queue's
   // BUF_BASE/SIZE written between a tenant's staging and its COMMIT would
@@ -205,11 +208,10 @@ public:
     header_mask_ = uint32_t(entries - 1);
     config_.header_entries = uint32_t(entries);
 
-    // Boot default: unclaimed memory is system/shared. Overwritten by
-    // install_single_owner() at construction (see processor.cpp).
-    default_header_.owner_eid = OWNER_ANY;
-    default_header_.perms = PERM_R | PERM_W;
-    default_header_.shared_perms = 0;
+    // Unclaimed memory: no owners, the default perms, no grant.
+    default_header_.owners = 0;
+    default_header_.perms = config_.default_perms & (PERM_R | PERM_W | PERM_X);
+    default_header_.grant_perms = 0;
     default_header_.grant_epoch = UINT64_MAX;
 
     poison_ = make_mem_block();
@@ -225,17 +227,6 @@ public:
 
   ~Impl() {}
 
-  // Installs one owner over all of global memory by moving the *default* —
-  // the policy every granule with no claim of its own falls to. Equivalent to
-  // the old blanket pre-fill of every entry, minus the part that made every
-  // entry look claimed, which is what the tag check needs to distinguish.
-  void install_single_owner(uint32_t owner_eid, uint32_t perms) {
-    default_header_.owner_eid = owner_eid;
-    default_header_.perms = perms;
-    default_header_.shared_perms = 0;
-    default_header_.grant_epoch = UINT64_MAX;
-  }
-
   // The policy governing `buffer_id`: its own header if it has one installed,
   // otherwise the default. The tag comparison is the whole aliasing fix.
   const BufferHeader& header_for(uint64_t buffer_id) const {
@@ -249,11 +240,9 @@ public:
   }
 
   void set_epoch(uint32_t owner, uint64_t epoch) {
-    // OWNER_ANY headers are never epoch-gated (see check()), so scoping a
-    // revocation to OWNER_ANY — staged or explicit — would be a no-op host
-    // mistake, not a real grant to expire. Also covers the "nothing staged"
-    // sentinel from a bare DCR_CHECKER_EPOCH write.
-    if (owner == OWNER_ANY || owner >= MAX_OWNERS)
+    // Owners are tenants; the issuer always is one, so this only guards the
+    // table against a bogus index.
+    if (owner >= MAX_OWNERS)
       return;
     if (owner >= epoch_table_.size())
       epoch_table_.resize(owner + 1, 0);
@@ -289,6 +278,7 @@ public:
     case DCR_CHECKER_BUF_SHARED: c.shared = value; break;
     case DCR_CHECKER_BUF_JOINT:    c.joint = value; break;
     case DCR_CHECKER_BUF_CONFINED: c.confined = value; break;
+    case DCR_CHECKER_BUF_GRANTEE:  c.grantee = value; break;
     case DCR_CHECKER_BUF_LEAVE:
       this->leave(c, value, issuer);
       break;
@@ -446,13 +436,13 @@ public:
   // A header's label: the header minus the store's bookkeeping.
   static MemLabel label_of(const BufferHeader& header) {
     MemLabel label;
-    label.valid        = true;
-    label.owner        = header.owner_eid;
-    label.perms        = header.perms;
-    label.shared_perms = header.shared_perms;
-    label.grant_epoch  = header.grant_epoch;
-    label.joint        = header.joint;
-    label.confined     = header.confined;
+    label.valid       = true;
+    label.owners      = header.owners;
+    label.perms       = header.perms;
+    label.grantee     = header.grantee;
+    label.grant_perms = header.grant_perms;
+    label.grant_epoch = header.grant_epoch;
+    label.confined    = header.confined;
     return label;
   }
 
@@ -462,69 +452,78 @@ public:
     return label_of(this->header_for(addr >> config_.buffer_log2));
   }
 
-  // THE predicate. check() applies it to a header at the memory port; a
-  // labeled cache applies it to the label it stored with the line. One
-  // function, so the placements cannot drift apart.
+  // THE predicate (header v2, kernel_identity_oct16.md "The predicate").
+  // check() applies it to a header at the memory port; a labeled cache to
+  // the label it stored with the line; the CP path to every line it moves.
+  // One function, so the placements cannot drift apart.
   //
-  // Owner (and system/shared OWNER_ANY) access is not epoch-gated:
-  // revocation expires grants to *others*, it does not evict the owner.
-  // Non-owner access rides the shared grant, which the *granting* owner's
-  // epoch-table entry gates — bumped via DCR_CHECKER_REVOKE_OWNER +
-  // DCR_CHECKER_EPOCH, without writing any header (thesis §6). Scoped per
-  // owner: revoking owner A's grants never advances owner C's entry, so
-  // C's unrelated grant to D is untouched. The epoch is read live, which is
-  // what lets one bump expire every cached copy of a grant at once.
-  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const {
-    if (!label.valid)
-      return true;   // no policy: IO / local memory
-    uint32_t owner = this->owner_of(hart_id);
-    uint32_t need = is_write ? PERM_W : PERM_R;
-    if (config_.taint)
-      return this->authorize_taint(label, owner, need, is_write);
+  //   unclaimed (owners == {}):  need in perms (the default perms)
+  //   eid an owner:              need in perms, never epoch-gated
+  //   otherwise:                 eid == grantee, need in grant_perms, and
+  //                              epoch(the owner) <= grant_epoch
+  //
+  // A grant exists only on a single-owner granule (S4, install_claim), so
+  // "the owner" whose epoch gates it is the one bit of `owners`. Revoking
+  // advances that owner's epoch, without writing any header, and expires
+  // every cached copy of the grant at once.
+  //
+  // `contrib` is what an allowed read adds to the reader's taint: the other
+  // owners of a joint granule, or the owners behind a confined grant.
+  bool judge(const MemLabel& label, uint32_t eid, uint32_t need,
+             uint32_t* contrib) const {
+    const uint32_t me = eid_bit(eid);
     bool ok;
-    if (label.owner == OWNER_ANY || label.owner == owner) {
+    *contrib = 0;
+    if (label.owners == 0) {
       ok = (label.perms & need) != 0;
+    } else if ((label.owners & me) != 0) {
+      ok = (label.perms & need) != 0;
+      *contrib = label.owners & ~me;
     } else {
-      ok = ((label.shared_perms & need) != 0)
-        && (this->epoch_for(label.owner) <= label.grant_epoch);
+      ok = (eid == label.grantee)
+        && ((label.grant_perms & need) != 0)
+        && (this->epoch_for(sole_owner(label.owners)) <= label.grant_epoch);
+      *contrib = label.confined ? label.owners : 0u;
     }
-    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
+    if (config_.test_deny == 1 || (config_.test_deny == 2 && need == PERM_W))
       ok = false;
     return ok;
   }
 
-  // The predicate with confinement (kernel_identity_oct16.md, "The
-  // predicate"). The owner set is {owner} plus the joint co-owners; the
-  // unclaimed default (OWNER_ANY) has an empty owner set. Every owner gets the
-  // owner permissions, unchanged; a non-owner rides the shared grant, gated by
-  // the granting owner's epoch, unchanged. Two additions:
-  //   - an allowed read raises the reader's taint by its contributors: the
-  //     other owners of a joint granule, or the owners behind a confined grant;
-  //   - an allowed write must land in a granule whose owners cover the
-  //     writer's taint. Unclaimed memory covers only an empty taint.
-  bool authorize_taint(const MemLabel& label, uint32_t eid, uint32_t need,
-                       bool is_write) const {
-    const bool     unclaimed = (label.owner == OWNER_ANY);
-    const uint32_t owners    = unclaimed ? 0u : (eid_bit(label.owner) | label.joint);
-    const uint32_t me        = eid_bit(eid);
-    const bool     is_owner  = unclaimed || (owners & me) != 0;
-    bool ok;
-    uint32_t contrib = 0;
-    if (is_owner) {
-      ok = (label.perms & need) != 0;
-      contrib = owners & ~me;
-    } else {
-      ok = ((label.shared_perms & need) != 0)
-        && (this->epoch_for(label.owner) <= label.grant_epoch);
-      contrib = label.confined ? owners : 0u;
-    }
-    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
-      ok = false;
-    if (!ok || eid >= MAX_TAINT_EIDS)
+  static uint32_t need_of(bool is_write, bool is_fetch) {
+    return is_write ? PERM_W : (is_fetch ? PERM_X : PERM_R);
+  }
+
+  // The lowest owner: the owner, on the single-owner granules grants exist on.
+  static uint32_t sole_owner(uint32_t owners) {
+    uint32_t i = 0;
+    while (i < 31 && ((owners >> i) & 1u) == 0)
+      ++i;
+    return i;
+  }
+
+  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
+                 bool is_fetch) const {
+    if (!label.valid)
+      return true;   // no policy: IO / local memory
+    const uint32_t eid  = this->owner_of(hart_id);
+    const uint32_t need = need_of(is_write, is_fetch);
+    uint32_t contrib;
+    const bool ok = this->judge(label, eid, need, &contrib);
+    if (!config_.taint || !ok || eid >= MAX_TAINT_EIDS)
       return ok;
+    return this->apply_taint(label, eid, is_write, contrib);
+  }
+
+  // Confinement (kernel_identity_oct16.md). An allowed read raises the
+  // reader's taint by its contributors; an allowed write must land in a
+  // granule whose owners cover the writer's taint. Unclaimed memory covers
+  // only an empty taint.
+  bool apply_taint(const MemLabel& label, uint32_t eid, bool is_write,
+                   uint32_t contrib) const {
     uint32_t& taint = taint_[eid];
     if (is_write) {
-      if ((taint & ~owners) != 0) {
+      if ((taint & ~label.owners) != 0) {
         ++perf_stats_.taint_denies;
         return false;
       }
@@ -535,9 +534,11 @@ public:
     return true;
   }
 
-  // D7: one device line the command processor moves for queue `issuer`.
-  // Runs on the CP's thread while a kernel may be running on another, so it
-  // reads policy (headers, epochs) and writes only its own cp_* counters.
+  // D7: one device line the command processor moves for queue `issuer`, the
+  // tenant. Runs on the CP's thread while a kernel may be running on another,
+  // so it reads policy (headers, epochs) and writes only its own cp_*
+  // counters. Every queue is a tenant (header v2 indexes owners by tenant,
+  // not by core); one that has claimed nothing simply owns nothing.
   bool cp_authorize(uint64_t addr, bool is_write, uint32_t issuer,
                     uint32_t* taint, bool to_host) {
     ++perf_stats_.cp_lines;
@@ -546,36 +547,18 @@ public:
       return true;
     }
     const MemLabel label = label_of(this->header_for(addr >> config_.buffer_log2));
-    const uint32_t need = is_write ? PERM_W : PERM_R;
-    // The owner set: the owner, plus the joint co-owners under confinement
-    // (without it joint co-owners are not owners, as in authorize()).
-    const bool     unclaimed = (label.owner == OWNER_ANY);
-    const uint32_t owners    = unclaimed ? 0u
-        : (eid_bit(label.owner) | (config_.taint ? label.joint : 0u));
-    const bool     names_core = issuer < uint32_t(VX_CFG_NUM_CORES * VX_CFG_NUM_CLUSTERS);
-    const uint32_t me        = names_core ? eid_bit(issuer) : 0u;
-    const bool     is_owner  = unclaimed
-        || (names_core && (config_.taint ? (owners & me) != 0 : label.owner == issuer));
-    bool ok;
-    uint32_t contrib = 0;
-    if (is_owner) {
-      ok = (label.perms & need) != 0;
-      contrib = owners & ~me;
-    } else {
-      ok = ((label.shared_perms & need) != 0)
-        && (this->epoch_for(label.owner) <= label.grant_epoch);
-      contrib = label.confined ? owners : 0u;
-    }
-    if (config_.test_deny == 1 || (config_.test_deny == 2 && is_write))
-      ok = false;
+    uint32_t contrib;
+    bool ok = this->judge(label, issuer, need_of(is_write, false), &contrib);
     if (ok && config_.taint && taint) {
       if (is_write) {
-        if ((*taint & ~owners) != 0) {
+        if ((*taint & ~label.owners) != 0) {
           ok = false;
           ++perf_stats_.cp_taint_denies;
         }
       } else {
         *taint |= contrib;
+        // S6: a download leaves the device. Joint data and confined grants
+        // never leave that way.
         if (to_host && *taint != 0) {
           ok = false;
           ++perf_stats_.cp_taint_denies;
@@ -610,38 +593,44 @@ private:
     return hart_id >> (LOG_WARPS + LOG_THREADS);
   }
 
-  // Installs the staged claim: every granule overlapping [base, base+size)
-  // gets the staged owner/perms/epoch. Indexing matches check()'s
-  // (id & header_mask_), so the claim lands on exactly the entries the
-  // data path will consult.
+  // Installs the staged claim over every granule overlapping
+  // [base, base+size). Indexing matches check()'s (id & header_mask_), so the
+  // claim lands on exactly the entries the data path will consult. All or
+  // nothing: a refused claim leaves the store exactly as it was.
   //
-  // Granule exclusivity (fail-closed). A claim is rejected outright if any
-  // granule it would cover already belongs to a *different* non-OWNER_ANY
-  // owner. This is the invariant the write-back-cache identity fix depends
-  // on: one writer id is stamped per cache sector, but the sector's dirty
-  // mask accumulates bytes from every writer, so if two owners could share a
-  // granule they could share a sector, and the last writer's identity would
-  // authorize the other owner's bytes on the merged writeback (playground_2626/PROJECT.md §2.3).
-  // Enforcing exclusivity here means two owners can never reach the same
-  // sector, which is what makes one writer id per sector sufficient.
+  // The setup rules (kernel_identity_oct16.md S1, S4; spec T6), with the
+  // issuer from the queue (D2):
+  //   - the staged owner must be the issuer (authorship); the owner set is
+  //     {issuer} plus the staged co-owners (BUF_JOINT);
+  //   - S1 claim: any unclaimed granule;
+  //   - S4 re-grant: a granule whose owner set is exactly {issuer}, with the
+  //     owner set unchanged, may change its perms and its grant;
+  //   - a grant (non-zero BUF_SHARED) only with a single owner, for a tenant;
+  //   - nothing else. No re-claim changes an owner set (T6): owner sets grow
+  //     only at claim time and shrink only by BUF_LEAVE.
   //
-  // Note this is deliberately *not* a blanket "base must be granule-aligned"
-  // rule. Alignment is neither necessary nor sufficient: a single-owner claim
-  // may sit unaligned and overlap code/stack granules harmlessly (all traffic
-  // is one eid — tests/regression/vecadd_claimed relies on this to stay
-  // cycle-identical to vecadd), while two *aligned* claims can still collide
-  // through outward rounding when a size spills past a granule boundary.
-  // Cross-owner conflict is the condition that actually matters, so that is
-  // the one enforced; misalignment is counted for diagnostics instead.
+  // Granule exclusivity is what the write-back-cache identity fix depends on:
+  // one writer id per cache sector is sufficient only because two claims can
+  // never share a granule (playground_2626/PROJECT.md §2.3). Alignment is
+  // counted, not enforced: a single-owner claim may sit unaligned and overlap
+  // unclaimed code or stack granules harmlessly (vecadd_claimed relies on it).
   void install_claim(const Claim& c, uint32_t issuer) {
     if (c.size == 0)
       return;
-    // Authorship (spec D2): a tenant claims for itself only. The staged
-    // owner is the issuer's statement of intent, and a claim naming anyone
-    // else -- including OWNER_ANY -- is refused whole. Counted apart from
-    // rejected/aliased: it is an attempt, not a conflict or a capacity limit.
-    if (c.owner != issuer) {
+    // Authorship (spec D2): a tenant claims for itself only. Counted apart
+    // from rejected/aliased: it is an attempt, not a conflict or a capacity
+    // limit.
+    if (c.owner != issuer || issuer >= VX_CFG_CHECKER_TENANTS) {
       ++perf_stats_.claims_foreign;
+      return;
+    }
+    const uint32_t tenants = (1u << VX_CFG_CHECKER_TENANTS) - 1;
+    const uint32_t self    = eid_bit(issuer);
+    const uint32_t owners  = self | (c.joint & tenants);
+    const uint32_t grant   = c.shared & (PERM_R | PERM_W | PERM_X);
+    // S4: a grant names one tenant, and only a sole owner grants.
+    if (grant != 0 && (owners != self || c.grantee >= VX_CFG_CHECKER_TENANTS)) {
+      ++perf_stats_.claims_rejected;
       return;
     }
     uint64_t first = uint64_t(c.base) >> config_.buffer_log2;
@@ -654,35 +643,18 @@ private:
      || (uint64_t(c.size) & granule_mask) != 0)
       ++perf_stats_.claims_unaligned;
 
-    // Pre-pass: reject before mutating anything, so a rejected claim leaves
-    // the header store exactly as it was. Two independent reasons to refuse,
-    // both fail-closed, counted separately because they say different things
-    // about the setup — one is a policy conflict, the other a capacity limit.
+    // Pre-pass: refuse before mutating anything.
     for (uint64_t id = first; id <= last; ++id) {
       const StoreEntry& entry = header_store_[id & header_mask_];
       if (entry.valid && entry.tag != id) {
         // The entry this granule indexes belongs to a different buffer.
-        // Installing here would hand that buffer this claim's policy while
-        // leaving it addressable under its own id — silent cross-buffer
-        // corruption, and the reason the store needs a tag at all
-        // (playground_2626/PROJECT.md §10, item #5). Refuse whole, whoever owns the occupant:
-        // two buffers is the
-        // problem, not two owners.
+        // Installing here would hand that buffer this claim's policy (the
+        // reason the store needs a tag at all, PROJECT.md §10 item #5).
         ++perf_stats_.claims_aliased;
         return;
       }
-      // Granule exclusivity, as before. An unclaimed granule is governed by
-      // the default, so that is what a cross-owner conflict is measured
-      // against when no header is installed yet.
-      const BufferHeader& header = entry.valid ? entry.header : default_header_;
-      if (header.owner_eid != OWNER_ANY && header.owner_eid != c.owner) {
-        ++perf_stats_.claims_rejected;
-        return;
-      }
-      // A re-claim may add co-owners but never drop one: only a co-owner
-      // removes itself (BUF_LEAVE). Otherwise the owner could release joint
-      // data to itself by re-claiming without its co-owners.
-      if (entry.valid && (header.joint & ~this->staged_joint(c)) != 0) {
+      const uint32_t cur = entry.valid ? entry.header.owners : 0u;
+      if (cur != 0 && !(cur == self && owners == self)) {
         ++perf_stats_.claims_rejected;
         return;
       }
@@ -690,41 +662,29 @@ private:
 
     for (uint64_t id = first; id <= last; ++id) {
       StoreEntry& entry = header_store_[id & header_mask_];
-      // Re-claim by the same owner (e.g. a Phase 4 re-grant) is allowed and
-      // counted, so "no owner ever silently replaced another" is a measured
-      // zero rather than an assumption. Only an installed header can be
-      // re-claimed; first claim over an unclaimed granule is not a re-claim,
-      // which is why the valid bit is part of the test.
-      if (entry.valid && entry.header.owner_eid == c.owner)
+      // A re-grant by the sole owner is legal and counted, so "no claim ever
+      // replaced another" is a measured zero rather than an assumption.
+      if (entry.valid && entry.header.owners != 0)
         ++perf_stats_.headers_reclaimed;
       entry.valid = true;
       entry.tag = id;
-      entry.header.owner_eid = c.owner;
-      entry.header.perms = c.perms;
-      entry.header.shared_perms = c.shared;
+      entry.header.owners      = owners;
+      entry.header.perms       = c.perms & (PERM_R | PERM_W | PERM_X);
+      entry.header.grantee     = (grant != 0) ? c.grantee : 0u;
+      entry.header.grant_perms = grant;
       entry.header.grant_epoch = (c.epoch == 0xFFFFFFFFu) ? UINT64_MAX
-                                                               : uint64_t(c.epoch);
-      entry.header.joint    = this->staged_joint(c);
-      entry.header.confined = (c.confined != 0);
+                                                          : uint64_t(c.epoch);
+      entry.header.confined    = (grant != 0) && (c.confined != 0);
       ++perf_stats_.headers_written;
     }
     ++perf_stats_.dcr_claims;
   }
 
-  // The staged co-owner mask, minus the owner itself; empty for an OWNER_ANY
-  // claim, which has no owners to add to.
-  uint32_t staged_joint(const Claim& c) const {
-    if (c.owner == OWNER_ANY)
-      return 0;
-    return c.joint & ~eid_bit(c.owner);
-  }
-
   // Release (S2): owner `eid` leaves every granule of the issuer's staged
-  // range. All or nothing, like a claim: refused if any granule is unclaimed,
-  // does not list `eid` as an owner, or would be left with no owner. When the
-  // leaving owner is owner_eid, the lowest remaining co-owner takes its place,
-  // so the owner set is exactly the old one minus `eid`. Only an owner removes
-  // itself: `eid` must be the issuer (spec D2).
+  // range. All or nothing, like a claim: refused if any granule is
+  // unclaimed, does not list `eid` as an owner, or would be left with no
+  // owner. Only an owner removes itself: `eid` must be the issuer (spec D2).
+  // A joint granule carries no grant, so the remaining set inherits none.
   void leave(const Claim& c, uint32_t eid, uint32_t issuer) {
     const uint32_t me = eid_bit(eid);
     if (c.size == 0 || me == 0 || eid != issuer) {
@@ -735,28 +695,18 @@ private:
     uint64_t last  = (uint64_t(c.base) + c.size - 1) >> config_.buffer_log2;
     for (uint64_t id = first; id <= last; ++id) {
       const StoreEntry& entry = header_store_[id & header_mask_];
-      if (!entry.valid || entry.tag != id || entry.header.owner_eid == OWNER_ANY) {
+      if (!entry.valid || entry.tag != id) {
         ++perf_stats_.leaves_refused;
         return;
       }
-      uint32_t owners = eid_bit(entry.header.owner_eid) | entry.header.joint;
+      const uint32_t owners = entry.header.owners;
       if ((owners & me) == 0 || owners == me) {
         ++perf_stats_.leaves_refused;
         return;
       }
     }
-    for (uint64_t id = first; id <= last; ++id) {
-      BufferHeader& header = header_store_[id & header_mask_].header;
-      if (header.owner_eid == eid) {
-        uint32_t next = 0;
-        while (((header.joint >> next) & 1u) == 0)
-          ++next;
-        header.owner_eid = next;
-        header.joint &= ~eid_bit(next);
-      } else {
-        header.joint &= ~me;
-      }
-    }
+    for (uint64_t id = first; id <= last; ++id)
+      header_store_[id & header_mask_].header.owners &= ~me;
     ++perf_stats_.leaves;
   }
 
@@ -816,7 +766,7 @@ private:
     uint64_t added = config_.lookup_latency;
 
     bool ok = this->authorize(label_of(this->header_for(buffer_id)),
-                              req.hart_id, req.is_write());
+                              req.hart_id, req.is_write(), req.flags.fetch);
 
     if (ok) {
       ++perf_stats_.allows;
@@ -855,9 +805,6 @@ void MemChecker::on_tick() {
   impl_->tick();
 }
 
-void MemChecker::install_single_owner(uint32_t owner_eid, uint32_t perms) {
-  impl_->install_single_owner(owner_eid, perms);
-}
 
 void MemChecker::set_epoch(uint32_t owner_eid, uint64_t epoch) {
   impl_->set_epoch(owner_eid, epoch);
@@ -888,8 +835,9 @@ MemLabel MemChecker::resolve_label(uint64_t addr) const {
   return impl_->resolve_label(addr);
 }
 
-bool MemChecker::authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const {
-  return impl_->authorize(label, hart_id, is_write);
+bool MemChecker::authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
+                           bool is_fetch) const {
+  return impl_->authorize(label, hart_id, is_write, is_fetch);
 }
 
 bool MemChecker::enforcing() const {
@@ -913,5 +861,6 @@ bool MemChecker::env_config(Config* out) {
   out->enforce        = env_flag("VX_CHECKER_ENFORCE", false);
   out->test_deny      = env_u32("VX_CHECKER_TEST_DENY", 0);
   out->taint          = env_flag("VX_CHECKER_TAINT", false);
+  out->default_perms  = env_u32("VX_CHECKER_DEFAULT_PERMS", VX_CFG_CHECKER_DEFAULT_PERMS);
   return true;
 }

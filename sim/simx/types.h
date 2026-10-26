@@ -462,6 +462,9 @@ struct MemFlags {
       // data that was authorized when it entered the cache; the memory-port
       // checker passes both. Placed last so no existing bit moves.
       uint32_t labeled           : 1;
+      // An instruction fetch: judged against X rather than R (header v2, T9).
+      // Set by the core on I-cache requests and carried by every fill.
+      uint32_t fetch             : 1;
     };
   };
 
@@ -1262,17 +1265,16 @@ struct MemReq {
 // line, like a packet header. A cache that delivers the line evaluates the
 // checker's own predicate against it. A label is constant across a line: a
 // line never straddles a granule (granules are >= 4 KB).
+// Header v2 (P1_and_taint_specv2.md T2): an owner set, no wildcard owner, X,
+// and a grant that names its grantee.
 struct MemLabel {
   bool     valid        = false;
-  uint32_t owner        = 0;
-  uint32_t perms        = 0;
-  uint32_t shared_perms = 0;
+  uint32_t owners       = 0;   // tenant bitmask; empty = unclaimed (default perms)
+  uint32_t perms        = 0;   // R|W|X for every owner, never epoch-gated
+  uint32_t grantee      = 0;   // the one tenant the grant is for
+  uint32_t grant_perms  = 0;   // R|W|X for the grantee, while the grant holds
   uint64_t grant_epoch  = 0;
-  // Confinement (kernel_identity_oct16.md, SimX proof of concept). `joint` is
-  // the bitmask of co-owners beside `owner`; `confined` marks the shared
-  // grant as confined, so a non-owner reading under it is tainted.
-  uint32_t joint        = 0;
-  bool     confined     = false;
+  bool     confined     = false;  // the grant taints its reader
 };
 
 struct MemRsp {

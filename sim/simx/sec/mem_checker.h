@@ -27,21 +27,27 @@ namespace vortex {
 // ::header_entries). A granule with no installed header is unclaimed and is
 // governed by the boot default rather than by whatever entry it indexes —
 // which is what makes an untagged store's silent aliasing impossible here.
+//
+// Header v2 (P1_and_taint_specv2.md T2, kernel_identity_oct16.md): an owner
+// *set*, so unclaimed is the empty set and the wildcard owner is gone; X; and
+// a grant that names the one tenant it is for. A grant exists only on a
+// granule with a single owner (S4), whose epoch gates it.
 struct BufferHeader {
-  uint32_t owner_eid = 0;
-  uint32_t perms = 0;         // owner access — not epoch-gated
-  uint32_t shared_perms = 0;  // non-owner access, valid while the grant holds
-  uint64_t grant_epoch = 0;   // shared grant valid while current_epoch <= grant_epoch
-  uint32_t joint = 0;         // co-owners beside owner_eid (bitmask by eid)
-  bool     confined = false;  // shared grant is confined: readers are tainted
+  uint32_t owners = 0;        // tenant bitmask; empty = unclaimed
+  uint32_t perms = 0;         // R|W|X for every owner — not epoch-gated
+  uint32_t grantee = 0;       // the tenant the grant is for
+  uint32_t grant_perms = 0;   // R|W|X for the grantee while the grant holds
+  uint64_t grant_epoch = 0;   // grant valid while epoch(owner) <= grant_epoch
+  bool     confined = false;  // the grant is confined: its reader is tainted
 };
 
 constexpr uint32_t PERM_R = 0x1;
 constexpr uint32_t PERM_W = 0x2;
+constexpr uint32_t PERM_X = 0x4;
 
-// Wildcard owner: any tenant may access (subject to perms + epoch). The boot
-// default for every header — unclaimed memory (kernel code, stacks, args) is
-// system/shared; DCR claims narrow specific buffer ranges to specific owners.
+// No tenant has this id, so a claim naming it is refused (it names someone
+// other than the issuer). Header v2 has no wildcard owner: unclaimed memory
+// is the empty owner set, governed by Config::default_perms.
 constexpr uint32_t OWNER_ANY = 0xFFFFFFFFu;
 
 // DCR setup path (Phase 3 step 4). Range 0x300+ reserved for the checker
@@ -84,6 +90,8 @@ constexpr uint32_t DCR_CHECKER_REVOKE_OWNER = 0x308;
 constexpr uint32_t DCR_CHECKER_BUF_JOINT    = 0x309;
 constexpr uint32_t DCR_CHECKER_BUF_CONFINED = 0x30A;
 constexpr uint32_t DCR_CHECKER_BUF_LEAVE    = 0x30B;
+// Header v2: the one tenant the staged grant (BUF_SHARED) is for.
+constexpr uint32_t DCR_CHECKER_BUF_GRANTEE  = 0x30C;
 constexpr uint32_t DCR_CHECKER_END        = 0x340;
 
 // Spliced into the l3cache_→memsim_ binding, which is the off-chip boundary in
@@ -143,10 +151,14 @@ public:
     // 2 = deny writes only, which completes cleanly under enforcement: the
     // kernel's output never reaches RAM and host verification fails.
     uint32_t test_deny = 0;
-    // Confinement by taint (VX_CHECKER_TAINT=1). Off: joint owners and the
-    // confined bit are stored but ignored, so every existing result is
-    // unchanged by construction.
+    // Confinement by taint (VX_CHECKER_TAINT=1). Off: the confined bit is
+    // stored but ignored, and nothing taints or is refused for taint. Joint
+    // owners are owners either way: the owner set is the header (v2).
     bool     taint = false;
+    // Perms of unclaimed memory (VX_CHECKER_DEFAULT_PERMS, default
+    // VX_CFG_CHECKER_DEFAULT_PERMS). D9 decided R|X; the build keeps R|W|X
+    // until the stack rule (T12) and claim-what-you-write land.
+    uint32_t default_perms = PERM_R | PERM_W | PERM_X;
   };
 
   struct PerfStats {
@@ -234,12 +246,6 @@ public:
   // never touches the channel at all.
   void attach_rsp_port(uint32_t port, SimChannel<MemRsp>* chan);
 
-  // Installs one owner over all of global memory. Boot default is
-  // OWNER_ANY (unclaimed = system/shared); DCR claims then narrow specific
-  // ranges. Phase 2's single-owner rows are the OWNER_ANY case observed
-  // from a single core.
-  void install_single_owner(uint32_t owner_eid, uint32_t perms);
-
   // Phase 3 step 4: the who's-who setup path. Handles DCR_CHECKER_BASE..END;
   // returns 0. Setup writes are configuration, not data-plane traffic — they
   // take effect immediately and cost no modelled cycles (the attested channel
@@ -284,7 +290,8 @@ public:
 
   // LabelAuthority: what a labeled cache consults (sec/label.h).
   MemLabel resolve_label(uint64_t addr) const override;
-  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write) const override;
+  bool authorize(const MemLabel& label, uint32_t hart_id, bool is_write,
+                 bool is_fetch) const override;
   bool enforcing() const override;
   std::shared_ptr<mem_block_t> poison() const override;
   void count_label_deny(bool is_write) override;

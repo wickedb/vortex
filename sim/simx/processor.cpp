@@ -188,12 +188,9 @@ ProcessorImpl::ProcessorImpl()
   if (MemChecker::env_config(&checker_config)) {
     checker_config.num_ports = VX_CFG_L3_MEM_PORTS;
     mem_checker_ = MemChecker::Create("checker", checker_config);
-    // Boot default: all memory is system/shared (OWNER_ANY). DCR claims over
-    // the attested channel (range 0x300+, Phase 3 step 4) then narrow specific
-    // buffer ranges to specific owners; unclaimed regions — kernel code,
-    // stacks, args — stay accessible to every tenant. Allow-all, so Phase 2's
-    // single-owner rows reproduce unchanged.
-    mem_checker_->install_single_owner(OWNER_ANY, PERM_R | PERM_W);
+    // Unclaimed memory is the empty owner set with the default perms
+    // (VX_CHECKER_DEFAULT_PERMS); DCR claims over the attested channel then
+    // narrow specific buffer ranges to specific owners.
 
     // Labeled lines (sec/label.h). A checker on the LLC->DRAM wire sees
     // misses, not accesses: a hit in a cache shared between tenants never

@@ -468,8 +468,11 @@ public:
     // op defaults to MemOp::LD — icache request is a load.
     uint32_t tag = pending_icache_.allocate(trace);
     mem_req.tag   = tag;
-    mem_req.hart_id   = trace->cid;
+    // The fetching warp's hart (thread 0), so the checker resolves the same
+    // tenant as for the warp's loads; and a fetch, so it is judged against X.
+    mem_req.hart_id   = make_hart_id(trace->cid, trace->wid, 0);
     mem_req.uuid  = trace->uuid;
+    mem_req.flags.fetch = 1;
     if (icache_req.try_send(mem_req)) {
       DT(3, simobject_->name() << " icache-req: addr=0x" << std::hex << mem_req.addr << ", tag=0x" << mem_req.tag << std::dec << ", " << *trace);
     #ifdef VX_CFG_EXT_C_ENABLE
